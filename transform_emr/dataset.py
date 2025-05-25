@@ -38,12 +38,15 @@ class DataProcessor:
 
 
     def run(self):
+        # Process on temporal_df
         self._validate_and_align_inputs()
         self._truncate_after_terminal_event()
         self._normalize_time()
         if self.max_input_days:
             self._cut_after_k_days()
         self._expand_tokens()
+        
+        # Process on context_df
         self.context_df = self.context_df.set_index("PatientID").astype("float32")
         self._fit_scaler()
         return self.df, self.context_df
@@ -217,7 +220,12 @@ class DataProcessor:
                     'TimePoint': tp
                 })
 
-        self.df = pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+
+        # --- Sort and compute time deltas ---
+        df = df.sort_values(['PatientID', 'TimePoint'])
+        df['TimeDelta'] = df.groupby('PatientID')['TimePoint'].diff().fillna(0)
+        self.df = df
 
 
 class EMRTokenizer:
@@ -369,10 +377,6 @@ class EMRDataset(Dataset):
         self.tokens_df['ConceptID']    = safe_map('Concept', self.tokenizer.concept2id, 'Concept')
         self.tokens_df['ValueID']      = safe_map('ValueToken', self.tokenizer.value2id, 'ValueToken')
         self.tokens_df['PositionID']   = safe_map('PositionToken', self.tokenizer.token2id, 'PositionToken')
-
-        # --- Sort and compute time deltas ---
-        self.tokens_df = self.tokens_df.sort_values(['PatientID', 'TimePoint'])
-        self.tokens_df['TimeDelta'] = self.tokens_df.groupby('PatientID')['TimePoint'].diff().fillna(0)
 
         self.patient_ids = self.tokens_df['PatientID'].unique()
         self.patient_groups = {pid: self.tokens_df[self.tokens_df['PatientID'] == pid] for pid in self.patient_ids}
