@@ -16,7 +16,7 @@ Static, time-aware evaluation for Transform-EMR predictions.
 """
 
 from __future__ import annotations
-from pathlib import Path
+import os
 from typing  import Dict, List
 
 import numpy  as np
@@ -29,9 +29,9 @@ from sklearn.preprocessing import MultiLabelBinarizer
 
 
 # ────────────────────────── CONFIG ───────────────────────────────────────── #
-EXCEL_FILE   = Path(r"C:\Users\yonat\CodeProjects\event-prediction-in-diabetes-care\checkpoints\inference_results.xlsx")
+EXCEL_FILE = r"C:\Users\yonat\CodeProjects\event-prediction-in-diabetes-care\checkpoints\inference_results.xlsx"
+OUT_DIR    = r"C:\Users\yonat\CodeProjects\event-prediction-in-diabetes-care\checkpoints\evaluation_plots"
 TIME_BIAS_H  = 24.0                                         # "Forgiveness time" -> was the event predicted in the correct time
-OUT_DIR      = Path(r"C:\Users\yonat\CodeProjects\event-prediction-in-diabetes-care\checkpoints\evaluation_plots")
 OUTCOMES = [
     "RELEASE",
     "DEATH",
@@ -51,7 +51,7 @@ OUTCOMES = [
 ]
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def load_dataframes(file: Path):
+def load_dataframes(file: str):
     input_df = pd.read_excel(file, sheet_name="Input Events")
     gen_df   = pd.read_excel(file, sheet_name="Generated Events")
 
@@ -78,9 +78,8 @@ def load_dataframes(file: Path):
 
 
 def evaluate(level: str = "time-aware",
-                  outcomes: List[str] | None = None,
                   time_bias: float = TIME_BIAS_H,
-                  out_dir: Path = OUT_DIR,
+                  out_dir: str = OUT_DIR,
                   verbose: bool = True
                   ) -> Dict[str, Dict]:
     """
@@ -89,7 +88,7 @@ def evaluate(level: str = "time-aware",
     - level = "multilabel": exact complication classification (multi-label, patient-level)
     - level = "time-aware": event-level w/ time error (existing logic)
     """
-    if not EXCEL_FILE.exists():
+    if not os.path.exists(EXCEL_FILE):
         raise FileNotFoundError(f"Excel file not found: {EXCEL_FILE}")
 
     # Load dfs
@@ -120,29 +119,52 @@ def evaluate(level: str = "time-aware",
 
 # ────────────────────────── CORE LOGIC ───────────────────────────────────── #
 def evaluate_3class(input_df, gen_df, outcome_map, verbose=True):
-    log_prefix = "[evaluate_3class]"
+    log_prefix = "[evaluate_3class (aligned)]"
+
+    # Map to 3-class outcomes
     input_df["OutcomeGroup"] = input_df["Token"].map(outcome_map).fillna("NONE")
     gen_df["OutcomeGroup"]   = gen_df["Token"].map(outcome_map).fillna("NONE")
 
-    def has_outcome(df, group):
-        return df[df["OutcomeGroup"] == group].groupby("PatientID").size().gt(0)
+    # Collect true/predicted labels per patient
+    def get_labels(df):
+        return df[df["OutcomeGroup"].isin(["RELEASE", "DEATH", "COMPLICATION"])] \
+                 .groupby("PatientID")["OutcomeGroup"].unique()
 
-    metrics = {}
-    for group in ["RELEASE", "DEATH", "COMPLICATION"]:
-        gt = has_outcome(input_df, group)
-        pred = has_outcome(gen_df, group)
-        common = gt.index.intersection(pred.index)
-        y_true, y_pred = gt.loc[common].astype(int), pred.loc[common].astype(int)
+    true_labels = get_labels(input_df)
+    pred_labels = get_labels(gen_df)
 
-        p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
-        acc = accuracy_score(y_true, y_pred) if len(y_true) else 0.0
+    common = true_labels.index.intersection(pred_labels.index)
+    y_true = [set(true_labels[pid]) for pid in common]
+    y_pred = [set(pred_labels[pid]) for pid in common]
 
-        metrics[group] = dict(precision=p, recall=r, f1=f1, accuracy=acc)
+    mlb = MultiLabelBinarizer(classes=["RELEASE", "DEATH", "COMPLICATION"])
+    y_true = mlb.fit_transform(y_true)
+    y_pred = mlb.transform(y_pred)
 
+    # Overall micro-F1
+    f1 = f1_score(y_true, y_pred, average="micro", zero_division=0)
+    acc = accuracy_score(y_true, y_pred)
+
+    if verbose:
+        print(f"{log_prefix}: Micro-F1={f1:.3f}  Acc={acc:.3f}  (n={len(y_true)})")
+
+    # Per-class metrics
+    per_class_metrics = precision_recall_fscore_support(y_true, y_pred, zero_division=0)
+    for i, label in enumerate(mlb.classes_):
+        p, r, f1_c, _ = per_class_metrics[0][i], per_class_metrics[1][i], per_class_metrics[2][i], per_class_metrics[3][i]
         if verbose:
-            print(f"{log_prefix}: [{group}] F1={f1:.3f}  P={p:.3f}  R={r:.3f}  Acc={acc:.3f}  (n={len(y_true)})")
+            print(f"{log_prefix}: [{label}]  F1={f1_c:.3f}  P={p:.3f}  R={r:.3f}")
 
-    return metrics
+    return dict(
+        micro_f1=f1,
+        micro_acc=acc,
+        per_class={
+            label: dict(precision=per_class_metrics[0][i],
+                        recall=per_class_metrics[1][i],
+                        f1=per_class_metrics[2][i])
+            for i, label in enumerate(mlb.classes_)
+        }
+    )
 
 
 def evaluate_multilabel(input_df, gen_df, complications, verbose=True):
@@ -161,14 +183,23 @@ def evaluate_multilabel(input_df, gen_df, complications, verbose=True):
 
     if len(y_true) == 0 or len(y_pred) == 0:
         f1 = acc = 0.0
+        per_class_metrics = {outcome: {"precision": 0.0, "recall": 0.0, "f1": 0.0} for outcome in OUTCOMES}
     else:
         f1 = f1_score(y_true, y_pred, average="micro", zero_division=0)
         acc = accuracy_score(y_true, y_pred)
+        p, r, f1s, _ = precision_recall_fscore_support(y_true, y_pred, average=None, zero_division=0, labels=range(len(OUTCOMES)))
+        per_class_metrics = {OUTCOMES[i]: {"precision": p[i], "recall": r[i], "f1": f1s[i]} for i in range(len(OUTCOMES))}
 
     if verbose:
-        print(f"{log_prefix}: F1={f1:.3f}  Acc={acc:.3f}  (n={len(y_true)})")
+        print(f"{log_prefix}: Micro-F1={f1:.3f}  Acc={acc:.3f}  (n={len(y_true)})")
+        for outcome, metrics in per_class_metrics.items():
+            print(f"{log_prefix} [{outcome}]  F1={metrics['f1']:.3f}  P={metrics['precision']:.3f}  R={metrics['recall']:.3f}")
 
-    return dict(f1=f1, accuracy=acc)
+    return dict(
+        f1=f1,
+        accuracy=acc,
+        per_class=per_class_metrics
+    )
 
 
 def evaluate_core(tokens_df: pd.DataFrame,
@@ -176,7 +207,7 @@ def evaluate_core(tokens_df: pd.DataFrame,
                    *,
                    time_bias: float,
                    outcomes:  List[str] | None,
-                   out_dir:   Path,
+                   out_dir:   str,
                    verbose:   bool
                    ) -> Dict[str, Dict]:
 
@@ -184,7 +215,8 @@ def evaluate_core(tokens_df: pd.DataFrame,
     time_col_gt, time_col_pred               = "TimePoint", "TimePoint"
     log_prefix = "[evaluate_core]"
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
 
     tokens_df = tokens_df[tokens_df[gt_concept_col].isin(outcomes)]
     pred_df   = pred_df[pred_df[pred_concept_col].isin(outcomes)]
@@ -267,15 +299,15 @@ def evaluate_core(tokens_df: pd.DataFrame,
 # ───────────── tweak the plotting helper so it can also plot accuracy ─────── #
 def _plot(metrics: Dict[str, Dict],
           time_bias: float,
-          out_dir: Path,
+          out_dir: str,
           plot_accuracy: bool = True):
     
     if metrics is None:
         print("No metrics to plot.")
         return
-    concepts = [c for c in metrics if not c.startswith("OVERALL")]
+    concepts = [c for c in OUTCOMES if c in metrics]
     f1s      = [metrics[c]["f1"]       for c in concepts]
-    accs     = [metrics[c]["accuracy"] for c in concepts]    # <- accuracy list
+    accs     = [metrics[c]["accuracy"] for c in concepts]
 
     order    = np.argsort(f1s)[::-1]
     concepts = [concepts[i] for i in order]
@@ -321,7 +353,7 @@ def _plot(metrics: Dict[str, Dict],
         for x, y in enumerate(accs):
             ax3.text(x, y+0.02, f"{y:.2f}", ha="center", va="bottom", fontsize=8)
 
-    out_file = out_dir / "evaluation_plots.png"
+    out_file = os.path.join(out_dir, "evaluation_plots.png")
     fig.savefig(out_file, dpi=300)
     plt.close(fig)
     print(f"Plots saved → {out_file}")
