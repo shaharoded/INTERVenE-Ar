@@ -127,6 +127,7 @@ class DataProcessor:
             if not release_rows.empty and not death_rows.empty:
                 release_time = release_rows.iloc[0]["StartDateTime"]
                 death_time = death_rows.iloc[0]["StartDateTime"]
+                
                 # If death is within 30 days after release → drop release
                 if pd.Timedelta(0) <= (death_time - release_time) <= pd.Timedelta(days=30):
                     group = group[group["ConceptName"] != RELEASE_TOKEN]
