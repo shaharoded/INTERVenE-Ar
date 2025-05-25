@@ -386,6 +386,7 @@ def train_transformer(model, train_dl, val_dl, tune_embedder=True, resume=True, 
                     token_weights=model.embedder.tokenizer.token_weights,
                     important_token_ids=model.embedder.tokenizer.important_token_ids
                 )
+                penalty /= pred_logits.size(0)   # Normalize penalty by batch size (B)
 
                 # Predict delta_ts[:, 1:] using model delta_t_head
                 true_delta = torch.clamp(batch["delta_ts"], 0.0, 720.0)  # Cap to 30 days, [B, T]
