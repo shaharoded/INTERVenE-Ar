@@ -295,6 +295,7 @@ def evaluate_core(tokens_df: pd.DataFrame,
               f"F1={macro['f1']:.3f}  "
               f"P={macro['precision']:.3f}  "
               f"R={macro['recall']:.3f}")
+    return metrics
 
 # ───────────── tweak the plotting helper so it can also plot accuracy ─────── #
 def _plot(metrics: Dict[str, Dict],
@@ -303,16 +304,22 @@ def _plot(metrics: Dict[str, Dict],
           plot_accuracy: bool = True):
     
     if metrics is None:
-        print("No metrics to plot.")
+        print("No metrics to plot (metrics is None).")
         return
+
     concepts = [c for c in OUTCOMES if c in metrics]
     f1s      = [metrics[c]["f1"]       for c in concepts]
     accs     = [metrics[c]["accuracy"] for c in concepts]
 
-    order    = np.argsort(f1s)[::-1]
+    # Check for all-zero F1s
+    if not f1s or all(f == 0.0 for f in f1s):
+        print("No metrics to plot (all F1s are zero).")
+        return
+
+    order = np.argsort(f1s)[::-1]
     concepts = [concepts[i] for i in order]
-    f1s      = [f1s[i]      for i in order]
-    accs     = [accs[i]     for i in order]
+    f1s      = [f1s[i] for i in order]
+    accs     = [accs[i] for i in order]
 
     ncols = 3 if plot_accuracy else 2
     fig, axes = plt.subplots(1, ncols,
@@ -333,7 +340,7 @@ def _plot(metrics: Dict[str, Dict],
 
     # ------------ signed error boxplot ------------------------------------- #
     time_err = [metrics[c]["time_errors"] or [np.nan] for c in concepts]
-    ax2.boxplot(time_err, tick_labels=concepts, showfliers=False)
+    ax2.boxplot(time_err, labels=concepts, showfliers=False)
     ax2.axhline(0,          ls="--", c="r", alpha=.6)
     ax2.axhline(time_bias,  ls="--", c="g", alpha=.4)
     ax2.axhline(-time_bias, ls="--", c="g", alpha=.4)
