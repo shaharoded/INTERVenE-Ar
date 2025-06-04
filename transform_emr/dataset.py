@@ -96,19 +96,30 @@ class DataProcessor:
         # 4. Align temporal and context data
         temporal_ids = set(self.df['PatientID'])
         context_ids = set(self.context_df['PatientID'])
+
+        missing_ids = temporal_ids - context_ids
+        extra_ids = context_ids - temporal_ids
         shared_ids = temporal_ids & context_ids
 
-        if len(shared_ids) < len(temporal_ids) or len(shared_ids) < len(context_ids):
-            print(f"Dropping unmatched PatientIDs:")
-            print(f"   - {len(context_ids - shared_ids)} from context data")
-            if (temporal_ids - shared_ids) > 0:
-                raise ValueError("Temporal df has patientIDs without a matching context vector. Be sure to add them to the context data, even if only as place-holders")
+        if missing_ids:
+            print(f"Adding {len(missing_ids)} missing PatientIDs to context_df with placeholder values (-1).")
+            placeholder_df = pd.DataFrame({
+                'PatientID': list(missing_ids),
+                **{
+                    col: [-1] * len(missing_ids)
+                    for col in self.context_df.columns
+                    if col != 'PatientID'
+                }
+            })
+            self.context_df = pd.concat([self.context_df, placeholder_df], ignore_index=True)
 
-            self.context_df = self.context_df[self.context_df['PatientID'].isin(shared_ids)].copy()
+        if extra_ids:
+            print(f"Dropping {len(extra_ids)} unmatched PatientIDs from context_df.")
+            self.context_df = self.context_df[self.context_df['PatientID'].isin(temporal_ids)].copy()
 
         # 5. Final integrity checks
-        assert self.context_df['PatientID'].is_unique, "PatientID must be unique in context_df after aggregation"
-        assert set(self.df['PatientID']) == set(self.context_df['PatientID']), "Mismatched PatientIDs after filtering"
+        assert self.context_df['PatientID'].is_unique, "PatientID must be unique in context_df after alignment"
+        assert set(self.df['PatientID']) == set(self.context_df['PatientID']), "Mismatched PatientIDs after alignment"
 
 
     def _truncate_after_terminal_event(self):
