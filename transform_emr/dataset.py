@@ -100,10 +100,10 @@ class DataProcessor:
 
         if len(shared_ids) < len(temporal_ids) or len(shared_ids) < len(context_ids):
             print(f"Dropping unmatched PatientIDs:")
-            print(f"   - {len(temporal_ids - shared_ids)} from temporal data")
             print(f"   - {len(context_ids - shared_ids)} from context data")
+            if (temporal_ids - shared_ids) > 0:
+                raise ValueError("Temporal df has patientIDs without a matching context vector. Be sure to add them to the context data, even if only as place-holders")
 
-            self.df = self.df[self.df['PatientID'].isin(shared_ids)].copy()
             self.context_df = self.context_df[self.context_df['PatientID'].isin(shared_ids)].copy()
 
         # 5. Final integrity checks
