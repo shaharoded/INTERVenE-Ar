@@ -114,8 +114,10 @@ class DataProcessor:
     def _truncate_after_terminal_event(self):
         """
         For each patient:
-        - Drop RELEASE_TOKEN if a DEATH_TOKEN occurs within 30 days after it.
-        - Then truncate any records after the first terminal event.
+        - If a DEATH_TOKEN occurs within 30 days after a RELEASE_TOKEN:
+            → Drop the DEATH_TOKEN.
+            → Replace the RELEASE_TOKEN's ConceptName with DEATH_TOKEN (keep its time).
+        - Then truncate any records after the first terminal event (RELEASE/DEATH).
         """
         def process_group(group):
             group = group.sort_values("StartDateTime").copy()
@@ -127,10 +129,15 @@ class DataProcessor:
             if not release_rows.empty and not death_rows.empty:
                 release_time = release_rows.iloc[0]["StartDateTime"]
                 death_time = death_rows.iloc[0]["StartDateTime"]
-                
-                # If death is within 30 days after release → drop release
+
+                # If death is within 30 days after release → drop death, rename release
                 if pd.Timedelta(0) <= (death_time - release_time) <= pd.Timedelta(days=30):
-                    group = group[group["ConceptName"] != RELEASE_TOKEN]
+                    # Drop death row
+                    group = group[group["ConceptName"] != DEATH_TOKEN]
+
+                    # Replace concept name of release row
+                    release_index = release_rows.index[0]
+                    group.loc[release_index, "ConceptName"] = DEATH_TOKEN
 
             # Then truncate after first terminal event
             terminal_idx = group[group["ConceptName"].isin(TERMINAL_OUTCOMES)].index
