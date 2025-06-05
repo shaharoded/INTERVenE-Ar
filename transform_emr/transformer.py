@@ -306,7 +306,8 @@ def train_transformer(model, train_dl, val_dl, tune_embedder=True, resume=True, 
         model.embedder.train()
 
     model.to(device)
-
+    model.embedder.tokenizer.token_weights = model.embedder.tokenizer.token_weights.to(device)
+    
     optimizer = model.configure_optimizers(
         weight_decay=TRAINING_SETTINGS["weight_decay"],
         learning_rate=TRAINING_SETTINGS["phase2_learning_rate"],

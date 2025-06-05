@@ -25,9 +25,9 @@ class DataProcessor:
 
     """
     def __init__(self, df, context_df, max_input_days=None, scaler=None):
-        df['StartDateTime'] = pd.to_datetime(df['StartTime'], utc=True, errors='raise')
+        df['StartDateTime'] = pd.to_datetime(df['StartTime'], format='ISO8601', utc=True, errors='raise')
         df['StartDateTime'] = df['StartDateTime'].dt.tz_convert(None)
-        df['EndDateTime'] = pd.to_datetime(df['EndTime'], utc=True, errors='raise')
+        df['EndDateTime'] = pd.to_datetime(df['EndTime'], format='ISO8601', utc=True, errors='raise')
         df['EndDateTime'] = df['EndDateTime'].dt.tz_convert(None)
         df.drop(columns=["StartTime", "EndTime"], inplace=True)
 
@@ -343,15 +343,17 @@ class EMRTokenizer:
 
     @classmethod
     def load(cls, path=os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
-        obj = torch.load(path)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        obj = torch.load(path, map_location=device)
+
         tokenizer = cls(
             token2id=obj['token2id'],
             rawconcept2id=obj['rawconcept2id'],
             concept2id=obj['concept2id'],
             value2id=obj['value2id'],
             special_tokens=obj['special_tokens'],
-            token_weights=obj['token_weights'],
-            important_token_ids=obj['important_token_ids']
+            token_weights=obj['token_weights'].to(device),
+            important_token_ids=obj['important_token_ids'].to(device)
         )
         tokenizer._loaded_fingerprint = obj.get('fingerprint')
         return tokenizer
