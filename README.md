@@ -4,7 +4,7 @@ This repository implements a two-phase deep learning pipeline for modeling longi
 
 This repo is part of an unpublished thesis and will be finalized post-submission. **Please do not reuse without permission**.
 
-This model will be used on actual EMR data, stored in a closed environment. For that, it is organized as a package that can be installed:
+The results shown here (in `evaluation.ipynb`) are on random data, as my research dataset is private. This model will be used on actual EMR data, stored in a closed environment. For that, it is organized as a package that can be installed:
 
 ```bash
 event-prediction-in-diabetes-care/
