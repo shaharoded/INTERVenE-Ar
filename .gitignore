@@ -1,5 +1,6 @@
 # Ignore specific files
 emr_model.zip
+evaluation2.0.py
 
 # Ignore an entire folder
 venv/

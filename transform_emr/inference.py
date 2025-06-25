@@ -4,6 +4,7 @@ import pandas as pd
 from tqdm import tqdm
 import joblib
 from pathlib import Path
+from time import sleep
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import *
@@ -28,7 +29,7 @@ def get_token_embedding(embedder, token: str) -> torch.Tensor:
     return embedding
 
 
-def infer_event_stream(model, dataset, max_len=500, temperature=1.0):
+def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_position=0, tqdm_desc='Generating'):
     """
     Generates a stream of events for each patient in the dataset.
     NOTE: Inference generates a token every 1h for current version. An upgrade might try to infer the next token's 
@@ -38,6 +39,9 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0):
         dataset: EMRDataset object (must contain all token components and context).
         max_len: Number of new tokens to generate.
         temprature: Controls the model's creativity. >1 makes model more creative but can cause hallucinations
+        tqdm_position: Controls the TQDM hierarchy for the function that can be activated directly or externally.
+        tqdm_desc: Controls the TQDM description for the function that can be activated directly or externally.
+
     
     Returns:
         DataFrame with PatientID, Step, Token, IsInput, IsOutcome, IsTerminal
@@ -62,7 +66,8 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0):
             tokenizer.value2id.get(value, tokenizer.mask_token_id)
         )
 
-    for pid in tqdm(dataset.patient_ids, desc="Generating"):
+    for pid in tqdm(dataset.patient_ids, desc=tqdm_desc, position=tqdm_position, leave=False, dynamic_ncols=True):
+        sleep(1)
         df = dataset.patient_groups[pid]
         ctx_vec = torch.tensor(dataset.context_df.loc[pid].values, dtype=torch.float32).unsqueeze(0).to(device)
 
