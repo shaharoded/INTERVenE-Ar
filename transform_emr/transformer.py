@@ -294,16 +294,36 @@ class GPT(nn.Module):
         return model, ckpt.get("epoch", 0), ckpt.get("best_val", float("inf")), ckpt.get("optim_state"), ckpt.get("scheduler_state")
 
 
-def train_transformer(model, train_dl, val_dl, tune_embedder=True, resume=True, checkpoint_path=TRANSFORMER_CHECKPOINT):
+def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRANSFORMER_CHECKPOINT):
+    """
+    Trains a Transformer-based EMR sequence model in Phase 2 (decoder stage),
+    using a pretrained embedder and structured multi-loss optimization.
+
+    Freezes the embedder for the initial `warmup_epochs`, then unfreezes and reconfigures
+    the optimizer to include it. Supports resume-from-checkpoint training.
+
+    Args:
+        model (nn.Module): GPT decoder with attached EMREmbedding.
+        train_dl (DataLoader): Training data loader.
+        val_dl (DataLoader): Validation data loader.
+        tune_embedder (bool): If False, permanently freezes embedder.
+                              If True, freezes for warmup phase only.
+        resume (bool): Resume from latest checkpoint if found.
+        checkpoint_path (str): Path to save the best model and state.
+
+    Returns:
+        None. Saves model checkpoints and plots training curves.
+    """
+    def set_embedder_frozen(model, freeze: bool):
+        for p in model.embedder.parameters():
+            p.requires_grad = not freeze
+        model.embedder.eval() if freeze else model.embedder.train()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Freeze embedder if requested
-    if not tune_embedder:
-        for p in model.embedder.parameters():
-            p.requires_grad = False
-        model.embedder.eval()
-    else:
-        model.embedder.train()
+    # If not freeze, temporarly freeze for warmup phase
+    freeze_epochs = TRAINING_SETTINGS.get("warmup_epochs", 5)
+    set_embedder_frozen(model, freeze=True)
 
     model.to(device)
     model.embedder.tokenizer.token_weights = model.embedder.tokenizer.token_weights.to(device)
@@ -387,7 +407,7 @@ def train_transformer(model, train_dl, val_dl, tune_embedder=True, resume=True, 
                     token_weights=model.embedder.tokenizer.token_weights,
                     important_token_ids=model.embedder.tokenizer.important_token_ids
                 )
-                penalty /= pred_logits.size(0)   # Normalize penalty by batch size (B)
+                penalty /= (pred_logits.size(0) * pred_logits.size(1))  # Normalize by B*T
 
                 # Predict delta_ts[:, 1:] using model delta_t_head
                 true_delta = torch.clamp(batch["delta_ts"], 0.0, 720.0)  # Cap to 30 days, [B, T]
@@ -407,6 +427,15 @@ def train_transformer(model, train_dl, val_dl, tune_embedder=True, resume=True, 
         return total_loss / len(loader)
     
     for epoch in range(start_epoch, TRAINING_SETTINGS.get("phase2_n_epochs")):
+        # Handle unfreezing the embedder
+        if epoch == freeze_epochs:
+            print(f"[GPT]: Unfreezing embedder after {freeze_epochs} epochs.")
+            set_embedder_frozen(model, freeze=False)
+            optimizer = model.configure_optimizers(
+                weight_decay=TRAINING_SETTINGS["weight_decay"],
+                learning_rate=TRAINING_SETTINGS["phase2_learning_rate"],
+                betas=(0.9, 0.95)
+            )
         tr_loss = run_epoch(train_dl, train_flag=True)
         vl_loss = run_epoch(val_dl, train_flag=False)
 

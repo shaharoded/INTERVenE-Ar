@@ -24,12 +24,12 @@ TRAINING_SETTINGS = {
     "phase1_n_epochs": 100,
     "phase2_n_epochs": 80,
     "warmup_epochs": 10,
-    "patience": 5,
+    "patience": 10,
     "phase1_learning_rate": 5e-4,
     "phase2_learning_rate": 3e-4,
     "weight_decay": 1e-3,
     "batch_size": 8, # Number of patients processed concurrently
     "k_window": 5, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
-    "penalty_weight": 1.0, # Weight for special penalties given on next token loss function. Currently as calculated.
-    "delta_t_weight": 1.0, # Weight loss on the delta_t prediction, which is combined with regular loss. Currently as calculated.
+    "penalty_weight": 0.3, # Weight for special penalties given on next token loss function. Currently as calculated.
+    "delta_t_weight": 0.2, # Weight loss on the delta_t prediction, which is combined with regular loss. Currently as calculated.
 }

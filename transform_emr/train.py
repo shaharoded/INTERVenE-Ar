@@ -105,12 +105,11 @@ def phase_one(embedder, train_dl, val_dl, resume=True):
         resume=resume
     )
 
-def phase_two(model, train_dl, val_dl, tune_embedder=True, resume=True):
+def phase_two(model, train_dl, val_dl, resume=True):
     return train_transformer(
                         model=model, 
                         train_dl=train_dl, 
                         val_dl=val_dl, 
-                        tune_embedder=tune_embedder, 
                         resume=resume, 
                         checkpoint_path=TRANSFORMER_CHECKPOINT
                     )
@@ -142,7 +141,7 @@ def run_two_phase_training():
     else:
         model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
 
-    phase_two(model=model, train_dl=train_dl, val_dl=val_dl, tune_embedder=True, resume=True)
+    phase_two(model=model, train_dl=train_dl, val_dl=val_dl, resume=True)
 
 
 
@@ -162,7 +161,7 @@ if __name__ == "__main__":
             embed_dim=MODEL_CONFIG.get("embed_dim")
         )
 
-    embedder, _, _ = phase_one(embedder=embedder, train_dl=train_dl, val_dl=val_dl, resume=True)
+    # embedder, _, _ = phase_one(embedder=embedder, train_dl=train_dl, val_dl=val_dl, resume=True)
 
     # --- Phase 2: Train or resume transformer ---
     ckpt_last_path = Path(TRANSFORMER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
@@ -172,4 +171,4 @@ if __name__ == "__main__":
     else:
         model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
 
-    phase_two(model=model, train_dl=train_dl, val_dl=val_dl, tune_embedder=True, resume=True)
+    phase_two(model=model, train_dl=train_dl, val_dl=val_dl, resume=True)
