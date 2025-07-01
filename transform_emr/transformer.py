@@ -306,8 +306,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         model (nn.Module): GPT decoder with attached EMREmbedding.
         train_dl (DataLoader): Training data loader.
         val_dl (DataLoader): Validation data loader.
-        tune_embedder (bool): If False, permanently freezes embedder.
-                              If True, freezes for warmup phase only.
         resume (bool): Resume from latest checkpoint if found.
         checkpoint_path (str): Path to save the best model and state.
 
@@ -333,7 +331,16 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         learning_rate=TRAINING_SETTINGS["phase2_learning_rate"],
         betas=(0.9, 0.95)
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)
+
+    steps_per_epoch = len(train_dl)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=TRAINING_SETTINGS["phase2_learning_rate"],
+        total_steps=TRAINING_SETTINGS["phase2_n_epochs"] * steps_per_epoch,
+        pct_start=0.1,  # 10% warmup
+        anneal_strategy='cos',
+        cycle_momentum=False
+    )
 
     ckpt_path = Path(checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -359,6 +366,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     def run_epoch(loader, train_flag=False):
         model.train() if train_flag else model.eval()
         total_loss = 0.0
+        total_bce, total_penalty, total_dt = 0.0, 0.0, 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -387,7 +395,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # Main loss: BCE with logits
                 loss_fn = nn.BCEWithLogitsLoss(pos_weight=model.embedder.tokenizer.token_weights.to(logits.device))
-                loss = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
+                bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
 
                 # Get predicted token IDs
                 pred_ids = pred_logits.argmax(dim=-1)              # [B, T]
@@ -397,34 +405,52 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     print("ERROR: Model is predicting invalid token IDs!")
                     print("Check your model architecture - lm_head output size mismatch!")
 
-                # Load penalties
-                penalty = 0.0
-                penalty += penalty_meal_order(pred_ids, model.embedder.tokenizer.id2token)
-                penalty += penalty_hallucinated_intervals(pred_ids, target_tokens, model.embedder.tokenizer.id2token)
-                penalty += penalty_false_positives(
+                # Load and normalize each penalty (∈ [0, 1])
+                penalty = torch.tensor(0.0, device=logits.device)
+                p1 = penalty_meal_order(pred_ids, model.embedder.tokenizer.id2token, logits.device)
+                p2 = penalty_hallucinated_intervals(pred_ids, target_tokens, model.embedder.tokenizer.id2token, device=logits.device)
+                p3 = penalty_false_positives(
                     predictions=pred_logits,
                     targets=multi_hot,
                     token_weights=model.embedder.tokenizer.token_weights,
                     important_token_ids=model.embedder.tokenizer.important_token_ids
                 )
-                penalty /= (pred_logits.size(0) * pred_logits.size(1))  # Normalize by B*T
+                # Average the penalties to bound in [0, 1] + smooth
+                penalty = torch.log1p((p1 + p2 + p3) / 3.0)
+                penalty = get_penalty_weight(epoch) * penalty # Apply dynamic weight
 
                 # Predict delta_ts[:, 1:] using model delta_t_head
-                true_delta = torch.clamp(batch["delta_ts"], 0.0, 720.0)  # Cap to 30 days, [B, T]
-                pred_delta = delta_t_pred[:, 1:]                                # [B, T]
-                delta_t_loss = F.mse_loss(pred_delta, true_delta)               # scalar
+                true_delta = torch.clamp(batch["delta_ts"], 0.0, 336.0) / 336.0  # Cap to 14 days (in hours), [B, T], range [0,1]
+                pred_delta = torch.clamp(torch.sigmoid(delta_t_pred[:, 1:]), min=0.0, max=1.0) # shape: [B, T], range [0,1]
+                
+                mask = (target_tokens != model.embedder.padding_idx).float()  # [B, T]
+                delta_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
+                delta_t_loss = (delta_t_loss * mask).sum() / mask.sum().clamp(min=1)
+                delta_t_loss = TRAINING_SETTINGS["delta_t_weight"] * delta_t_loss
 
-                # Combine with weighted penalty
-                loss = loss + TRAINING_SETTINGS.get("penalty_weight", 1.0) * penalty + \
-                    TRAINING_SETTINGS.get("delta_t_weight", 1.0) * delta_t_loss
+                # Combine all
+                loss = bce + penalty + delta_t_loss
 
                 if train_flag:
                     optimizer.zero_grad()
                     loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
+                    scheduler.step()
 
                 total_loss += loss.item()
-        return total_loss / len(loader)
+                total_bce += bce.item()
+                total_penalty += penalty.item()
+                total_dt += delta_t_loss.item()
+        
+        n_batches = len(loader)
+
+        return (
+            total_loss / n_batches,
+            total_bce / n_batches,
+            total_penalty / n_batches,
+            total_dt / n_batches
+        )
     
     for epoch in range(start_epoch, TRAINING_SETTINGS.get("phase2_n_epochs")):
         # Handle unfreezing the embedder
@@ -436,14 +462,15 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 learning_rate=TRAINING_SETTINGS["phase2_learning_rate"],
                 betas=(0.9, 0.95)
             )
-        tr_loss = run_epoch(train_dl, train_flag=True)
-        vl_loss = run_epoch(val_dl, train_flag=False)
+        tr_loss, tr_bce, tr_pen, tr_dt = run_epoch(train_dl, train_flag=True)
+        vl_loss, vl_bce, vl_pen, vl_dt = run_epoch(val_dl, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        print(f"[Training Transformer]: Epoch {epoch:02d} | Train={tr_loss:.4f} | Val={vl_loss:.4f}")
-        scheduler.step(vl_loss)
+        print(f"[Training Transformer]: Epoch {epoch:02d} | "
+            f"\n--> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, Pen={tr_pen:.4f}, Δt={tr_dt:.4f}) | "
+            f"\n--> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Δt={vl_dt:.4f})")
 
         # Save latest
         model.save(ckpt_last, epoch, best_val, optimizer, scheduler)

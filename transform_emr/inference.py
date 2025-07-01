@@ -67,7 +67,7 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
         )
 
     for pid in tqdm(dataset.patient_ids, desc=tqdm_desc, position=tqdm_position, leave=False, dynamic_ncols=True):
-        sleep(1)
+        if tqdm_position == 0: sleep(1)  # only when running from main thread
         df = dataset.patient_groups[pid]
         ctx_vec = torch.tensor(dataset.context_df.loc[pid].values, dtype=torch.float32).unsqueeze(0).to(device)
 
@@ -135,8 +135,8 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
             is_terminal = next_token_id in terminal_ids
 
             # Predicted delta for next token
-            pred_delta_t = delta_t_preds[0, -1].item()
-            pred_delta_t = min(max(pred_delta_t, 0.0), 720.0)  # Avoid negative or NaN, limit next token to 30 days
+            pred_delta_t = delta_t_preds[0, -1].item() * 336.0  # revert normalization
+            pred_delta_t = min(max(pred_delta_t, 0.0), 336.0)  # Avoid negative or NaN, limit next token to 14 days
 
             rows.append({
                 "PatientID": pid,

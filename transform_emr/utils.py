@@ -7,10 +7,12 @@ general util functions for the package
 import matplotlib.pyplot as plt
 import torch
 from collections import Counter
+from math import exp
 
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import meal2rank
+from transform_emr.config.model_config import TRAINING_SETTINGS
 
 
 
@@ -49,7 +51,19 @@ def get_multi_hot_targets(position_ids, padding_idx, vocab_size, k):
     return targets
 
 
-def penalty_meal_order(predicted_tokens, id2token):
+def get_penalty_weight(epoch, max_weight=TRAINING_SETTINGS.get("penalty_weight")):
+    """
+    Allows the model slow increase of penalty in order to first learn basic patterns and then improve them.
+    """
+    # Sigmoid-based non-linear ramp-up over first N epochs
+    warmup = TRAINING_SETTINGS.get("warmup_epochs")
+    if epoch >= warmup:
+        return max_weight
+    progress = epoch / warmup
+    return max_weight * (1 / (1 + exp(-12 * (progress - 0.5))))  # S-curve centered at 0.5
+
+
+def penalty_meal_order(predicted_tokens, id2token, device=None):
     """
     Penalizes incorrect meal ordering in a cyclic daily schedule.
     Expects meals to follow MEAL_BREAKFAST → MEAL_LUNCH → MEAL_DINNER → MEAL_NIGHT → MEAL_BREAKFAST.
@@ -59,108 +73,133 @@ def penalty_meal_order(predicted_tokens, id2token):
         id2token (dict): Mapping from token ID to token string.
 
     Returns:
-        float: Total penalty score.
+        Torch.Tensor: Total penalty score.
     """
-    penalty = 0.0
+    total_penalty = 0.0
+    total_transitions = 0
+
     for b in range(predicted_tokens.size(0)):
-        sequence = []
-        for t in range(predicted_tokens.size(1)):
-            tok = predicted_tokens[b, t].item()
-            tok_str = id2token.get(tok)
-            if tok_str in meal2rank:
-                sequence.append(meal2rank[tok_str])
+        sequence = [
+            meal2rank[id2token.get(predicted_tokens[b, t].item())]
+            for t in range(predicted_tokens.size(1))
+            if id2token.get(predicted_tokens[b, t].item()) in meal2rank
+        ]
 
-        if not sequence:
-            continue
-
-        # Compare each to the previous in cyclic order
         for i in range(1, len(sequence)):
-            prev = sequence[i - 1]
-            curr = sequence[i]
-            # valid if curr == (prev + 1) % len(MEAL_ORDER)
-            expected_next = (prev + 1) % len(meal2rank)
-            if curr != expected_next:
-                penalty += 1.0
-    return penalty
+            expected = (sequence[i - 1] + 1) % len(meal2rank)
+            total_transitions += 1
+            if sequence[i] != expected:
+                total_penalty += 1.0
+
+    if total_transitions == 0:
+        return torch.tensor(0.0, device=device)
+
+    normalized = total_penalty / total_transitions
+    return torch.tensor(normalized, dtype=torch.float32, device=device)
 
 
-def penalty_hallucinated_intervals(predicted_tokens, target_tokens, id2token, start_suffix="_START", end_suffix="_END"):
+def penalty_hallucinated_intervals(predicted_tokens, target_tokens, id2token, start_suffix="_START", end_suffix="_END", device=None):
     """
-    Penalizes:
-      - Intervals predicted with invalid open/close order (e.g., END before START).
-      - Incomplete or unmatched intervals that are not in the target.
+    Computes a normalized penalty for hallucinated or structurally invalid intervals.
+
+    This function penalizes the model for:
+      - Predicting unmatched START/END pairs (e.g., START without END).
+      - Predicting END before a corresponding START.
+      - Generating interval markers that do not appear in the target sequence.
+
+    The penalty is normalized as:
+        unmatched predicted intervals / total predicted intervals
 
     Args:
         predicted_tokens (Tensor): [B, T] tensor of predicted token IDs.
-        target_tokens (Tensor):    [B, T] tensor of target token IDs.
-        id2token (dict): Token ID -> string.
-        start_suffix (str): Interval start suffix (default: "_START").
-        end_suffix (str): Interval end suffix (default: "_END").
+        target_tokens    (Tensor): [B, T] tensor of ground-truth token IDs.
+        id2token (dict): Mapping from token ID to token string.
+        start_suffix (str): Suffix indicating interval start (default="_START").
+        end_suffix (str): Suffix indicating interval end (default="_END").
+        device (torch.device): Device for returned tensor.
 
     Returns:
-        float: total penalty
+        torch.Tensor: A scalar tensor with normalized penalty in [0, 1].
     """
-    penalty = 0.0
+    total_unmatched = 0      # total unmatched (hallucinated or malformed) intervals across batch
+    total_predicted = 0      # total interval tokens predicted across batch
     B, T = predicted_tokens.shape
 
     def extract_intervals(tokens):
+        """
+        Extracts a sequence of (concept, marker) pairs like ('HYPO', 'START').
+
+        Args:
+            tokens (Tensor): [T] vector of token IDs.
+
+        Returns:
+            List[Tuple[str, str]]: e.g., [('HYPO', 'START'), ('HYPO', 'END')]
+        """
         sequence = []
         for t in range(T):
             tok_str = id2token[tokens[t].item()]
             if tok_str.endswith(start_suffix):
-                base = tok_str.replace(start_suffix, "")
+                base = tok_str[:-len(start_suffix)]
                 sequence.append((base, "START"))
             elif tok_str.endswith(end_suffix):
-                base = tok_str.replace(end_suffix, "")
+                base = tok_str[:-len(end_suffix)]
                 sequence.append((base, "END"))
         return sequence
 
     def decompose(sequence):
         """
-        Separates sequence into:
-        - complete: properly paired START->END in order (not really important so not saved)
-        - incomplete: unmatched START or END tokens
+        Identifies unmatched interval markers in a sequence using a simple stack-based parser.
+
+        Args:
+            sequence (List[Tuple[str, str]]): extracted interval sequence
+
+        Returns:
+            List[Tuple[str, str]]: unmatched (base, marker) items (e.g., ('HYPO', 'END'))
         """
         incomplete = []
         stack = []
-        for item in sequence:
-            base, kind = item
+        for base, kind in sequence:
             if kind == "START":
                 stack.append(base)
-            elif kind == "END":
+            else:  # kind == "END"
                 if base in stack:
-                    stack.remove(base)
+                    stack.remove(base)  # matched START/END pair
                 else:
                     incomplete.append((base, "END"))
-        # Any leftover STARTs in stack are incomplete
-        for base in stack:
-            incomplete.append((base, "START"))
+        # Remaining STARTs in stack are unmatched
+        incomplete += [(base, "START") for base in stack]
         return incomplete
 
     for b in range(B):
         pred_seq = extract_intervals(predicted_tokens[b])
         tgt_seq = extract_intervals(target_tokens[b])
 
+        # Decompose both sequences to unmatched START/END tokens
         pred_incomplete = decompose(pred_seq)
         tgt_incomplete = decompose(tgt_seq)
 
-        # Step 1: Drop all complete intervals from both
-        # Step 2: Drop from pred_incomplete anything that's also in tgt_incomplete
-        pred_filtered = Counter(pred_incomplete)
-        tgt_incomplete_counter = Counter(tgt_incomplete)
+        total_predicted += len(pred_seq)
 
-        for k in tgt_incomplete_counter:
+        # Convert unmatched sequences to counters for filtering
+        pred_filtered = Counter(pred_incomplete)
+        tgt_filtered = Counter(tgt_incomplete)
+
+        # Remove hallucinations that also appear in the target as incomplete (no penalty)
+        for k in tgt_filtered:
             if k in pred_filtered:
-                # Remove min(pred, target) occurrences
-                remove_count = min(pred_filtered[k], tgt_incomplete_counter[k])
-                pred_filtered[k] -= remove_count
-                if pred_filtered[k] == 0:
+                pred_filtered[k] -= min(pred_filtered[k], tgt_filtered[k])
+                if pred_filtered[k] <= 0:
                     del pred_filtered[k]
 
-        # Remaining in pred_filtered are hallucinated or unmatched intervals
-        penalty += sum(pred_filtered.values())
+        # Remaining are hallucinated/unjustified by target
+        total_unmatched += sum(pred_filtered.values())
 
-    return penalty
+    if total_predicted == 0:
+        return torch.tensor(0.0, device=device)
+
+    # Normalize penalty: unmatched / predicted
+    normalized = total_unmatched / total_predicted
+    return torch.tensor(normalized, dtype=torch.float32, device=device)
 
 
 def penalty_false_positives(predictions, targets, token_weights, important_token_ids, threshold=0.5):
@@ -178,15 +217,17 @@ def penalty_false_positives(predictions, targets, token_weights, important_token
         threshold (float): threshold above which a token is considered predicted
 
     Returns:
-        float: penalty scalar
+        Torch.Tensor: penalty
     """
-    with torch.no_grad():
-        pred_bin = (predictions > threshold).float()         # [B, T, V]
-        false_pos = torch.clamp(pred_bin - targets, min=0.0) # [B, T, V]
-        fp_counts = false_pos.sum(dim=(0, 1))                # [V]
+    pred_bin = (predictions > threshold).float()         # [B, T, V]
+    false_pos = torch.clamp(pred_bin - targets, min=0.0) # [B, T, V]
+    fp_counts = false_pos.sum(dim=(0, 1))                # [V]
 
-        # Mask and weight only the important token IDs
-        important_ids = torch.tensor(list(important_token_ids), device=predictions.device)
-        penalties = fp_counts[important_ids] * token_weights[important_ids]
+    # Mask and weight only the important token IDs
+    important_ids = torch.tensor(list(important_token_ids), device=predictions.device)
+    penalties = fp_counts[important_ids] * token_weights[important_ids]
 
-        return penalties.sum().item()
+    penalty = penalties.sum()
+    max_possible_fp = predictions.size(0) * predictions.size(1)  # B * T norm
+    normalized_penalty = penalty / max_possible_fp
+    return normalized_penalty.clamp(0.0, 1.0)
