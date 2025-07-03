@@ -1,7 +1,7 @@
 import torch
 from torch.nn import functional as F
 import pandas as pd
-from tqdm import tqdm
+from tqdm.auto import tqdm
 import joblib
 from pathlib import Path
 from time import sleep
