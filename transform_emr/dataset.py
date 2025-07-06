@@ -47,6 +47,8 @@ class DataProcessor:
         self._expand_tokens()
         
         # Process on context_df
+        if 'index' in self.context_df.columns:
+            self.context_df = self.context_df.drop(columns=['index'])
         self.context_df = self.context_df.set_index("PatientID").drop(columns=["PatientID"], errors="ignore").astype("float32")
         self._fit_scaler()
         return self.df, self.context_df
