@@ -273,6 +273,7 @@ Once the EMR structure is captured, the transformer learns to model sequential d
 - How does timing affect outcomes?  
 - How does patient context modulate the trajectory?
 
+The training flow uses a warmup period where the model is to learn patterns using a frozen embedder (so that the sharp gradients won't cause forgetting to the embedder's weights). Then, there is a gradual increase in the penalty weight to smoothly combine the structural penalties with the general loss (BCE + Δt).
 ---
 
 ### 4. **`inference.py`** – Generating output from the model

@@ -99,7 +99,6 @@ class DataProcessor:
 
         missing_ids = temporal_ids - context_ids
         extra_ids = context_ids - temporal_ids
-        shared_ids = temporal_ids & context_ids
 
         if missing_ids:
             print(f"Adding {len(missing_ids)} missing PatientIDs to context_df with placeholder values (-1).")
@@ -242,9 +241,7 @@ class DataProcessor:
         df = pd.DataFrame(rows)
 
         # --- Sort and compute time deltas ---
-        df = df.sort_values(['PatientID', 'TimePoint'])
-        df['TimeDelta'] = df.groupby('PatientID')['TimePoint'].diff().fillna(0)
-        self.df = df
+        self.df = df.sort_values(['PatientID', 'TimePoint'])
 
 
 class EMRTokenizer:
@@ -449,8 +446,7 @@ class EMRDataset(Dataset):
             "concept_ids": torch.tensor(df["ConceptID"].values, dtype=torch.long),
             "value_ids": torch.tensor(df["ValueID"].values, dtype=torch.long),
             "position_ids": torch.tensor(df["PositionID"].values, dtype=torch.long),
-            "delta_ts": torch.tensor(df["TimeDelta"].values, dtype=torch.float32),
-            "abs_ts": torch.tensor(df["TimePoint"].values, dtype=torch.float32),
+            "abs_ts": torch.tensor(df["TimePoint"].values, dtype=torch.float32) / 336.0, # Normalize to range [0,1]
             "context_vec": torch.tensor(self.context_df.loc[pid].values, dtype=torch.float32),
             "targets": torch.tensor(df["PositionID"].values, dtype=torch.long),
         }
@@ -461,11 +457,11 @@ def collate_emr(batch, pad_token_id=0):
     Collates a batch of patient EMR sequences into padded tensors.
 
     Each sequence contains:
+        - Raw Concept ID
         - Concept ID
         - Value ID
         - Position ID (used for prediction)
-        - Delta time (Δt)
-        - Absolute time (since admission)
+        - Absolute time (Δt since admission)
         - Patient context vector (no padding)
 
     Returns:
@@ -484,7 +480,6 @@ def collate_emr(batch, pad_token_id=0):
     concept_ids      = pad_tensor([x['concept_ids'] for x in batch], pad_val=pad_token_id)
     value_ids        = pad_tensor([x['value_ids'] for x in batch], pad_val=pad_token_id)
     position_ids     = pad_tensor([x['position_ids'] for x in batch], pad_val=pad_token_id)
-    delta_ts         = pad_tensor([x['delta_ts'] for x in batch], pad_val=0.0, dtype=torch.float32)
     abs_ts           = pad_tensor([x['abs_ts'] for x in batch], pad_val=0.0, dtype=torch.float32)
 
     context_vecs = torch.stack([x['context_vec'] for x in batch])
@@ -494,7 +489,6 @@ def collate_emr(batch, pad_token_id=0):
         'concept_ids': concept_ids,
         'value_ids': value_ids,
         'position_ids': position_ids,  # targets
-        'delta_ts': delta_ts,
         'abs_ts': abs_ts,
         'context_vec': context_vecs,
         'targets': position_ids.clone()

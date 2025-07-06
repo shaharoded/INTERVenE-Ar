@@ -80,9 +80,8 @@ class EMREmbedding(nn.Module):
       - Concept ID (e.g., "GLUCOSE_STATE")
       - Concept + Value ID (e.g., "GLUCOSE_STATE_Low")
       - Concept + Value + Position ID (e.g., "GLUCOSE_STATE_Low_START")
-      - Relative time delta since the previous event (Δt)
-      - Absolute time since admission (t_abs)
-      - Patient-level context vector (e.g., age, sex, diagnosis group)
+      - Absolute time since admission (Δt abs)
+      - Patient-level context vector (e.g., age, sex, No. prior admissions in 6 months)
 
     These components are embedded, concatenated, and projected into a shared
     fixed-size embedding space. A special [CTX] token is prepended to each sequence
@@ -119,12 +118,10 @@ class EMREmbedding(nn.Module):
         self.position_embed = nn.Embedding(len(tokenizer.token2id), embed_dim) # Embed for "GLUCOSE_MEASURE_STATE_High_Start" -> the full vocab size
 
         # --- Time embeddings ---
-        self.time2vec_rel = Time2Vec(time2vec_dim)
         self.time2vec_abs = Time2Vec(time2vec_dim)
 
         # --- Time projection ---
-        time_cat_dim = 2 * time2vec_dim
-        self.time_proj = nn.Linear(time_cat_dim, embed_dim, bias=False)
+        self.time_proj = nn.Linear(time2vec_dim, embed_dim, bias=False)
 
         # --- patient‑context slot ----------------------------------------
         self.ctx_token  = nn.Parameter(torch.randn(embed_dim)) # learnable [CTX] token
@@ -172,15 +169,13 @@ class EMREmbedding(nn.Module):
         p_emb = self.position_embed(position_ids)
 
         # --- Time encoding ---
-        t_rel = self.time2vec_rel(delta_ts)         # [B, T, k]
-        t_abs = self.time2vec_abs(abs_ts)
-        t_cat = torch.cat([t_rel, t_abs], dim=-1)   # [B, T, 2k]
-        t_emb = self.time_proj(t_cat)               # [B, T, D]
+        t_abs = self.time2vec_abs(abs_ts)           # [B, T, k]
+        t_emb = self.time_proj(t_abs)               # [B, T, D]
 
         # --- Combine all token-wise pieces ---
         combined = torch.cat([r_emb, c_emb, v_emb, p_emb, t_emb], dim=-1)  # [B, T, 5D]
-        ev_vec = self.final_proj(combined)                          # [B, T, D]
-        ev_vec = self.dropout(ev_vec) / self.scale                 # [B, 1, D]
+        ev_vec = self.final_proj(combined)                                 # [B, T, D]
+        ev_vec = self.dropout(ev_vec) / self.scale                         # [B, 1, D]
 
         # --- [CTX] slot ---
         ctx_vec = self.ctx_token + self.context_proj(patient_contexts)  # [B, D]
@@ -197,7 +192,7 @@ class EMREmbedding(nn.Module):
         return seq
     
     def forward_with_decoder(self, raw_concept_ids, concept_ids, value_ids, position_ids,
-                            delta_ts, abs_ts, patient_contexts):
+                            abs_ts, patient_contexts):
         """
         Runs full forward pass + decoding (for training phase 1).
 
@@ -206,7 +201,7 @@ class EMREmbedding(nn.Module):
         """
         seq = self.forward(
             raw_concept_ids, concept_ids, value_ids, position_ids,
-            delta_ts, abs_ts, patient_contexts,
+            abs_ts, patient_contexts,
             return_mask=False
         )  # [B, T+1, D]
 
@@ -325,7 +320,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True):
                 concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"],
                 position_ids=batch["position_ids"],
-                delta_ts=batch["delta_ts"],
                 abs_ts=batch["abs_ts"],
                 patient_contexts=batch["context_vec"]
             )  # [B, T, V]

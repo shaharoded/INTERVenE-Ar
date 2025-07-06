@@ -76,7 +76,6 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
         concept_ids = torch.tensor([df["ConceptID"].tolist()], dtype=torch.long, device=device)
         value_ids   = torch.tensor([df["ValueID"].tolist()], dtype=torch.long, device=device)
         pos_ids     = torch.tensor([df["PositionID"].tolist()], dtype=torch.long, device=device)
-        delta_ts    = torch.tensor([df["TimeDelta"].tolist()], dtype=torch.float32, device=device)
         abs_ts      = torch.tensor([df["TimePoint"].tolist()], dtype=torch.float32, device=device)
 
         seq_len = pos_ids.size(1)
@@ -91,7 +90,6 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
             rows.append({
                 "PatientID": pid,
                 "Step": i + 1,
-                "TimeDelta": delta_ts[0, i].item(),
                 "TimePoint": abs_ts[0, i].item(),
                 "Token": id2token.get(tok_id, f"<UNK_{tok_id}>"),
                 "IsInput": 1,
@@ -105,12 +103,11 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
         steps = 0
         while steps < max_len:
             with torch.no_grad():
-                logits, delta_t_preds = model(
+                logits, abs_t_preds = model(
                     raw_concept_ids=raw_ids,
                     concept_ids=concept_ids,
                     value_ids=value_ids,
                     position_ids=pos_ids,
-                    delta_ts=delta_ts,
                     abs_ts=abs_ts,
                     context_vec=ctx_vec
                 )
@@ -135,14 +132,13 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
             is_terminal = next_token_id in terminal_ids
 
             # Predicted delta for next token
-            pred_delta_t = delta_t_preds[0, -1].item() * 336.0  # revert normalization
-            pred_delta_t = min(max(pred_delta_t, 0.0), 336.0)  # Avoid negative or NaN, limit next token to 14 days
+            pred_abs_t_norm = abs_t_preds[0, -1].item()
+            pred_abs_t = min(max(pred_abs_t_norm * 336.0, 0.0), 336.0)  # Revert normalization, Avoid negative or NaN, limit next token to 14 days from admission
 
             rows.append({
                 "PatientID": pid,
                 "Step": raw_ids.shape[1] + 1,
-                "TimeDelta": pred_delta_t,
-                "TimePoint": abs_ts[0, -1].item(),
+                "TimePoint": pred_abs_t,
                 "Token": tok_str,
                 "IsInput": 0,
                 "IsOutcome": int(is_outcome),
@@ -159,9 +155,7 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
             concept_ids = torch.cat([concept_ids, torch.tensor([[concept_id]], device=device)], dim=1)
             value_ids   = torch.cat([value_ids, torch.tensor([[value_id]], device=device)], dim=1)
             pos_ids     = torch.cat([pos_ids, torch.tensor([[next_token_id]], device=device)], dim=1)
-            delta_ts = torch.cat([delta_ts, torch.tensor([[pred_delta_t]], device=device)], dim=1)
-            abs_ts = torch.cat([abs_ts, abs_ts[:, -1:] + pred_delta_t], dim=1)
-
+            abs_ts = torch.cat([abs_ts, torch.tensor([[pred_abs_t_norm]], device=device)], dim=1)
             steps += 1
 
     return pd.DataFrame(rows)

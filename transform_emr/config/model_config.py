@@ -31,5 +31,5 @@ TRAINING_SETTINGS = {
     "batch_size": 8, # Number of patients processed concurrently
     "k_window": 5, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
     "penalty_weight": 1.0, # Weight for special penalties given on next token loss function. Currently as calculated.
-    "delta_t_weight": 1.0, # Weight loss on the delta_t prediction, which is combined with regular loss. Currently as calculated.
+    "abs_t_weight": 1.0, # Weight loss on the abs_t prediction, which is combined with regular loss. Currently as calculated.
 }

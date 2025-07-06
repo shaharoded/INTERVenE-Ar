@@ -157,11 +157,11 @@ class GPT(nn.Module):
             f"does not match embedder.position_embed ({vocab_size})"
         )
 
-        # Delta T prediction head (for regression of delta_t at each step -> When will next event occur?)
-        self.delta_t_head = nn.Sequential(
+        # Delta T prediction head (for regression of delta t from admission at each step -> When will each event occur?)
+        self.abs_t_head = nn.Sequential(
             nn.Linear(cfg["embed_dim"], 16 * cfg["time2vec_dim"]),
             nn.ReLU(),
-            nn.Linear(16 * cfg["time2vec_dim"], 1)  # Output: scalar delta_t
+            nn.Linear(16 * cfg["time2vec_dim"], 1)  # Output: scalar abs_t
         )
 
         self.apply(self._init_weights)
@@ -226,14 +226,13 @@ class GPT(nn.Module):
 
     # ---------------------------------------------------- forward & loss ---- #
     def forward(self, raw_concept_ids, concept_ids, value_ids, position_ids,
-            delta_ts, abs_ts, context_vec=None):
+            abs_ts, context_vec=None):
         """
         All tensors come straight from `collate_emr`:
             raw_concept_ids (torch.Tensor)   - padded raw_concept ids, (B, T)
             concept_ids (torch.Tensor)       - padded concepts ids, (B, T)
             value_ids (torch.Tensor)         - padded concept_value ids, (B, T)
             position_ids (torch.Tensor)      - padded token ids, (B, T)
-            delta_ts (torch.Tensor)          - relative start times from last event (hours), (B, T)
             abs_ts (torch.Tensor)            - relative start times from ADMISSION (hours), (B, T)
             context_vec (torch.Tensor)       - age/gender or [] if not used, (B, C)
         """
@@ -242,7 +241,7 @@ class GPT(nn.Module):
             return block(x)
         
         x = self.drop(self.embedder(raw_concept_ids, concept_ids, value_ids, position_ids,
-            delta_ts, abs_ts, context_vec, return_mask=False))  # (B, T+1, D)
+            abs_ts, context_vec, return_mask=False))  # (B, T+1, D)
         
         for blk in self.blocks:
             if self.training and self.use_checkpoint:
@@ -252,9 +251,9 @@ class GPT(nn.Module):
         
         x = self.ln_f(x)
         logits = self.lm_head(x)            # (B, T+1, V)
-        delta_t_pred = self.delta_t_head(x)     # (B, T+1, 1)
+        abs_t_pred = self.abs_t_head(x)     # (B, T+1, 1)
 
-        return logits, delta_t_pred.squeeze(-1)  # loss is computed in train.py, squeeze for easier MSE
+        return logits, abs_t_pred.squeeze(-1)  # loss is computed in train.py, squeeze for easier MSE
     
 
     def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None):
@@ -370,12 +369,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
                 batch = {k: v.to(device) for k, v in batch.items()}
-                logits, delta_t_pred = model(
+                logits, abs_t_pred = model(
                     raw_concept_ids=batch["raw_concept_ids"],
                     concept_ids=batch["concept_ids"],
                     value_ids=batch["value_ids"],
                     position_ids=batch["position_ids"],
-                    delta_ts=batch["delta_ts"],
                     abs_ts=batch["abs_ts"],
                     context_vec=batch["context_vec"]
                 )
@@ -419,17 +417,17 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 penalty = torch.log1p((p1 + p2 + p3) / 3.0)
                 penalty = get_penalty_weight(epoch) * penalty # Apply dynamic weight
 
-                # Predict delta_ts[:, 1:] using model delta_t_head
-                true_delta = torch.clamp(batch["delta_ts"], 0.0, 336.0) / 336.0  # Cap to 14 days (in hours), [B, T], range [0,1]
-                pred_delta = torch.clamp(torch.sigmoid(delta_t_pred[:, 1:]), min=0.0, max=1.0) # shape: [B, T], range [0,1]
+                # Predict abs_ts[:, 1:] using model abs_t_head
+                true_delta = torch.clamp(batch["abs_ts"], 0.0, 1.0)  # [B, T], range [0,1]
+                pred_delta = torch.clamp(torch.sigmoid(abs_t_pred[:, 1:]), min=0.0, max=1.0) # shape: [B, T], range [0,1]
                 
                 mask = (target_tokens != model.embedder.padding_idx).float()  # [B, T]
-                delta_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
-                delta_t_loss = (delta_t_loss * mask).sum() / mask.sum().clamp(min=1)
-                delta_t_loss = TRAINING_SETTINGS["delta_t_weight"] * delta_t_loss
+                abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
+                abs_t_loss = (abs_t_loss * mask).sum() / mask.sum().clamp(min=1)
+                abs_t_loss = TRAINING_SETTINGS["abs_t_weight"] * abs_t_loss
 
                 # Combine all
-                loss = bce + penalty + delta_t_loss
+                loss = bce + penalty + abs_t_loss
 
                 if train_flag:
                     optimizer.zero_grad()
@@ -441,7 +439,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 total_loss += loss.item()
                 total_bce += bce.item()
                 total_penalty += penalty.item()
-                total_dt += delta_t_loss.item()
+                total_dt += abs_t_loss.item()
         
         n_batches = len(loader)
 
