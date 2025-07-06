@@ -9,7 +9,7 @@ EMBEDDER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase1', 'best_embedder.pt'
 TRANSFORMER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'best_model.pt')
 
 MODEL_CONFIG = {
-      "ctx_dim": 0, # A place holder to fill after creating the dataset. Adjust value post-training before deploying.
+      "ctx_dim": 2, # Fill manually once defined your context data.
       "time2vec_dim": 16,
       "embed_dim": 256,
       "block_size": 256,  # //e.g. sequence length, number of tokens processed concurrently

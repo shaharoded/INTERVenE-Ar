@@ -91,7 +91,10 @@ def prepare_data():
     
     summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer)   
 
-    MODEL_CONFIG['ctx_dim'] = train_ds.context_df.shape[1] # Dinamically updating shape
+    assert train_ds.context_df.shape[1] == MODEL_CONFIG['ctx_dim'], (
+    f"Context dimension mismatch: expected {MODEL_CONFIG['ctx_dim']}, "
+    f"but got {train_ds.context_df.shape[1]}. Columns: {list(train_ds.context_df.columns)}"
+    )
 
     train_dl = DataLoader(train_ds, batch_size=TRAINING_SETTINGS.get('batch_size'), shuffle=True, collate_fn=collate_emr, num_workers=os.cpu_count())
     val_dl   = DataLoader(val_ds,  batch_size=TRAINING_SETTINGS.get('batch_size'), shuffle=False, collate_fn=collate_emr, num_workers=os.cpu_count())
