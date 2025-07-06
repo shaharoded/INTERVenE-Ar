@@ -144,7 +144,7 @@ class EMREmbedding(nn.Module):
 
 
     def forward(self, raw_concept_ids, concept_ids, value_ids, position_ids,
-                delta_ts, abs_ts, patient_contexts, return_mask=False):
+                 abs_ts, patient_contexts, return_mask=False):
         """
         Build time-aware event embeddings for a full sequence.
 
@@ -153,7 +153,6 @@ class EMREmbedding(nn.Module):
             concept_ids (LongTensor):     [B, T]
             value_ids (LongTensor):       [B, T]
             position_ids (LongTensor):    [B, T]
-            delta_ts (FloatTensor):       [B, T]
             abs_ts (FloatTensor):         [B, T]
             patient_contexts (FloatTensor): [B, ctx_dim]
             return_mask (bool): Whether to return an attention mask
@@ -216,7 +215,7 @@ class EMREmbedding(nn.Module):
             "model_state": self.state_dict(),
             "config": {
                 "ctx_dim": self.context_proj.in_features,
-                "time2vec_dim": self.time2vec_rel.freq.out_features + 1,
+                "time2vec_dim": self.time2vec_abs.freq.out_features + 1,
                 "embed_dim": self.output_dim,
                 "dropout": self.dropout.p,
                 "vocab_size": self.position_embed.num_embeddings,
