@@ -47,7 +47,7 @@ class DataProcessor:
         self._expand_tokens()
         
         # Process on context_df
-        self.context_df = self.context_df.set_index("PatientID").astype("float32")
+        self.context_df = self.context_df.set_index("PatientID").drop(columns=["PatientID"], errors="ignore").astype("float32")
         self._fit_scaler()
         return self.df, self.context_df
 
