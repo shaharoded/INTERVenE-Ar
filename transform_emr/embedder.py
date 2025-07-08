@@ -263,7 +263,8 @@ class EMREmbedding(nn.Module):
         return model, ckpt["epoch"], ckpt["best_val"], ckpt["optim_state"], ckpt["scheduler_state"]
 
 
-def train_embedder(embedder, train_loader, val_loader, resume=True):
+def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_path=EMBEDDER_CHECKPOINT, 
+                   training_settings=TRAINING_SETTINGS):
     """
     Trains an EMREmbedding model using weighted k-step prediction loss, to allow for a softer loss penalty.
     IDEA: The exact order of the token is not really important, only the existance of important tokens and patterns.
@@ -273,6 +274,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True):
         train_loader (DataLoader): Training dataloader.
         val_loader (DataLoader): Validation dataloader.
         resume (bool): Resume from last checkpoint if available.
+        checkpoint_path (str): Path to save the best model and state.
+        training_settings (dict): A settings dictionary, imported from model_config.
 
     Returns:
         Tuple: (trained model, train_losses, val_losses)
@@ -280,12 +283,12 @@ def train_embedder(embedder, train_loader, val_loader, resume=True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     embedder.to(device)
 
-    ckpt_path = Path(EMBEDDER_CHECKPOINT).resolve()
+    ckpt_path = Path(checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     ckpt_last = ckpt_path.parent / "ckpt_last.pt"
 
     # ----- Loss & Optimizer -----
-    optimizer = torch.optim.AdamW(embedder.parameters(), lr=TRAINING_SETTINGS["phase1_learning_rate"])
+    optimizer = torch.optim.AdamW(embedder.parameters(), lr=training_settings["phase1_learning_rate"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=embedder.tokenizer.token_weights.to(device))
 
@@ -327,7 +330,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True):
                                                     position_ids=batch["position_ids"], 
                                                     padding_idx=embedder.padding_idx, 
                                                     vocab_size=logits.size(-1), 
-                                                    k=TRAINING_SETTINGS["k_window"]
+                                                    k=training_settings["k_window"]
                                                     )
             loss = loss_fn(logits, multi_hot_targets)
 
@@ -341,7 +344,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True):
         return total_loss / len(loader)
 
     # ----- Training loop -----
-    for epoch in range(start_epoch, TRAINING_SETTINGS["phase1_n_epochs"] + 1):
+    for epoch in range(start_epoch, training_settings["phase1_n_epochs"] + 1):
         tr_loss = run_epoch(train_loader, train=True)
         vl_loss = run_epoch(val_loader, train=False)
 
@@ -359,9 +362,9 @@ def train_embedder(embedder, train_loader, val_loader, resume=True):
             best_val = vl_loss
             embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path)
         else:
-            if epoch >= TRAINING_SETTINGS["warmup_epochs"]:
+            if epoch >= training_settings["warmup_epochs"]:
                 bad_epochs += 1
-                if bad_epochs >= TRAINING_SETTINGS["patience"]:
+                if bad_epochs >= training_settings["patience"]:
                     print("[Phase 1] Early stopping triggered.")
                     break
 

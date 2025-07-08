@@ -170,6 +170,8 @@ if __name__ == "__main__":
     from transform_emr.transformer import GPT
     from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset
     from transform_emr.config.model_config import *
+    from transform_emr.config.dataset_config import *
+
 
     # Load test data
     print("Loading dataset...")

@@ -12,7 +12,6 @@ from math import exp
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import meal2rank
-from transform_emr.config.model_config import TRAINING_SETTINGS
 
 
 
@@ -49,28 +48,6 @@ def get_multi_hot_targets(position_ids, padding_idx, vocab_size, k):
                 if token != padding_idx:
                     targets[b, t, token] = 1.0
     return targets
-
-
-def get_penalty_weight(epoch, max_weight=TRAINING_SETTINGS.get("penalty_weight")):
-    """
-    Penalty weight schedule:
-    - [0, warmup): 0.0 (no penalty)
-    - [warmup, 2*warmup): sharp sigmoid ramp-up
-    - [2*warmup, ∞): max_weight
-    """
-    warmup = TRAINING_SETTINGS.get("warmup_epochs")
-
-    if epoch < warmup:
-        return 0.0
-    elif epoch >= 2 * warmup:
-        return max_weight
-
-    # progress ∈ [0, 1] over the ramp phase
-    progress = (epoch - warmup) / warmup
-    sharpness = 16  # Increase for steeper burst
-    weight = 1 / (1 + exp(-sharpness * (progress - 0.75)))
-
-    return max_weight * weight
 
 
 def penalty_meal_order(predicted_tokens, id2token, device=None):

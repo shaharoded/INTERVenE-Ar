@@ -1,3 +1,4 @@
+import os
 import torch
 from torch.utils.data import Dataset
 import pandas as pd
@@ -22,9 +23,10 @@ class DataProcessor:
     df (pd.DataFrame): Transformed long-format event dataframe after all processing.
     context_df (pd.DataFrame): Patient context dataframe with PatientID as index.
     scaler (StandardScaler): Scaler fitted to context_df and optionally saved to disk.
+    checkpoint_path (str): Path to save the scaler / tokenizer at for later usage.
 
     """
-    def __init__(self, df, context_df, max_input_days=None, scaler=None):
+    def __init__(self, df, context_df, max_input_days=None, scaler=None, checkpoint_path=CHECKPOINT_PATH):
         df['StartDateTime'] = pd.to_datetime(df['StartTime'], format='ISO8601', utc=True, errors='raise')
         df['StartDateTime'] = df['StartDateTime'].dt.tz_convert(None)
         df['EndDateTime'] = pd.to_datetime(df['EndTime'], format='ISO8601', utc=True, errors='raise')
@@ -35,6 +37,7 @@ class DataProcessor:
         self.context_df = context_df.copy()
         self.max_input_days = max_input_days
         self.scaler = scaler
+        self.checkpoint_path = checkpoint_path
 
 
     def run(self):
@@ -61,8 +64,8 @@ class DataProcessor:
         if self.scaler is None:
             scaler = StandardScaler()
             self.context_df.loc[:, :] = scaler.fit_transform(self.context_df.values)
-            os.makedirs(CHECKPOINT_PATH, exist_ok=True)
-            dump(scaler, os.path.join(CHECKPOINT_PATH, 'scaler.pkl'))
+            os.makedirs(self.checkpoint_path, exist_ok=True)
+            dump(scaler, os.path.join(self.checkpoint_path, 'scaler.pkl'))
         else:
             self.context_df.loc[:, :] = self.scaler.transform(self.context_df.values)
 

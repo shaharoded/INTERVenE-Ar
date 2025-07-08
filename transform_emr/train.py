@@ -105,7 +105,9 @@ def phase_one(embedder, train_dl, val_dl, resume=True):
         embedder=embedder,
         train_loader=train_dl,
         val_loader=val_dl,
-        resume=resume
+        resume=resume,
+        checkpoint_path=EMBEDDER_CHECKPOINT,
+        training_settings=TRAINING_SETTINGS
     )
 
 def phase_two(model, train_dl, val_dl, resume=True):
@@ -114,7 +116,8 @@ def phase_two(model, train_dl, val_dl, resume=True):
                         train_dl=train_dl, 
                         val_dl=val_dl, 
                         resume=resume, 
-                        checkpoint_path=TRANSFORMER_CHECKPOINT
+                        checkpoint_path=TRANSFORMER_CHECKPOINT,
+                        training_settings=TRAINING_SETTINGS
                     )
 
 
