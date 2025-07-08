@@ -82,7 +82,7 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
 
         # Log all inputs
         rows.append({
-            "PatientID": pid, "Step": 0, "Token": "[CTX]",
+            "PatientID": pid, "Step": 0, "Token": "[CTX]", "TimePoint": 0.0,
             "IsInput": 1, "IsOutcome": 0, "IsTerminal": 0
         })
         for i in range(seq_len):
@@ -133,7 +133,7 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
 
             # Predicted delta for next token
             pred_abs_t_norm = abs_t_preds[0, -1].item()
-            pred_abs_t = min(max(pred_abs_t_norm * 336.0, 0.0), 336.0)  # Revert normalization, Avoid negative or NaN, limit next token to 14 days from admission
+            pred_abs_t = max(pred_abs_t_norm * 336.0, 0.0)  # Revert normalization, Avoid negative or NaN
 
             rows.append({
                 "PatientID": pid,

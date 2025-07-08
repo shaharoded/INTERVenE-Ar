@@ -45,9 +45,9 @@ class DataProcessor:
         self._validate_and_align_inputs()
         self._truncate_after_terminal_event()
         self._normalize_time()
+        self._expand_tokens()
         if self.max_input_days:
             self._cut_after_k_days()
-        self._expand_tokens()
         
         # Process on context_df
         if 'index' in self.context_df.columns:
@@ -163,30 +163,6 @@ class DataProcessor:
             return group
 
         self.df = self.df.groupby("PatientID", group_keys=False).apply(process_group).reset_index(drop=True)
-
-
-    def _cut_after_k_days(self):
-        """
-        Trims patient timelines to only include events within the first `k` days from admission.
-        Drops patients whose entire stay is <= k+1 days (nothing to predict beyond that).
-        """
-        df = self.df
-        k_days = self.max_input_days
-        k_hours = k_days * 24
-
-        # Keep only visits with at least k+1 minutes
-        visit_durations = df.groupby("VisitID")["RelStartTime"].max()
-        eligible_visits = visit_durations[visit_durations > k_hours].index
-        df = df[df["VisitID"].isin(eligible_visits)].copy()
-
-        # Cut timeline to first k minutes of visit
-        df = df[df["RelStartTime"] <= k_hours].copy()
-
-        # Drop visits with 1 or fewer records
-        visit_counts = df.groupby("VisitID").size()
-        df = df[df["VisitID"].isin(visit_counts[visit_counts > 1].index)]
-
-        self.df = df
     
 
     def _normalize_time(self):
@@ -247,6 +223,34 @@ class DataProcessor:
 
         # --- Sort and compute time deltas ---
         self.df = df.sort_values(['PatientID', 'TimePoint'])
+
+
+    def _cut_after_k_days(self):
+        """
+        Trims token-level data to only include tokens occurring within the first `k` days (from admission).
+        Drops visits where no events remain after truncation.
+
+        NOTE: This version fits a data process where PatientID is actually the visitID, meaning every ID belongs 
+        to only 1 group of records. If you want generation based on PatientID that can have the information of a few 
+        visits you'll need to change the key here to VisitCounter, but to ensure it is also passed from _expand_tokens().
+
+        """
+        df = self.df
+        k_hours = self.max_input_days * 24
+
+        # Only keep visits that originally last longer than k days
+        visit_max_times = df.groupby("PatientID")["TimePoint"].max()
+        long_enough_visits = visit_max_times[visit_max_times > k_hours].index
+        df = df[df["PatientID"].isin(long_enough_visits)].copy()
+
+        # Keep only events up to k_days
+        df = df[df["TimePoint"] <= k_hours].copy()
+
+        # Drop visits with no records remaining
+        remaining_visits = df.groupby("PatientID").size()
+        df = df[df["PatientID"].isin(remaining_visits[remaining_visits > 1].index)]
+
+        self.df = df
 
 
 class EMRTokenizer:
