@@ -27,11 +27,13 @@ class DataProcessor:
 
     """
     def __init__(self, df, context_df, max_input_days=None, scaler=None, checkpoint_path=CHECKPOINT_PATH):
-        df['StartDateTime'] = pd.to_datetime(df['StartTime'], format='ISO8601', utc=True, errors='raise')
+        # Handle compatability issue in complete flow
+        if "StartTime" in df.columns and "EndTime" in df.columns:
+            df.rename(columns={"StartTime": "StartDateTime", "EndTime": "EndDateTime"}, inplace=True)
+        df['StartDateTime'] = pd.to_datetime(df['StartDateTime'], format='ISO8601', utc=True, errors='raise')
         df['StartDateTime'] = df['StartDateTime'].dt.tz_convert(None)
-        df['EndDateTime'] = pd.to_datetime(df['EndTime'], format='ISO8601', utc=True, errors='raise')
+        df['EndDateTime'] = pd.to_datetime(df['EndDateTime'], format='ISO8601', utc=True, errors='raise')
         df['EndDateTime'] = df['EndDateTime'].dt.tz_convert(None)
-        df.drop(columns=["StartTime", "EndTime"], inplace=True)
 
         self.df = df.copy()
         self.context_df = context_df.copy()
