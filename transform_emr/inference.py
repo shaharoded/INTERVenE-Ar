@@ -131,9 +131,14 @@ def infer_event_stream(model, dataset, max_len=500, temperature=1.0, tqdm_positi
             is_outcome = next_token_id in outcome_ids
             is_terminal = next_token_id in terminal_ids
 
-            # Predicted delta for next token
+            # Get model's prediction (normalized absolute time)
             pred_abs_t_norm = abs_t_preds[0, -1].item()
-            pred_abs_t = max(pred_abs_t_norm * 336.0, 0.0)  # Revert normalization, Avoid negative or NaN
+            pred_abs_t = pred_abs_t_norm * 336.0  # denormalize
+
+            # Enforce monotonicity: time must be >= last predicted time
+            last_time = abs_ts[0, -1].item() * 336.0
+            pred_abs_t = max(pred_abs_t, last_time)
+            pred_abs_t_norm = pred_abs_t / 336.0  # re-normalize
 
             rows.append({
                 "PatientID": pid,

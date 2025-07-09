@@ -297,6 +297,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     """
     Trains a Transformer-based EMR sequence model in Phase 2 (decoder stage),
     using a pretrained embedder and structured multi-loss optimization.
+    Total Loss = BCE + λ1 * Penalty + λ2 * Time Loss (τt)
 
     Freezes the embedder for the initial `warmup_epochs`, then unfreezes and reconfigures
     the optimizer to include it. Supports resume-from-checkpoint training.
