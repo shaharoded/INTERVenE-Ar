@@ -158,6 +158,7 @@ if __name__ == "__main__":
     ckpt_embedder_path = Path(EMBEDDER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
 
     if ckpt_embedder_path.exists():
+        # Not really needed. train_embedder function also calles EMREmbedding.load() on assumed checkpoint.
         embedder, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
     else:
         embedder = EMREmbedding(
@@ -173,6 +174,7 @@ if __name__ == "__main__":
     ckpt_last_path = Path(TRANSFORMER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
 
     if ckpt_last_path.exists():
+        # Not really needed. train_transformer function also calles GPT.load() on assumed checkpoint.
         model, _, _, _, _ = GPT.load(ckpt_last_path, embedder=embedder)
     else:
         model = GPT(cfg=MODEL_CONFIG, embedder=embedder)

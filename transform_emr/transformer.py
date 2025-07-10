@@ -224,6 +224,32 @@ class GPT(nn.Module):
         ]
 
         return torch.optim.AdamW(optim_groups, betas=betas)
+    
+    def configure_scheduler(self, optimizer, training_settings, train_dl):
+        """
+        Configures the learning rate scheduler for phase 2 training.
+
+        Uses the OneCycleLR scheduler to warm up and then anneal the learning rate
+        over the course of training. Scheduler parameters (like total steps and
+        learning rate) are derived from the provided training settings.
+
+        Args:
+            optimizer (torch.optim.Optimizer): Optimizer instance to schedule.
+            training_settings (dict): Dictionary containing training hyperparameters,
+                including 'phase2_learning_rate' and 'phase2_n_epochs'.
+            train_dl (DataLoader): Training dataloader used to compute steps per epoch.
+
+        Returns:
+            torch.optim.lr_scheduler.OneCycleLR: Configured learning rate scheduler.
+        """
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=training_settings["phase2_learning_rate"],
+            total_steps=training_settings["phase2_n_epochs"] * len(train_dl),
+            pct_start=0.1,
+            anneal_strategy="cos",
+            cycle_momentum=False
+        )
 
     # ---------------------------------------------------- forward & loss ---- #
     def forward(self, raw_concept_ids, concept_ids, value_ids, position_ids,
@@ -277,7 +303,6 @@ class GPT(nn.Module):
     @classmethod
     def load(cls, path, embedder, map_location="cpu"):
         ckpt = torch.load(path, map_location=map_location)
-        config = ckpt["config"]
 
         # === Vocab safety check ===
         expected_vocab = ckpt["vocab_size"]
@@ -286,12 +311,18 @@ class GPT(nn.Module):
             raise ValueError(
                 f"[GPT.load] Embedder vocab size mismatch: expected {expected_vocab}, got {actual_vocab}"
             )
-
-        model = cls(cfg=config, embedder=embedder)
+        
+        model = cls(cfg=ckpt["config"], embedder=embedder)
         model.load_state_dict(ckpt["model_state"])
 
         # Return full training state if available
-        return model, ckpt.get("epoch", 0), ckpt.get("best_val", float("inf")), ckpt.get("optim_state"), ckpt.get("scheduler_state")
+        return (
+        model,
+        ckpt.get("epoch", 0),
+        ckpt.get("best_val", float("inf")),
+        ckpt.get("optim_state", None),
+        ckpt.get("scheduler_state", None)
+        )
 
 
 def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRANSFORMER_CHECKPOINT, training_settings=TRAINING_SETTINGS):
@@ -334,15 +365,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         betas=(0.9, 0.95)
     )
 
-    steps_per_epoch = len(train_dl)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=training_settings["phase2_learning_rate"],
-        total_steps=training_settings["phase2_n_epochs"] * steps_per_epoch,
-        pct_start=0.1,  # 10% warmup
-        anneal_strategy='cos',
-        cycle_momentum=False
-    )
+    scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
 
     ckpt_path = Path(checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -355,11 +378,15 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     if resume and ckpt_last.exists():
         print(f"[GPT]: Resuming from checkpoint: {ckpt_last}")
-        loaded_model, start_epoch, best_val, opt_state, sch_state = GPT.load(ckpt_last, embedder=model.embedder, map_location=device)
+        loaded_model, start_epoch, best_val, opt_state, sch_state  = GPT.load(ckpt_last, embedder=model.embedder, map_location=device)
         model.load_state_dict(loaded_model.state_dict())
         optimizer.load_state_dict(opt_state)
+        
+        # Scheduler needs to be re-initiated with the recovered optimizer before loading it's state dict
+        scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
         scheduler.load_state_dict(sch_state)
         start_epoch += 1
+        print(f"[GPT]: Resumed training at epoch {start_epoch} (best val_loss so far: {best_val:.4f})")
     else:
         print("[GPT]: Starting transformer training loop...")
 
@@ -453,6 +480,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         if epoch == freeze_epochs:
             print(f"[GPT]: Unfreezing embedder after {freeze_epochs} epochs.")
             set_embedder_frozen(model, freeze=False)
+            # Re-initiate optimizer now that the embedder will update as well
             optimizer = model.configure_optimizers(
                 weight_decay=training_settings["weight_decay"],
                 learning_rate=training_settings["phase2_learning_rate"],
