@@ -187,34 +187,3 @@ def penalty_hallucinated_intervals(predicted_tokens, target_tokens, id2token, st
     # Normalize penalty: unmatched / predicted
     normalized = total_unmatched / total_predicted
     return torch.tensor(normalized, dtype=torch.float32, device=device)
-
-
-def penalty_false_positives(predictions, targets, token_weights, important_token_ids, threshold=0.5):
-    """
-    Penalizes overgeneration of important tokens, scaled by their importance weights.
-
-    Only considers tokens in `important_token_ids`. Penalizes if a token is predicted more times
-    than it appears in the ground truth (multi-hot). This prevents false positives on critical concepts.
-
-    Args:
-        predictions (Tensor): [B, T, V] — raw logits or probabilities
-        targets     (Tensor): [B, T, V] — ground-truth multi-hot labels
-        token_weights (Tensor): [V] — per-token importance weights
-        important_token_ids (Iterable[int]): list or set of token IDs to consider for penalty
-        threshold (float): threshold above which a token is considered predicted
-
-    Returns:
-        Torch.Tensor: penalty
-    """
-    pred_bin = (predictions > threshold).float()         # [B, T, V]
-    false_pos = torch.clamp(pred_bin - targets, min=0.0) # [B, T, V]
-    fp_counts = false_pos.sum(dim=(0, 1))                # [V]
-
-    # Mask and weight only the important token IDs
-    important_ids = torch.tensor(list(important_token_ids), device=predictions.device)
-    penalties = fp_counts[important_ids] * token_weights[important_ids]
-
-    penalty = penalties.sum()
-    max_possible_fp = predictions.size(0) * predictions.size(1)  # B * T norm
-    normalized_penalty = penalty / max_possible_fp
-    return normalized_penalty.clamp(0.0, 1.0)

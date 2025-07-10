@@ -410,14 +410,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 penalty = torch.tensor(0.0, device=logits.device)
                 p1 = penalty_meal_order(pred_ids, model.embedder.tokenizer.id2token, logits.device)
                 p2 = penalty_hallucinated_intervals(pred_ids, target_tokens, model.embedder.tokenizer.id2token, device=logits.device)
-                p3 = penalty_false_positives(
-                    predictions=pred_logits,
-                    targets=multi_hot,
-                    token_weights=model.embedder.tokenizer.token_weights,
-                    important_token_ids=model.embedder.tokenizer.important_token_ids
-                )
+
                 # Average the penalties to bound in [0, 1] + smooth
-                penalty = torch.log1p((p1 + p2 + p3) / 3.0)
+                penalty = torch.log1p((p1 + p2) / 2.0)
                 penalty = training_settings["penalty_weight"] * penalty # Apply penalty weight
 
                 # Predict abs_ts[:, 1:] using model abs_t_head
