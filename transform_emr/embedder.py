@@ -1,6 +1,7 @@
 import numpy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import sklearn.preprocessing
 import math
 from pathlib import Path
@@ -87,6 +88,10 @@ class EMREmbedding(nn.Module):
 
     All embeddings are regularized with dropout and normalized with LayerNorm.
 
+    In addeition, a tiny MLP head (self.time_head) is attached solely for Phase-1 pre-training.  
+    It encourages Time2Vec to encode absolute-time information by regressing the normalised Δt  ∈ [0,1].  
+    The head is ignored / discarded in Phase-2.
+
     Args:
         tokenizer (EMRTokenizer): The tokenizer object managing vocabularies and token metadata.
         ctx_dim (int): Dimensionality of the patient context vector.
@@ -118,8 +123,16 @@ class EMREmbedding(nn.Module):
         # --- Time embeddings ---
         self.time2vec_abs = Time2Vec(time2vec_dim)
 
-        # --- Time projection ---
+        # --- Time projection + supervised head ---
         self.time_proj = nn.Linear(time2vec_dim, embed_dim, bias=False)
+        
+        hidden = max(4, time2vec_dim // 2) # Small regression head for Δt supervision (only used in phase‑1)
+        self.time_head = nn.Sequential(
+            nn.Linear(time2vec_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+            nn.Sigmoid() # bound to [0,1]
+        )
 
         # --- patient‑context slot ----------------------------------------
         self.ctx_token  = nn.Parameter(torch.randn(embed_dim)) # learnable [CTX] token
@@ -139,6 +152,16 @@ class EMREmbedding(nn.Module):
         # --- Decoder tied to token embeddings ----------------------------
         self.decoder = nn.Linear(embed_dim, len(tokenizer.token2id), bias=False)
         self.decoder.weight = self.position_embed.weight  # weight tying
+
+
+    def predict_time(self, abs_ts):
+        """
+        Helper used during Phase‑1 to supervise Time2Vec.
+        abs_ts must be the same tensor given to forward().
+        Returns: [B, T, 1] values ∈ [0,1]
+        """
+        t_abs = self.time2vec_abs(abs_ts)      # [B, T, k]
+        return self.time_head(t_abs)           # [B, T, 1]
 
 
     def forward(self, raw_concept_ids, concept_ids, value_ids, position_ids,
@@ -166,7 +189,7 @@ class EMREmbedding(nn.Module):
         p_emb = self.position_embed(position_ids)
 
         # --- Time encoding ---
-        t_abs = self.time2vec_abs(abs_ts)           # [B, T, k]
+        t_abs = self.time2vec_abs(abs_ts)           # [B, T, k] (k = time2vec_dim)
         t_emb = self.time_proj(t_abs)               # [B, T, D]
 
         # --- Combine all token-wise pieces ---
@@ -202,7 +225,7 @@ class EMREmbedding(nn.Module):
             raw_concept_ids, concept_ids, value_ids, position_ids,
             abs_ts, patient_contexts,
             return_mask=False
-        )  # [B, T+1, D]
+        )  # → returns only [B,T+1,D]
 
         return self.decoder(seq[:, :-1, :])  # Predict next token at each step
     
@@ -308,8 +331,11 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
 
     # ----- Epoch function -----
     def run_epoch(loader, train=False):
+        """
+        Returns Tuple: total_loss, bce_loss, time_loss (for logging in train_embedder and validation)
+        """
         embedder.train() if train else embedder.eval()
-        total_loss = 0
+        total_loss, total_bce, total_dt = 0.0, 0.0, 0.0
 
         for batch in tqdm(loader, desc="Training" if train else "Validation", leave=False):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -332,7 +358,17 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                                                     vocab_size=logits.size(-1), 
                                                     k=training_settings["k_window"]
                                                     )
-            loss = loss_fn(logits, multi_hot_targets)
+            loss_bce = loss_fn(logits, multi_hot_targets)
+            # Δt regression supervision
+            # Predict normalised absolute time for every step
+            pred_t = embedder.predict_time(batch["abs_ts"])            # [B,T,1]
+            time_loss = F.mse_loss(
+                pred_t.squeeze(-1),                                    # [B,T]
+                batch["abs_ts"],                                       # [B,T]
+                reduction='mean'
+            )
+            time_loss *= training_settings["phase1_dt_weight"] # Scale
+            loss = loss_bce + time_loss
 
             if train:
                 loss.backward()
@@ -340,26 +376,30 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 optimizer.step()
 
             total_loss += loss.item()
+            total_bce  += loss_bce.item()
+            total_dt   += time_loss.item()
 
-        return total_loss / len(loader)
+        n = len(loader)
+        return (total_loss / n, total_bce / n, total_dt / n)
 
     # ----- Training loop -----
     for epoch in range(start_epoch, training_settings["phase1_n_epochs"] + 1):
-        tr_loss = run_epoch(train_loader, train=True)
-        vl_loss = run_epoch(val_loader, train=False)
+        tr_tot, tr_bce, tr_dt = run_epoch(train_loader, train_flag=True)
+        vl_tot, vl_bce, vl_dt = run_epoch(val_loader,   train_flag=False)
 
-        train_losses.append(tr_loss)
-        val_losses.append(vl_loss)
+        train_losses.append(tr_tot)
+        val_losses.append(vl_tot)
 
-        print(f"[Phase 1] Epoch {epoch:03d} | Train: {tr_loss:.4f} | Val: {vl_loss:.4f}")
-        scheduler.step(vl_loss)
+        print(f"[Phase‑1] Epoch {epoch:03d} | "
+            f"Train BCE={tr_bce:.4f}  Δt={tr_dt:.4f}  Tot={tr_tot:.4f} | "
+            f"Val BCE={vl_bce:.4f}    Δt={vl_dt:.4f}  Tot={vl_tot:.4f}")
 
         # Save last checkpoint
         embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last)
 
         # Save best model
-        if vl_loss < best_val - 1e-4:
-            best_val = vl_loss
+        if vl_tot < best_val - 1e-4:
+            best_val = vl_tot
             embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path)
         else:
             if epoch >= training_settings["warmup_epochs"]:

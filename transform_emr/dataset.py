@@ -285,7 +285,7 @@ class EMRTokenizer:
         self.important_token_ids = important_token_ids
         
         # Validate presence of mandatory special tokens
-        required_specials = ["[MASK]", "[PAD]", "[CTX]"]
+        required_specials = ["[MASK]", "[PAD]", "[CTX]", "[NULL]"]
         for tok in required_specials:
             if tok not in token2id:
                 raise ValueError(f"[Tokenizer Error] Missing required special token: {tok}")
@@ -293,10 +293,11 @@ class EMRTokenizer:
         self.mask_token_id = token2id["[MASK]"]
         self.pad_token_id = token2id["[PAD]"]
         self.ctx_token_id = token2id["[CTX]"]
+        self.null_token_id = token2id["[NULL]"]
 
 
     @classmethod
-    def from_processed_df(cls, df, special_tokens=["[PAD]", "[MASK]", "[CTX]"]):
+    def from_processed_df(cls, df, special_tokens=["[PAD]", "[MASK]", "[CTX]", "[NULL]"]):
         raw_concepts = sorted(df['RawConcept'].unique())
         concepts = sorted(df['Concept'].unique())
         values = sorted(df['ValueToken'].unique())
@@ -324,7 +325,7 @@ class EMRTokenizer:
         for outcome in OUTCOMES:
             tok_id = token2id.get(outcome)
             if tok_id is not None:
-                token_weights[tok_id] = 3.0
+                token_weights[tok_id] = 5.0
         for term in TERMINAL_OUTCOMES:
             tok_id = token2id.get(term)
             if tok_id is not None:
@@ -332,8 +333,6 @@ class EMRTokenizer:
         for tok in token2id:
             if "MEAL" in tok:
                 token_weights[token2id[tok]] = 2.0
-            if tok.endswith("_START") or tok.endswith("_END"):
-                token_weights[token2id[tok]] = 1.5
         for ignore_tok in special_tokens + [ADMISSION_TOKEN]:
             tok_id = token2id.get(ignore_tok)
             if tok_id is not None:
