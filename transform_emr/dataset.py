@@ -375,9 +375,6 @@ class EMRTokenizer:
             tok_id = token2id.get(term)
             if tok_id is not None:
                 token_weights[tok_id] = 10.0
-        for tok in token2id:
-            if "MEAL" in tok:
-                token_weights[token2id[tok]] = 2.0
         for ignore_tok in special_tokens + [ADMISSION_TOKEN]:
             tok_id = token2id.get(ignore_tok)
             if tok_id is not None:
