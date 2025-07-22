@@ -418,12 +418,13 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     position_ids=target_tokens,
                     padding_idx=model.embedder.padding_idx,
                     vocab_size=logits.size(-1),
-                    k=training_settings["k_window"]
+                    k=training_settings["bce_k_window"]
                 )
 
                 # Main loss: BCE with logits
                 loss_fn = nn.BCEWithLogitsLoss(pos_weight=model.embedder.tokenizer.token_weights.to(logits.device))
-                bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
+                loss_bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
+                loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 
                 # Get predicted token IDs
                 pred_ids = pred_logits.argmax(dim=-1) # [B, T] — single token prediction per timestep, full block
@@ -440,7 +441,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # Average the penalties to bound in [0, 1] + smooth
                 generative_penalty = torch.log1p((p1 + p2) / 2.0)
-                generative_penalty = training_settings["penalty_weight"] * generative_penalty # Apply penalty weight
+                generative_penalty = training_settings["phase2_penalty_weight"] * generative_penalty # Apply penalty weight
 
                 # Predict abs_ts[:, 1:] using model abs_t_head
                 true_delta = torch.clamp(batch["abs_ts"], min=0.0, max=1.0)  # [B, T], range [0,1]
@@ -451,7 +452,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Base MSE loss
                 abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
                 abs_t_loss = (abs_t_loss * mask).sum() / mask.sum().clamp(min=1)
-                abs_t_loss = training_settings["abs_t_weight"] * abs_t_loss
+                abs_t_loss = training_settings["phase2_dt_weight"] * abs_t_loss
 
                 # === Temporal Monotonicity Penalty ===
                 # Penalize predicted time going backwards: max(0, prev - curr)
@@ -459,10 +460,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 monotonic_penalty = F.relu(-delta_diff)              # only penalize decreases
                 monotonic_mask = mask[:, 1:] * mask[:, :-1]          # valid when both t and t-1 are not PAD
                 monotonic_penalty = (monotonic_penalty * monotonic_mask).sum() / monotonic_mask.sum().clamp(min=1)
-                abs_t_loss += training_settings["abs_t_monotonic_penalty"] * monotonic_penalty
+                abs_t_loss += training_settings["phase2_dt_monotonic_penalty"] * monotonic_penalty
 
                 # Combine all
-                loss = bce + generative_penalty + abs_t_loss
+                loss = loss_bce + generative_penalty + abs_t_loss
 
                 if train_flag:
                     optimizer.zero_grad()
@@ -472,7 +473,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     scheduler.step()
 
                 total_loss += loss.item()
-                total_bce += bce.item()
+                total_bce += loss_bce.item()
                 total_penalty += generative_penalty.item()
                 total_dt += abs_t_loss.item()
         

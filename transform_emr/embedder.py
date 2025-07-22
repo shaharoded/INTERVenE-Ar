@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
+from transform_emr.config.dataset_config import ADMISSION_TOKEN, TERMINAL_OUTCOMES
 from transform_emr.config.model_config import *
 from transform_emr.utils import get_multi_hot_targets
 
@@ -153,6 +154,9 @@ class EMREmbedding(nn.Module):
         self.decoder = nn.Linear(embed_dim, len(tokenizer.token2id), bias=False)
         self.decoder.weight = self.position_embed.weight  # weight tying
 
+        # --- MLM tied to token embeddings ----------------------------
+        self.mlm_head = nn.Linear(embed_dim, len(tokenizer.token2id), bias=False)
+        self.mlm_head.weight = self.position_embed.weight  # weight tying
 
     def predict_time(self, abs_ts):
         """
@@ -213,21 +217,35 @@ class EMREmbedding(nn.Module):
 
         return seq
     
-    def forward_with_decoder(self, raw_concept_ids, concept_ids, value_ids, position_ids,
-                            abs_ts, patient_contexts):
+    def forward_with_decoder(self, *batch_args):
         """
         Runs full forward pass + decoding (for training phase 1).
+        Same inputs as forward_with_decoder
 
         Returns:
             logits: [B, T, vocab_size] — scores for next-token prediction
         """
         seq = self.forward(
-            raw_concept_ids, concept_ids, value_ids, position_ids,
-            abs_ts, patient_contexts,
+            *batch_args,
             return_mask=False
         )  # → returns only [B,T+1,D]
 
         return self.decoder(seq[:, :-1, :])  # Predict next token at each step
+    
+
+    def forward_with_mlm(self, *batch_args, mlm_mask=None):
+        """
+        Runs full forward pass + MLM (for training phase 1).
+        Same inputs as forward_with_decoder, plus:
+            mlm_mask - bool tensor [B,T] where True → this position was masked.
+        Returns:
+            mlm_logits [B, T, vocab_size]
+        """
+        seq = self.forward(*batch_args, return_mask=False)     # [B,T+1,D]
+        logits = self.mlm_head(seq[:, 1:, :])                  # drop [CTX]
+        if mlm_mask is not None:
+            logits = logits[mlm_mask]                          # flatten to [N_masked,V]
+        return logits
     
     def save(self, epoch, best_val, optimizer, scheduler, path):
         torch.save({
@@ -328,14 +346,50 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         optimizer.load_state_dict(optim_state)
         scheduler.load_state_dict(scheduler_state)
         start_epoch += 1
-
+    
+    # ----- MLM Mask Helper -----
+    def random_token_mask(ids, tokenizer, p=0.15):
+        """
+        ids:  (B,T) tensor - raw_concept_ids / concept_ids / value_ids / position_ids
+        returns masked_ids (same shape)
+        Masking strategy (BERT-style):
+            80% → replace with [MASK]
+            10% → keep original
+            10% → replace with random token (not PAD)
+        """
+        device = ids.device
+        never_mask_ids = {
+            tokenizer.pad_token_id,
+            tokenizer.ctx_token_id,
+            tokenizer.null_token_id,
+            tokenizer.token2id.get(ADMISSION_TOKEN),
+            *[tokenizer.token2id[tok] for tok in TERMINAL_OUTCOMES],
+        }
+        keep = torch.zeros_like(ids, dtype=torch.bool)
+        for tid in never_mask_ids:
+            if tid is not None:
+                keep |= (ids == tid)
+        mask = (~keep) & (torch.rand_like(ids.float()) < p)
+        masked = ids.clone()
+        # 80 %
+        rand = torch.rand_like(ids.float())
+        mask80 = mask & (rand < 0.8)
+        masked[mask80] = tokenizer.mask_token_id
+        # 10 % random token
+        mask10 = mask & (rand >= 0.8) & (rand < 0.9)
+        vocab_size = embedder.position_embed.num_embeddings
+        random_tokens = torch.randint(1, vocab_size, size=ids.shape, device=device)
+        masked[mask10] = random_tokens[mask10]
+        # 10 % keep original – already satisfied
+        return masked, mask        # mask is the bool tensor of *predict‑me* positions
+    
     # ----- Epoch function -----
     def run_epoch(loader, train=False):
         """
-        Returns Tuple: total_loss, bce_loss, time_loss (for logging in train_embedder and validation)
+        Returns Tuple: total_loss, bce_loss, time_loss, mlm_loss (for logging in train_embedder and validation)
         """
         embedder.train() if train else embedder.eval()
-        total_loss, total_bce, total_dt = 0.0, 0.0, 0.0
+        total_loss, total_bce, total_dt, total_mlm = 0.0, 0.0, 0.0, 0.0
 
         for batch in tqdm(loader, desc="Training" if train else "Validation", leave=False):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -343,7 +397,14 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             if train:
                 optimizer.zero_grad()
             
-            logits = embedder.forward_with_decoder(
+            masked_pos_ids, mlm_mask = random_token_mask(
+                batch["position_ids"],
+                tokenizer=embedder.tokenizer,
+                p=0.15
+            ) # MLM mask
+            
+            # BCE Logits + Loss
+            bce_logits = embedder.forward_with_decoder(
                 raw_concept_ids=batch["raw_concept_ids"],
                 concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"],
@@ -355,10 +416,31 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             multi_hot_targets = get_multi_hot_targets(
                                                     position_ids=batch["position_ids"], 
                                                     padding_idx=embedder.padding_idx, 
-                                                    vocab_size=logits.size(-1), 
-                                                    k=training_settings["k_window"]
+                                                    vocab_size=bce_logits.size(-1), 
+                                                    k=training_settings["bce_k_window"]
                                                     )
-            loss_bce = loss_fn(logits, multi_hot_targets)
+
+            bce_loss = loss_fn(bce_logits, multi_hot_targets)
+            bce_loss *= training_settings["phase1_bce_weight"] # Applying weight
+            
+            # MLM Logits + Loss
+            mlm_logits = embedder.forward_with_mlm(
+                batch["raw_concept_ids"],
+                batch["concept_ids"],
+                batch["value_ids"],
+                masked_pos_ids,          # <‑‑ give *masked* positions
+                batch["abs_ts"],
+                batch["context_vec"],
+                mlm_mask=mlm_mask
+            )
+            mlm_labels = batch["position_ids"][mlm_mask]          # ground truth
+            mlm_loss = F.cross_entropy(
+                mlm_logits,
+                mlm_labels,
+                reduction="mean"
+            )
+            mlm_loss *= training_settings["phase1_mlm_weight"]
+            
             # Δt regression supervision
             # Predict normalised absolute time for every step
             pred_t = embedder.predict_time(batch["abs_ts"])            # [B,T,1]
@@ -368,7 +450,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 reduction='mean'
             )
             time_loss *= training_settings["phase1_dt_weight"] # Scale
-            loss = loss_bce + time_loss
+            loss = bce_loss + time_loss + mlm_loss
 
             if train:
                 loss.backward()
@@ -376,23 +458,24 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 optimizer.step()
 
             total_loss += loss.item()
-            total_bce  += loss_bce.item()
+            total_bce  += bce_loss.item()
             total_dt   += time_loss.item()
+            total_mlm   += mlm_loss.item()
 
         n = len(loader)
-        return (total_loss / n, total_bce / n, total_dt / n)
+        return (total_loss / n, total_bce / n, total_dt / n, total_mlm / n)
 
     # ----- Training loop -----
     for epoch in range(start_epoch, training_settings["phase1_n_epochs"] + 1):
-        tr_tot, tr_bce, tr_dt = run_epoch(train_loader, train_flag=True)
-        vl_tot, vl_bce, vl_dt = run_epoch(val_loader,   train_flag=False)
+        tr_tot, tr_bce, tr_dt, tr_mlm = run_epoch(train_loader, train_flag=True)
+        vl_tot, vl_bce, vl_dt, val_mlm = run_epoch(val_loader,   train_flag=False)
 
         train_losses.append(tr_tot)
         val_losses.append(vl_tot)
 
-        print(f"[Phase‑1] Epoch {epoch:03d} | "
-            f"Train BCE={tr_bce:.4f}  Δt={tr_dt:.4f}  Tot={tr_tot:.4f} | "
-            f"Val BCE={vl_bce:.4f}    Δt={vl_dt:.4f}  Tot={vl_tot:.4f}")
+        print(f"[Phase-1] Epoch {epoch:03d} | "
+            f"--> Train={tr_tot:.4f} (BCE={tr_bce:.4f}  MLM={tr_mlm:.4f}  Δt={tr_dt:.4f}) | "
+            f"--> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  MLM={val_mlm:.4f}  Δt={vl_dt:.4f})")
 
         # Save last checkpoint
         embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last)
