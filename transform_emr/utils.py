@@ -16,24 +16,6 @@ from transform_emr.config.dataset_config import (
 )
 
 
-
-def plot_losses(train_losses, val_losses):
-    """
-    Plot train vs. validation loss to inspect training quality.
-    """
-    epochs = range(1, len(train_losses) + 1)
-    plt.figure()
-    plt.plot(epochs, train_losses, label="Train loss")
-    plt.plot(epochs, val_losses, label="Val loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Cross‑entropy loss")
-    plt.title("Training vs. validation loss")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
-
 def get_multi_hot_targets(position_ids: torch.Tensor,
                           padding_idx: int,
                           vocab_size: int,
@@ -570,3 +552,44 @@ def apply_masks_to_logits(logits, illegal_mask, bonus_mask, bonus_boost=0.2):
     if bonus_boost > 0:
         logits = logits + bonus_boost * bonus_mask.float()
     return logits
+
+
+def plot_losses(train_losses, val_losses):
+    """
+    Plot train vs. validation loss to inspect training quality.
+    """
+    epochs = range(1, len(train_losses) + 1)
+    plt.figure()
+    plt.plot(epochs, train_losses, label="Train loss")
+    plt.plot(epochs, val_losses, label="Val loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Cross‑entropy loss")
+    plt.title("Training vs. validation loss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+def build_rep_penalty(last_tokens, V, window=5, strength=0.6, device=None):
+    """
+    Soft repetition discourager on inference.
+    last_tokens : list[int]   (already generated, newest at the end)
+    V           : vocab size
+    window      : how many recent tokens we look back
+    strength    : scalar multiplier for the penalty (0..1 typical)
+    Returns:
+        rep_vec : [V] float tensor, 0 for unseen, higher for very recent repeats
+    """
+    if not last_tokens or strength <= 0:
+        return torch.zeros(V, device=device)
+    device = device or torch.device("cpu")
+    k = min(window, len(last_tokens))
+    # decay weights: newest gets 1.0, then 0.8, 0.6, ...
+    decay = torch.linspace(1.0, 0.2, steps=window, device=device)[:k]
+    idx = torch.tensor(last_tokens[-k:], device=device)
+
+    rep_vec = torch.zeros(V, device=device)
+    # reverse so newest aligns with decay[0]
+    rep_vec.index_add_(0, idx.flip(0), decay)
+    return rep_vec * strength
