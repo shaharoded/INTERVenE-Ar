@@ -424,6 +424,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                                 luts["meal_rank"],
                                                 luts["meal_pred_rank"],
                                                 luts["K_meals"],
+                                                luts["conflict_mat"]
                                             )
                 # Apply masks BEFORE BCE so gradients learn legality
                 pred_logits = apply_masks_to_logits(
@@ -449,7 +450,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Load and normalize each penalty (∈ [0, 1]) -> No grad in functions decorator
                 p_meal = penalty_meal_order(pred_ids, luts["meal_rank"])
                 p_struct = penalty_interval_structure(pred_ids, target_ids, 
-                                                        luts["is_start"], luts["is_end"], luts["base_map"])
+                                                        luts["is_start"], luts["is_end"], 
+                                                        luts["base_id"], luts["conflict_mat"])
 
                 # Average the penalties to bound in [0, 1] + smooth
                 generative_penalty = torch.log1p((p_meal + p_struct) / 2.0)

@@ -178,81 +178,119 @@ def apply_cbm(batch, epoch, total_epochs, tokenizer, forbid_ids, max_p=0.15):
 
 def build_luts(tokenizer):
     """
-    Pre-compute all lookup tensors needed for:
-      • legality masks (intervals + meals)
+    Pre-compute all LUTs (lookup tensors) needed for:
+      • legality masks (intervals + meals + value-conflict)
       • CBM masking forbid list
+      • Inference legality
 
     Returns
     -------
     luts : dict
         {
-          # interval structure
-          "is_start"            : BoolTensor [V]
-          "is_end"              : BoolTensor [V]
-          "base_id"             : LongTensor [V]   (-1 if not interval token)
-          "start_ids"           : LongTensor [B]   all *_START token ids (unordered)
-          "end_ids"             : LongTensor [B]   all *_END   token ids (unordered)
-          "start_ids_per_base"  : LongTensor [B]   index-aligned with base_id (id of *_START)
-          "end_ids_per_base"    : LongTensor [B]   index-aligned with base_id (id of *_END)
+        # per-token
+        "is_start"          : Bool[V]
+        "is_end"            : Bool[V]
+        "base_id"           : Long[V]   (-1 if not interval token)
+        "meal_rank"         : Long[V]   (-1 non-meal, else 0..K-1)
+        "meal_pred_rank"    : Long[V]   (-1 non-meal)
 
-          # meals
-          "meal_rank"           : LongTensor [V]   (-1 non-meal, else 0..K-1)
-          "meal_pred_rank"      : LongTensor [V]   predecessor rank per meal token, -1 for non-meal
-          "K_meals"             : LongTensor []    scalar K
+        # per-base (nb = #interval bases)
+        "start_ids_per_base": Long[nb]  id of *_START  (‑1 if missing)
+        "end_ids_per_base"  : Long[nb]  id of *_END    (‑1 if missing)
+        "conflict_mat"      : Bool[nb, nb]  (same concept & different value)
 
-          # CBM forbid
-          "forbid_mask_ids"     : LongTensor [?]   token ids never to CBM-mask
+        # misc
+        "start_ids"         : Long[*]   all start ids (unordered)
+        "end_ids"           : Long[*]   all end ids   (unordered)
+        "K_meals"           : Long[]    scalar
+        "forbid_mask_ids"   : Long[*]   tokens we never CBM-mask
         }
     """
     V = len(tokenizer.token2id)
+    device = torch.device("cpu")  # keep CPU; move to GPU later where needed
 
-    is_start = torch.zeros(V, dtype=torch.bool)
-    is_end   = torch.zeros(V, dtype=torch.bool)
-    base_id  = torch.full((V,), -1, dtype=torch.long)
+    # --- per-token LUTs ------------------------------------------------------
+    is_start   = torch.zeros(V, dtype=torch.bool, device=device)
+    is_end     = torch.zeros(V, dtype=torch.bool, device=device)
+    base_id    = torch.full((V,), -1, dtype=torch.long, device=device)
+    tok2concept= torch.full((V,), -1, dtype=torch.long, device=device)
+    tok2value  = torch.full((V,), -1, dtype=torch.long, device=device)
 
+    # ---------- detect START/END tokens, map bases, and fill per‑token LUTs ----------
     base2idx = {}
     start_ids_list, end_ids_list = [], []
 
-    # Pass 1: detect START/END & assign base indices
     for tok, tid in tokenizer.token2id.items():
+        # Strip ONLY the suffix for interval tokens
         if tok.endswith("_START"):
-            base = tok[:-6]
-            idx  = base2idx.setdefault(base, len(base2idx))
+            core = tok[:-6]
             is_start[tid] = True
-            base_id[tid]  = idx
-            start_ids_list.append(tid)
         elif tok.endswith("_END"):
-            base = tok[:-4]
-            idx  = base2idx.setdefault(base, len(base2idx))
-            is_end[tid]  = True
-            base_id[tid] = idx
-            end_ids_list.append(tid)
+            core = tok[:-4]
+            is_end[tid] = True
+        else:
+            core = tok
 
-    start_ids = torch.tensor(start_ids_list, dtype=torch.long)
-    end_ids   = torch.tensor(end_ids_list,   dtype=torch.long)
+        # ----- concept & value ids -----
+        parts = core.split("_")
+        # concept key = first two chunks if exist, else the whole core (e.g. "GLUCOSE_TREND")
+        concept_key = "_".join(parts[:2]) if len(parts) >= 2 else core
+        # value key   = the full core (e.g. "GLUCOSE_TREND_INC")
+        value_key   = core
 
-    n_b = len(base2idx)
-    start_ids_per_base = torch.full((n_b,), -1, dtype=torch.long)
-    end_ids_per_base   = torch.full((n_b,), -1, dtype=torch.long)
+        tok2concept[tid] = tokenizer.concept2id.get(concept_key, -1)
+        tok2value[tid]   = tokenizer.value2id.get(value_key,   -1)
 
-    # Pass 2: invert base_id → token_id (per base)
-    for tok, tid in tokenizer.token2id.items():
-        b = base_id[tid].item()
-        if b >= 0:
+        # ----- interval base bookkeeping -----
+        if is_start[tid] or is_end[tid]:
+            base_idx = base2idx.setdefault(core, len(base2idx))
+            base_id[tid] = base_idx
             if is_start[tid]:
-                start_ids_per_base[b] = tid
-            elif is_end[tid]:
-                end_ids_per_base[b]   = tid
+                start_ids_list.append(tid)
+            else:  # END
+                end_ids_list.append(tid)
 
-    # ---- meal lookups ----
-    meal_rank = torch.full((V,), -1, dtype=torch.long)
+    # tensors of all *_START / *_END ids (unordered)
+    start_ids = torch.tensor(start_ids_list, dtype=torch.long, device=device)
+    end_ids   = torch.tensor(end_ids_list,   dtype=torch.long, device=device)
+
+    # ---------- per‑base LUTs ----------
+    nb = len(base2idx)
+    start_ids_per_base = torch.full((nb,), -1, dtype=torch.long, device=device)
+    end_ids_per_base   = torch.full((nb,), -1, dtype=torch.long, device=device)
+    base_concept       = torch.full((nb,), -1, dtype=torch.long, device=device)
+    base_value         = torch.full((nb,), -1, dtype=torch.long, device=device)
+
+    # Fill per‑base arrays (first seen wins; START/END of same base share concept/value)
+    for tid in range(V):
+        b = base_id[tid].item()
+        if b < 0:
+            continue
+        if is_start[tid]:
+            start_ids_per_base[b] = tid
+        elif is_end[tid]:
+            end_ids_per_base[b] = tid
+        if base_concept[b] < 0:
+            base_concept[b] = tok2concept[tid]
+        if base_value[b] < 0:
+            base_value[b] = tok2value[tid]
+
+    # ---------- conflict matrix: same concept, different value ----------
+    if nb > 0:
+        conf_mat = (base_concept[:, None] == base_concept[None, :]) & \
+                (base_value[:,  None]  != base_value[None,  :])
+    else:
+        conf_mat = torch.zeros(0, 0, dtype=torch.bool, device=device)
+
+    # --- meals ---------------------------------------------------------------
+    meal_rank = torch.full((V,), -1, dtype=torch.long, device=device)
     for r, name in enumerate(MEAL_TOKENS):
         tid = tokenizer.token2id.get(name)
         if tid is not None:
             meal_rank[tid] = r
     K = int(meal_rank.max().item()) + 1 if (meal_rank >= 0).any() else 0
 
-    meal_pred_rank = torch.full((V,), -1, dtype=torch.long)
+    meal_pred_rank = torch.full((V,), -1, dtype=torch.long, device=device)
     if K > 0:
         meal_mask = meal_rank >= 0
         meal_pred_rank[meal_mask] = (meal_rank[meal_mask] - 1) % K
@@ -272,44 +310,59 @@ def build_luts(tokenizer):
                                    dtype=torch.long)
 
     return {
+        # per-token
         "is_start": is_start,
         "is_end":   is_end,
         "base_id":  base_id,
-        "start_ids": start_ids,
-        "end_ids":   end_ids,
+        "meal_rank":      meal_rank,
+        "meal_pred_rank": meal_pred_rank,
+
+        # per-base
         "start_ids_per_base": start_ids_per_base,
         "end_ids_per_base":   end_ids_per_base,
-        "meal_rank": meal_rank,
-        "meal_pred_rank": meal_pred_rank,
-        "K_meals": torch.tensor(K, dtype=torch.long),
+        "conflict_mat":       conf_mat,
+
+        # misc
+        "start_ids": start_ids,
+        "end_ids":   end_ids,
+        "K_meals":   torch.tensor(K, dtype=torch.long, device=device),
         "forbid_mask_ids": forbid_mask_ids,
     }
+
 
 @torch.no_grad()
 def penalty_interval_structure(pred_ids: torch.LongTensor,
                                gt_ids:   torch.LongTensor,
                                is_start: torch.BoolTensor,
                                is_end:   torch.BoolTensor,
-                               base_id:  torch.LongTensor) -> torch.Tensor:
+                               base_id:  torch.LongTensor,
+                               conflict_mat: torch.BoolTensor) -> torch.Tensor:
     """
     Structural penalty on predictions (scalar ∈ [0,1]).
 
     Counts three prediction-side violations:
-      1. END without an open START         (fsm)        -> Normalized by count(_END)
-      2. START while same base already open (dup)       -> Normalized by count(_START)
-      3. START that never gets an END       (unclosed)  -> Normalized by count(_START)
-    A violation is forgiven once if the SAME violation type for that base
+      1. END without an open START         (fsm)             -> Normalized by count(_END)
+      2. START while same base already open (dup)            -> Normalized by count(_START)
+      3. START that never gets an END       (unclosed)       -> Normalized by count(_START)
+      4. START while a *conflicting* base is open (conflict) -> Normalized by count(_START)
+    A violation is forgiven once if the SAME violation type for that base (1 & 3 only)
     appears anywhere in the GT (order/time agnostic).
 
     Vectorized over T for meta lookup; single loop over B to maintain an 'open' set.
 
     pred_ids, gt_ids : [B,T]
-    is_start/is_end/base_id : [V] LUTs
+    is_start/is_end/base_id : [V]
+    conflict_mat : [nb, nb] (True if (i,j) conflict: same concept & diff value)
 
     Returns: scalar tensor
+    NOTE: This still uses a counter of violation and does not compare the exact violation in GT 
+    compared to the exact violation in pred. We can't allow the model to learn that any type X violation 
+    is ok if also appear in GT, but only that it's allowed to generate a violating token if the same token 
+    caused a violation in GT.
     """
     device = pred_ids.device
     B, T = pred_ids.shape
+    nb = conflict_mat.size(0)
 
     # Meta lookups
     p_s = is_start[pred_ids]         # [B,T] bool
@@ -320,13 +373,13 @@ def penalty_interval_structure(pred_ids: torch.LongTensor,
     g_e = is_end[gt_ids]
     g_b = base_id[gt_ids]
 
-    fsm_viol = dup_viol = unclosed_viol = 0
+    fsm_viol = dup_viol = unclosed_viol = conflict_viol = 0
     tot_end  = tot_start = 0
 
     for b in range(B):
         # ========== build forgiveness pools from GT ========== #
         gt_open = set()
-        gt_fsm, gt_dup, gt_unclosed = [], [], []
+        gt_fsm, gt_dup, gt_unclosed, gt_conf = [], [], [], []
 
         for t in range(T):
             bid = g_b[b, t].item()
@@ -335,6 +388,9 @@ def penalty_interval_structure(pred_ids: torch.LongTensor,
             if g_s[b, t]:
                 if bid in gt_open:
                     gt_dup.append(bid)
+                # conflict start?
+                if nb > 0 and any(conflict_mat[bid, k] for k in gt_open):
+                    gt_conf.append(bid)
                 gt_open.add(bid)
             elif g_e[b, t]:
                 if bid not in gt_open:
@@ -343,11 +399,12 @@ def penalty_interval_structure(pred_ids: torch.LongTensor,
                     gt_open.remove(bid)
         gt_unclosed.extend(list(gt_open))
 
-        forgive_fsm  = Counter(gt_fsm)
-        forgive_dup  = Counter(gt_dup)
-        forgive_uncl = Counter(gt_unclosed)
+        forgive_fsm   = Counter(gt_fsm)
+        forgive_dup   = Counter(gt_dup)
+        forgive_uncl  = Counter(gt_unclosed)
+        forgive_conf  = Counter(gt_conf)
 
-        # ========== check pred violations ========== #
+        # ========== check prediction violations ========== #
         pred_open = set()
 
         for t in range(T):
@@ -356,13 +413,22 @@ def penalty_interval_structure(pred_ids: torch.LongTensor,
                 continue
             if p_s[b, t]:
                 tot_start += 1
+
+                # duplicate
                 if bid in pred_open:
                     if forgive_dup[bid] > 0:
                         forgive_dup[bid] -= 1
                     else:
                         dup_viol += 1
-                else:
-                    pred_open.add(bid)
+                # conflict
+                elif nb > 0 and any(conflict_mat[bid, k] for k in pred_open):
+                    if forgive_conf[bid] > 0:
+                        forgive_conf[bid] -= 1
+                    else:
+                        conflict_viol += 1
+
+                pred_open.add(bid)
+
             elif p_e[b, t]:
                 tot_end += 1
                 if bid not in pred_open:
@@ -373,7 +439,7 @@ def penalty_interval_structure(pred_ids: torch.LongTensor,
                 else:
                     pred_open.remove(bid)
 
-        # left open → unclosed
+        # leftover opens → unclosed
         for bid in list(pred_open):
             if forgive_uncl[bid] > 0:
                 forgive_uncl[bid] -= 1
@@ -383,11 +449,12 @@ def penalty_interval_structure(pred_ids: torch.LongTensor,
     tot_end   = max(tot_end,   1)
     tot_start = max(tot_start, 1)
 
-    fsm_rate   = fsm_viol   / tot_end
-    dup_rate   = dup_viol   / tot_start
-    unclosed_r = unclosed_viol / tot_start
+    fsm_rate    = fsm_viol      / tot_end
+    dup_rate    = dup_viol      / tot_start
+    unclosed_r  = unclosed_viol / tot_start
+    conflict_r  = conflict_viol / tot_start
 
-    return torch.tensor((fsm_rate + dup_rate + unclosed_r) / 3.0,
+    return torch.tensor((fsm_rate + dup_rate + unclosed_r + conflict_r) / 4.0,
                         device=device, dtype=torch.float32)
 
 
@@ -439,7 +506,8 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
                               end_ids_per_base:   torch.LongTensor,
                               meal_rank: torch.LongTensor,
                               meal_pred_rank: torch.LongTensor,
-                              K_meals: torch.Tensor):
+                              K_meals: torch.Tensor,
+                              conflict_mat: torch.BoolTensor):
     """
     Vectorized legality/bonus masks from GOLD prefix (teacher forcing).
 
@@ -450,6 +518,7 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
       • END illegal if base not open yet
       • START illegal if base already open
       • END bonus  if base open
+      • START/END of concept_valX is illegal if concept_valY is still open.
 
     Meal logic:
       cyclic order; meal m illegal if predecessor rank not seen yet, bonus if seen.
@@ -461,7 +530,7 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
     device = position_ids.device
     B, T = position_ids.shape
     V    = is_start.numel()
-    n_b  = start_ids_per_base.numel()
+    nb   = start_ids_per_base.numel()
     K    = int(K_meals.item())
 
     # ---------------- interval prefix states ----------------
@@ -476,37 +545,50 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
     scatter_idx = tok_base.clone()
     scatter_idx[~base_valid] = 0  # dummy
 
-    start_oh = torch.zeros(B, T, n_b, device=device, dtype=torch.int16)
+    start_oh = torch.zeros(B, T, nb, device=device, dtype=torch.int16)
     end_oh   = torch.zeros_like(start_oh)
 
-    start_oh[torch.arange(B)[:, None], torch.arange(T)[None, :], scatter_idx] = tok_s & base_valid
-    end_oh[torch.arange(B)[:, None], torch.arange(T)[None, :], scatter_idx]   = tok_e & base_valid
+    b_idx = torch.arange(B, device=device)[:, None]
+    t_idx = torch.arange(T, device=device)[None, :]
+
+    start_oh[b_idx, t_idx, scatter_idx] = (tok_s & base_valid)
+    end_oh[b_idx, t_idx, scatter_idx]   = (tok_e & base_valid)
 
     # cumulative open counts up to (and including) t
     starts_cum = start_oh.cumsum(dim=1)          # [B,T,n_b]
     ends_cum   = end_oh.cumsum(dim=1)
     open_cum   = (starts_cum - ends_cum) > 0     # [B,T,n_b] bool
 
-    # illegal END where not open
-    # illegal_start where already open
+    # Illegal END where not open
+    # Illegal_start where already open
     # bonus END where open
     # To paint into [B,T,V], we broadcast with per-base token ids
     illegal = torch.zeros(B, T, V, device=device, dtype=torch.bool)
     bonus   = torch.zeros_like(illegal)
 
-    # build [1,1,n_b] -> [B,T,n_b] helpers
-    end_tok_ids   = end_ids_per_base.view(1, 1, n_b).expand(B, T, n_b)
-    start_tok_ids = start_ids_per_base.view(1, 1, n_b).expand(B, T, n_b)
+    # Build [1,1,nb] -> [B,T,nb] helpers
+    end_tok_ids   = end_ids_per_base.view(1, 1, nb).expand(B, T, nb)
+    start_tok_ids = start_ids_per_base.view(1, 1, nb).expand(B, T, nb)
 
     # Mask matrices
-    need_end_closed = ~open_cum                  # END illegal where not open
-    need_start_closed = open_cum                 # START illegal where open
-    good_end = open_cum                          # END bonus where open
+    need_end_closed   = ~open_cum          # END illegal if not open
+    need_start_closed =  open_cum          # START illegal if already open
+    good_end          =  open_cum          # END bonus if open
 
     # Scatter to [B,T,V]
-    illegal.scatter_(2, end_tok_ids, need_end_closed)
+    illegal.scatter_(2, end_tok_ids,   need_end_closed)
     illegal.scatter_(2, start_tok_ids, need_start_closed)
-    bonus.scatter_(2, end_tok_ids, good_end)
+    bonus.scatter_(  2, end_tok_ids,   good_end)
+
+    # Value-conflict masking 
+    # Conflict_mat[nb,nb]: True if (j,k) conflict (same concept, different value)
+    if nb > 0 and conflict_mat.any():
+        # For each time step, which bases are conflicting-with-open ones?
+        # open_cum: [B,T,nb]; conflict_mat: [nb,nb]
+        # -> conflict_active[b,t,j] = OR_k ( open_cum[b,t,k] & conflict_mat[k,j] )
+        conflict_active = open_cum @ conflict_mat.T    # bool matmul
+        # Forbid START of j when conflict_active==True
+        illegal.scatter_(2, start_tok_ids, conflict_active)
 
     # ---------------- meal prefix states ----------------
     if K > 0:

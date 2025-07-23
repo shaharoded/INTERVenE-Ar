@@ -194,8 +194,9 @@ def infer_event_stream(model,
     Strictly legal autoregressive generation.
 
     • Interval legality: no END without START, no duplicate START.
+    • Concept legality: no START on conceptX_value1 interval if another conceptX_value2 is open.
     • Meal legality: a meal m is illegal if its predecessor in the cycle hasn't been seen yet.
-    • Repetition: optionally forbid the last N generated tokens.
+    • Repetition: Reduce probability of the last N generated tokens.
 
     Args:
         model: Trained GPT model.
@@ -209,14 +210,11 @@ def infer_event_stream(model,
     Returns:
         DataFrame with PatientID, Step, Token, TimePoint, IsInput, IsOutcome, IsTerminal
     """
-
-    tok = model.embedder.tokenizer
-    luts = build_luts(tok)        # is_start, is_end, base_id, meal_rank, start_ids, end_ids, forbid_mask_ids
-    for k,v in luts.items():
-        if isinstance(v, torch.Tensor):
-            luts[k] = v.to(next(model.parameters()).device)
-
     device    = next(model.parameters()).device
+    tok = model.embedder.tokenizer
+    luts = build_luts(tok)        # is_start, is_end, base_id, meal_rank, ...
+    luts = {k: v.to(device) if torch.is_tensor(v) else v for k,v in luts.items()}
+
     id2token  = tok.id2token
     token2id  = tok.token2id
     outcome_ids  = {token2id[o] for o in OUTCOMES if o in token2id}
@@ -246,16 +244,27 @@ def infer_event_stream(model,
         V = luts["is_start"].numel()
         illegal = torch.zeros(V, dtype=torch.bool, device=device)
 
-        # ----- intervals -----
-        # END illegal if not open
-        closed = (open_counts <= 0)  # [n_b]
-        if closed.any():
-            illegal[luts["end_ids"][closed]] = True
+        # ----- interval open/closed logic -----
+        closed  = (open_counts <= 0)          # [nb]
+        opened  = (open_counts >  0)          # [nb]
 
-        # START illegal if already open (no nested)
-        opened = (open_counts > 0)
+        # END illegal if base closed
+        if closed.any():
+            illegal[luts["end_ids_per_base"][closed]] = True
+
+        # START illegal if base already open
         if opened.any():
-            illegal[luts["start_ids"][opened]] = True
+            illegal[luts["start_ids_per_base"][opened]] = True
+
+        # ----- value-conflict logic -----
+        # Any base that is open forbids START for any other base with same concept but different value
+        if opened.any():
+            # conflict_mat[open] -> [#open, nb] → reduce across rows
+            conflicting_bases = luts["conflict_mat"][opened].any(dim=0)  # [nb]
+            # we only care about those NOT already open (otherwise dup rule already covers)
+            conflicting_bases &= ~opened
+            if conflicting_bases.any():
+                illegal[luts["start_ids_per_base"][conflicting_bases]] = True
 
         # ----- meals -----
         K = (luts["meal_rank"] >= 0).max().item() and int(luts["meal_rank"].max().item()) + 1 or 0
