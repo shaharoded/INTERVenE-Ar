@@ -7,7 +7,6 @@ General util functions for the package
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from collections import Counter
 
 
 # ───────── local code ─────────────────────────────────────────────────── #
@@ -338,123 +337,162 @@ def penalty_interval_structure(pred_ids: torch.LongTensor,
                                base_id:  torch.LongTensor,
                                conflict_mat: torch.BoolTensor) -> torch.Tensor:
     """
-    Structural penalty on predictions (scalar ∈ [0,1]).
+    Structural penalty ∈ [0,1] with per-(token_id, violation_type) forgiveness.
 
-    Counts three prediction-side violations:
-      1. END without an open START         (fsm)             -> Normalized by count(_END)
-      2. START while same base already open (dup)            -> Normalized by count(_START)
-      3. START that never gets an END       (unclosed)       -> Normalized by count(_START)
-      4. START while a *conflicting* base is open (conflict) -> Normalized by count(_START)
-    A violation is forgiven once if the SAME violation type for that base (1 & 3 only)
-    appears anywhere in the GT (order/time agnostic).
+    Violations on PRED side:
+      FSM : END without an open START
+      DUP : START when same base already open
+      UNC : START never closed by END (sequence ended)
+      CNF : START while a conflicting base is open (same concept, different value)
 
-    Vectorized over T for meta lookup; single loop over B to maintain an 'open' set.
+    Forgive only if the SAME token_id triggered the SAME violation type in GT.
 
-    pred_ids, gt_ids : [B,T]
-    is_start/is_end/base_id : [V]
-    conflict_mat : [nb, nb] (True if (i,j) conflict: same concept & diff value)
+    Args
+    ----
+    pred_ids, gt_ids : [B, T] Long
+    is_start, is_end, base_id : [V] tensors
+    conflict_mat : [nb, nb] Bool (True if base i conflicts with base j)
 
-    Returns: scalar tensor
-    NOTE: This still uses a counter of violation and does not compare the exact violation in GT 
-    compared to the exact violation in pred. We can't allow the model to learn that any type X violation 
-    is ok if also appear in GT, but only that it's allowed to generate a violating token if the same token 
-    caused a violation in GT.
+    Returns
+    -------
+    torch.Tensor scalar in [0,1]
     """
     device = pred_ids.device
-    B, T = pred_ids.shape
-    nb = conflict_mat.size(0)
+    B, T   = pred_ids.shape
+    V      = is_start.numel()
+    nb     = conflict_mat.size(0)
 
-    # Meta lookups
-    p_s = is_start[pred_ids]         # [B,T] bool
+    # Lookups
+    p_s = is_start[pred_ids]        # [B,T]
     p_e = is_end[pred_ids]
-    p_b = base_id[pred_ids]          # [B,T] long ( -1 if not interval )
+    p_b = base_id[pred_ids]         # [B,T]  -1 if non-interval
 
     g_s = is_start[gt_ids]
     g_e = is_end[gt_ids]
     g_b = base_id[gt_ids]
 
-    fsm_viol = dup_viol = unclosed_viol = conflict_viol = 0
-    tot_end  = tot_start = 0
+    # Totals for normalization
+    tot_start = 0
+    tot_end   = 0
+
+    # Violation counts (post-forgiveness)
+    v_fsm = 0
+    v_dup = 0
+    v_unc = 0
+    v_cnf = 0
+
+    # helper
+    def zeros_V():
+        return torch.zeros(V, dtype=torch.int32, device=device)
 
     for b in range(B):
-        # ========== build forgiveness pools from GT ========== #
-        gt_open = set()
-        gt_fsm, gt_dup, gt_unclosed, gt_conf = [], [], [], []
+        # ---------- Build GT forgiveness pools (per token & type) ----------
+        gt_fsm_tok = zeros_V()
+        gt_dup_tok = zeros_V()
+        gt_unc_tok = zeros_V()
+        gt_cnf_tok = zeros_V()
+
+        # stacks of opened intervals: tensors for base and token
+        gt_open_bases = torch.empty(0, dtype=torch.long, device=device)
+        gt_open_toks  = torch.empty(0, dtype=torch.long, device=device)
 
         for t in range(T):
-            bid = g_b[b, t].item()
-            if bid < 0:  # not interval
-                continue
-            if g_s[b, t]:
-                if bid in gt_open:
-                    gt_dup.append(bid)
-                # conflict start?
-                if nb > 0 and any(conflict_mat[bid, k] for k in gt_open):
-                    gt_conf.append(bid)
-                gt_open.add(bid)
-            elif g_e[b, t]:
-                if bid not in gt_open:
-                    gt_fsm.append(bid)
-                else:
-                    gt_open.remove(bid)
-        gt_unclosed.extend(list(gt_open))
-
-        forgive_fsm   = Counter(gt_fsm)
-        forgive_dup   = Counter(gt_dup)
-        forgive_uncl  = Counter(gt_unclosed)
-        forgive_conf  = Counter(gt_conf)
-
-        # ========== check prediction violations ========== #
-        pred_open = set()
-
-        for t in range(T):
-            bid = p_b[b, t].item()
+            tok_id = gt_ids[b, t]
+            bid    = g_b[b, t]
             if bid < 0:
                 continue
+
+            if g_s[b, t]:
+                # DUP
+                if (gt_open_bases == bid).any():
+                    gt_dup_tok[tok_id] += 1
+
+                # CNF
+                if nb > 0 and gt_open_bases.numel() > 0:
+                    if conflict_mat[bid, gt_open_bases].any():
+                        gt_cnf_tok[tok_id] += 1
+
+                # push
+                gt_open_bases = torch.cat([gt_open_bases, bid.view(1)])
+                gt_open_toks  = torch.cat([gt_open_toks,  tok_id.view(1)])
+
+            elif g_e[b, t]:
+                # FSM
+                if gt_open_bases.numel() == 0 or (gt_open_bases == bid).sum() == 0:
+                    gt_fsm_tok[tok_id] += 1
+                else:
+                    # pop one occurrence of that base (last occurrence)
+                    idx = (gt_open_bases == bid).nonzero(as_tuple=False)
+                    rm  = idx[-1, 0]  # last opened
+                    gt_open_bases = torch.cat([gt_open_bases[:rm], gt_open_bases[rm+1:]])
+                    gt_open_toks  = torch.cat([gt_open_toks[:rm],  gt_open_toks[rm+1:]])
+
+        # leftovers -> UNC
+        for tok_open_id in gt_open_toks:
+            gt_unc_tok[tok_open_id] += 1
+
+        # ---------- Check PRED + apply forgiveness ----------
+        pred_open_bases = torch.empty(0, dtype=torch.long, device=device)
+        pred_open_toks  = torch.empty(0, dtype=torch.long, device=device)
+
+        for t in range(T):
+            tok_id = pred_ids[b, t]
+            bid    = p_b[b, t]
+            if bid < 0:
+                continue
+
             if p_s[b, t]:
                 tot_start += 1
 
-                # duplicate
-                if bid in pred_open:
-                    if forgive_dup[bid] > 0:
-                        forgive_dup[bid] -= 1
+                # DUP?
+                if (pred_open_bases == bid).any():
+                    if gt_dup_tok[tok_id] > 0:
+                        gt_dup_tok[tok_id] -= 1
                     else:
-                        dup_viol += 1
-                # conflict
-                elif nb > 0 and any(conflict_mat[bid, k] for k in pred_open):
-                    if forgive_conf[bid] > 0:
-                        forgive_conf[bid] -= 1
-                    else:
-                        conflict_viol += 1
+                        v_dup += 1
+                # CNF?
+                elif nb > 0 and pred_open_bases.numel() > 0:
+                    if conflict_mat[bid, pred_open_bases].any():
+                        if gt_cnf_tok[tok_id] > 0:
+                            gt_cnf_tok[tok_id] -= 1
+                        else:
+                            v_cnf += 1
 
-                pred_open.add(bid)
+                # push
+                pred_open_bases = torch.cat([pred_open_bases, bid.view(1)])
+                pred_open_toks  = torch.cat([pred_open_toks,  tok_id.view(1)])
 
             elif p_e[b, t]:
                 tot_end += 1
-                if bid not in pred_open:
-                    if forgive_fsm[bid] > 0:
-                        forgive_fsm[bid] -= 1
+                if pred_open_bases.numel() == 0 or (pred_open_bases == bid).sum() == 0:
+                    if gt_fsm_tok[tok_id] > 0:
+                        gt_fsm_tok[tok_id] -= 1
                     else:
-                        fsm_viol += 1
+                        v_fsm += 1
                 else:
-                    pred_open.remove(bid)
+                    # pop last
+                    idx = (pred_open_bases == bid).nonzero(as_tuple=False)
+                    rm  = idx[-1, 0]
+                    pred_open_bases = torch.cat([pred_open_bases[:rm], pred_open_bases[rm+1:]])
+                    pred_open_toks  = torch.cat([pred_open_toks[:rm],  pred_open_toks[rm+1:]])
 
-        # leftover opens → unclosed
-        for bid in list(pred_open):
-            if forgive_uncl[bid] > 0:
-                forgive_uncl[bid] -= 1
+        # leftover opens -> UNC
+        for tok_open_id in pred_open_toks:
+            if gt_unc_tok[tok_open_id] > 0:
+                gt_unc_tok[tok_open_id] -= 1
             else:
-                unclosed_viol += 1
+                v_unc += 1
 
+    # normalize
     tot_end   = max(tot_end,   1)
     tot_start = max(tot_start, 1)
 
-    fsm_rate    = fsm_viol      / tot_end
-    dup_rate    = dup_viol      / tot_start
-    unclosed_r  = unclosed_viol / tot_start
-    conflict_r  = conflict_viol / tot_start
+    fsm_rate   = v_fsm / tot_end
+    dup_rate   = v_dup / tot_start
+    unc_rate   = v_unc / tot_start
+    cnf_rate   = v_cnf / tot_start
 
-    return torch.tensor((fsm_rate + dup_rate + unclosed_r + conflict_r) / 4.0,
+    return torch.tensor((fsm_rate + dup_rate + unc_rate + cnf_rate) / 4.0,
                         device=device, dtype=torch.float32)
 
 
