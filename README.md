@@ -126,11 +126,11 @@ but you'll need to adjust the imports. Use `train.py` structure for that.
 ```
 
 This results_df will include both input events and generated events and will have these columns:
-{"PatientID", "Step", "Token", "IsInput", "IsOutcome", "IsTerminal", "TimeDelta", "TimePoint"}
+{"PatientID", "Step", "Token", "IsInput", "IsOutcome", "IsTerminal", "TimePoint"}
 
 You can analize the model's performance by comparing the input (`dataset.tokens_df`) to the output:
  - Were all complications generated?
- - Were all complications generated on time? (Set a forgiving boundry)
+ - Were all complications generated on time? (Set a forgiving boundry like 24h window)
 
 
 ### 4. Using as a module
@@ -204,7 +204,7 @@ Remove-Item -Recurse -Force .\transform_emr_temp
 
 - This project uses synthetic EMR data (`data/train/` and `data/test/`).
 - For best results, ensure consistent preprocessing when saving/loading models.
-- `model_config.py` should only be updated **after** dataset initialization to avoid embedding size mismatches.
+- `model_config.py: MODEL_CONFIG.ctx_dim` should only be updated **after** dataset initialization to avoid embedding size mismatches. You should update this value with your full context dimention (without PatientID idx).
 
 ---
 
@@ -213,7 +213,7 @@ Remove-Item -Recurse -Force .\transform_emr_temp
 Raw EMR Tables
 │
 ▼
-Per-patient Event Tokenization (with normalized timestamps)
+Per-patient Event Tokenization (with normalized absolute timestamps)
 │
 ▼
 🧠 Phase 1 – Train EMREmbedding (token + time + patient context)
@@ -222,7 +222,7 @@ Per-patient Event Tokenization (with normalized timestamps)
 📚 Phase 2 – Pre-train a Transformer decoder over learned embeddings, as a next-token-prediction task.
 │
 ▼
-→ Predict next medical events or missing timeline entries
+→ Predict next medical events and deduce outcome predictions from them (in `evaluation.ipynb`)
 
 ---
 
@@ -255,7 +255,10 @@ Medical data varies in density and structure across patients. This dynamic prepr
 Phase 1 learns a robust, patient-aware representation of their event sequences. It isolates the core structure of patient timelines without being confounded by the autoregressive depth of Transformers.
 The embedder uses:
 - 4 levels of tokens - The event token is seperated to 4 hierarichal components to impose similarity between tokens of the same domain: `GLUCOSE` -> `GLUCOSE_TREND` -> `GLUCOSE_TREND_Inc` -> `GLUCOSE_TREND_Inc_Start`
-- 2 levels of time - Delta T from the previous event, to predict local patterns, and ABS T from ADMISSION, to understand global patterns.
+- 1 level of time - ABS T from ADMISSION, to understand global patterns and relationships between non sequential events.
+
+The training uses next token prediction loss (k-window BCE) + time prediction MSE (Δt) + MLM prediction loss.
+MLM will avoid masking tokens which will damage the broader meaning like ADMISSION, [CTX], TERMINAL_OUTCOMES...
 
 ---
 
@@ -273,7 +276,11 @@ Once the EMR structure is captured, the transformer learns to model sequential d
 - How does timing affect outcomes?  
 - How does patient context modulate the trajectory?
 
-The training flow uses a warmup period where the model is to learn patterns using a frozen embedder (so that the sharp gradients won't cause forgetting to the embedder's weights). Then, there is a gradual increase in the penalty weight to smoothly combine the structural penalties with the general loss (BCE + Δt).
+The training uses next token prediction loss (k-window BCE) + time prediction MSE (Δt) + structural penalties.
+The training is guided by teacher's forcing, showing the model the correct context at every step (exposing [0, t-1] at step t from T where T is block_size), while also masking logits for illegal predictions based on the true trajectory. As training progress, the model's input ([0, t-1]) is partially masked (CBM) to teach the model to handle inaccuracies in generation, while avoiding masking same tokens as the EMREmbedding + MEAL + _START + _END tokens, to not clash with the penalties the model recieves.
+
+The training flow uses a warmup period where the model is to learn patterns using a frozen embedder (so that the sharp gradients won't cause forgetting to the embedder's weights).
+
 ---
 
 ### 4. **`inference.py`** – Generating output from the model
@@ -281,8 +288,10 @@ The training flow uses a warmup period where the model is to learn patterns usin
 | Component           | Role                                                                                              |
 |--------------------|---------------------------------------------------------------------------------------------------|
 | `get_token_embedding()` | Select a token and get it's embeddings based on an input embedder.                                 |
-| `infer_event_stream()` | Generate predicted stream of events on an input dataset (Test).                         |
+| `infer_event_stream()` | Generate predicted stream of events on an input dataset (Test), using a masking process to block prediction of illegal tokens in relation to the predictions so far.                         |
 
+
+NOTE: Unlike the parallel batching in the training process, inference on the transformer is step-by-step, hence slow (especially with the updating of illegal tokens on the fly).
 ---
 
 ### 5. **`evaluation.ipynb`** – Evaluation of the model's performance based on dynamic activations of `inference.py`.
