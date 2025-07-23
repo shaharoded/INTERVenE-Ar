@@ -254,7 +254,7 @@ Medical data varies in density and structure across patients. This dynamic prepr
 ⚙️ **Phase 1: Learning Events Representation**  
 Phase 1 learns a robust, patient-aware representation of their event sequences. It isolates the core structure of patient timelines without being confounded by the autoregressive depth of Transformers.
 The embedder uses:
-- 4 levels of tokens - The event token is seperated to 4 hierarichal components to impose similarity between tokens of the same domain: `GLUCOSE` -> `GLUCOSE_TREND` -> `GLUCOSE_TREND_Inc` -> `GLUCOSE_TREND_Inc_Start`
+- 4 levels of tokens - The event token is seperated to 4 hierarichal components to impose similarity between tokens of the same domain: `GLUCOSE` -> `GLUCOSE_TREND` -> `GLUCOSE_TREND_Inc` -> `GLUCOSE_TREND_Inc_START`
 - 1 level of time - ABS T from ADMISSION, to understand global patterns and relationships between non sequential events.
 
 The training uses next token prediction loss (k-window BCE) + time prediction MSE (Δt) + MLM prediction loss.
