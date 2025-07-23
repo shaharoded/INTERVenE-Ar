@@ -315,8 +315,9 @@ class EMRTokenizer:
         token_weights (torch.Tensor): Weights used in loss to emphasize important tokens.
         important_token_ids (torch.Tensor): Token IDs with weight > 1.0.
         pad_token_id (int): ID for padding token.
-        mask_token_id (int): ID for mask token.
+        mask_token_id (int): ID for MASK token.
         ctx_token_id (int): ID for context token.
+        null_token_id (int): ID for NULL token.
     """
     def __init__(self, token2id, rawconcept2id, concept2id, value2id, special_tokens, 
                  token_weights, important_token_ids):
