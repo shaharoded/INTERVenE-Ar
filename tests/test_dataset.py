@@ -42,6 +42,7 @@ def test_synthetic_data_pipeline(tmp_path, capsys):
 
     # now build tokenizer & dataset on full temporal_df
     tokenizer = EMRTokenizer.from_processed_df(temporal_df)
+    tokenizer.save()
     ds = EMRDataset(temporal_df, context_df, tokenizer=tokenizer)
 
     # collate one batch of size 2
