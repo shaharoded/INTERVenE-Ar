@@ -160,7 +160,7 @@ pytest tests/
 📝 If you have **not trained a model yet**, skip inference-related tests:
 
 ```bash
-pytest tests/test_dataset.py tests/test_embedder.py tests/test_train_pipeline.py
+pytest tests/test_dataset.py tests/test_embedder.py tests/test_utils.py tests/test_train_pipeline.py
 ```
 
 ⚠️ Inference tests assume the presence of:
