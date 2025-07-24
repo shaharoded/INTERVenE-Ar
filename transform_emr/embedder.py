@@ -348,17 +348,17 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         start_epoch += 1
     
     # ----- Epoch function -----
-    def run_epoch(loader, train=False):
+    def run_epoch(loader, train_flag=False):
         """
         Returns Tuple: total_loss, bce_loss, time_loss, mlm_loss (for logging in train_embedder and validation)
         """
-        embedder.train() if train else embedder.eval()
+        embedder.train() if train_flag else embedder.eval()
         total_loss, total_bce, total_dt, total_mlm = 0.0, 0.0, 0.0, 0.0
 
-        for batch in tqdm(loader, desc="Training" if train else "Validation", leave=False):
+        for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            if train:
+            if train_flag:
                 optimizer.zero_grad()
             
             masked_pos_ids, mlm_mask = build_mlm(
@@ -416,7 +416,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             time_loss *= training_settings["phase1_dt_weight"] # Scale
             loss = bce_loss + time_loss + mlm_loss
 
-            if train:
+            if train_flag:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(embedder.parameters(), 1.0)
                 optimizer.step()
