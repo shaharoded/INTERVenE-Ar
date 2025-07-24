@@ -47,14 +47,27 @@ def mini_tokenizer():
 
 
 def test_multi_hot_targets_basic(mini_tokenizer):
-    # Sequence of 4 tokens with pad at end
-    seq = torch.tensor([[1,2,3,0]])  # assume 0=PAD
-    mh = get_multi_hot_targets(seq, padding_idx=0, vocab_size=len(mini_tokenizer.token2id), k=2)
-    # At t=0, look at tokens at [1,2] → ids 2 and 3
-    assert mh.shape == (1,4,len(mini_tokenizer.token2id))
-    assert mh[0,0,2] == 1 and mh[0,0,3] == 1
-    # pad index never hot
-    assert torch.all(mh[...,0] == 0)
+    # Build a longer sequence: values 1–10, then two PADs (0)
+    seq = torch.tensor([[1,2,3,4,5,6,7,8,9,10,0,0]])
+    B, T = seq.shape
+    V    = seq.max().item() + 1  # vocab size = 11 (0–10)
+    k    = 4
+
+    mh = get_multi_hot_targets(seq, padding_idx=0, vocab_size=V, k=k)
+    assert mh.shape == (B, T, V)
+
+    # For each timestep, compute the “expected” hot ids via slicing
+    for t in range(T):
+        # lookahead window in Python
+        future = seq[0, t+1 : t+1+k].tolist()
+        # remove PADs and dedupe
+        expected = sorted({x for x in future if x != 0})
+        # pull out all nonzero entries in mh
+        hot_ids = mh[0, t].nonzero(as_tuple=False).squeeze(-1).tolist()
+        hot_ids.sort()
+        assert hot_ids == expected, (
+            f"At t={t}, expected hot={expected} but got {hot_ids}"
+        )
 
 
 def test_build_mlm_masks(mini_tokenizer):
