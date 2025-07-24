@@ -216,7 +216,7 @@ class EMREmbedding(nn.Module):
 
         return seq
     
-    def forward_with_decoder(self, *batch_args):
+    def forward_with_decoder(self, batch: dict):
         """
         Runs full forward pass + decoding (for training phase 1).
         Same inputs as forward_with_decoder
@@ -225,14 +225,19 @@ class EMREmbedding(nn.Module):
             logits: [B, T, vocab_size] — scores for next-token prediction
         """
         seq = self.forward(
-            *batch_args,
-            return_mask=False
+        raw_concept_ids=batch["raw_concept_ids"],
+        concept_ids=batch["concept_ids"],
+        value_ids=batch["value_ids"],
+        position_ids=batch["position_ids"],
+        abs_ts=batch["abs_ts"],
+        patient_contexts=batch["context_vec"],
+        return_mask=False
         )  # → returns only [B,T+1,D]
 
         return self.decoder(seq[:, :-1, :])  # Predict next token at each step
     
 
-    def forward_with_mlm(self, *batch_args, mlm_mask=None):
+    def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None):
         """
         Runs full forward pass + MLM (for training phase 1).
         Same inputs as forward_with_decoder, plus:
@@ -240,7 +245,15 @@ class EMREmbedding(nn.Module):
         Returns:
             mlm_logits [B, T, vocab_size]
         """
-        seq = self.forward(*batch_args, return_mask=False)     # [B,T+1,D]
+        seq = self.forward(
+        raw_concept_ids=batch["raw_concept_ids"],
+        concept_ids=batch["concept_ids"],
+        value_ids=batch["value_ids"],
+        position_ids=masked_pos_ids,  # masked positions used here
+        abs_ts=batch["abs_ts"],
+        patient_contexts=batch["context_vec"],
+        return_mask=False
+        )    # [B,T+1,D]
         logits = self.mlm_head(seq[:, 1:, :])                  # drop [CTX]
         if mlm_mask is not None:
             logits = logits[mlm_mask]                          # flatten to [N_masked,V]
@@ -368,14 +381,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             ) # MLM mask
             
             # BCE Logits + Loss
-            bce_logits = embedder.forward_with_decoder(
-                raw_concept_ids=batch["raw_concept_ids"],
-                concept_ids=batch["concept_ids"],
-                value_ids=batch["value_ids"],
-                position_ids=batch["position_ids"],
-                abs_ts=batch["abs_ts"],
-                patient_contexts=batch["context_vec"]
-            )  # [B, T, V]
+            bce_logits = embedder.forward_with_decoder(batch)  # [B, T, V]
 
             multi_hot_targets = get_multi_hot_targets(
                                                     position_ids=batch["position_ids"], 
@@ -389,14 +395,10 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             
             # MLM Logits + Loss
             mlm_logits = embedder.forward_with_mlm(
-                batch["raw_concept_ids"],
-                batch["concept_ids"],
-                batch["value_ids"],
-                masked_pos_ids,          # <‑‑ give *masked* positions
-                batch["abs_ts"],
-                batch["context_vec"],
-                mlm_mask=mlm_mask
-            )
+                                                    batch,
+                                                    mlm_mask=mlm_mask,
+                                                    masked_pos_ids=masked_pos_ids
+                                                )
             mlm_labels = batch["position_ids"][mlm_mask]          # ground truth
             mlm_loss = F.cross_entropy(
                 mlm_logits,

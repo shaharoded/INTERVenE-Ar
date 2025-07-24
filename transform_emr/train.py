@@ -7,6 +7,7 @@ Phase‑2 : GPT( pretrained_embedder, fine-tuned during training )  ->  best.pt
 """
 
 from torch.utils.data import DataLoader
+import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from pathlib import Path
@@ -60,10 +61,19 @@ def summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer
     print(f"  - Full Tokens:      {len(tokenizer.token2id):,}")
 
 
-def prepare_data():
+def prepare_data(sample=False):
     print(f"[Pre-processing]: Reading dataset...")
     temporal_df = pd.read_csv(TRAIN_TEMPORAL_DATA_FILE, low_memory=False)
     ctx_df = pd.read_csv(TRAIN_CTX_DATA_FILE)
+
+    # --- SAMPLE RANDOM PATIENTS ---
+    if sample:
+        unique_pids = temporal_df["PatientID"].unique()
+        rng = np.random.RandomState(42)  # for reproducibility
+        sampled_pids = rng.choice(unique_pids, size=sample, replace=False)
+
+        temporal_df = temporal_df[temporal_df["PatientID"].isin(sampled_pids)]
+        ctx_df      = ctx_df[ctx_df["PatientID"].isin(sampled_pids)]
 
     if os.path.exists(os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
         print(f"[Pre-processing]: Loading tokenizer from checkpoint...")
