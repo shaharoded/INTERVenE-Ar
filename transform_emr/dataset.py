@@ -331,19 +331,19 @@ class EMRTokenizer:
         self.important_token_ids = important_token_ids
         
         # Validate presence of mandatory special tokens
-        required_specials = ["[MASK]", "[PAD]", "[CTX]", "[NULL]"]
+        required_specials = ["[PAD]", "[MASK]", "[NULL]", "[CTX]"]
         for tok in required_specials:
             if tok not in token2id:
                 raise ValueError(f"[Tokenizer Error] Missing required special token: {tok}")
 
-        self.mask_token_id = token2id["[MASK]"]
         self.pad_token_id = token2id["[PAD]"]
-        self.ctx_token_id = token2id["[CTX]"]
+        self.mask_token_id = token2id["[MASK]"]
         self.null_token_id = token2id["[NULL]"]
+        self.ctx_token_id = token2id["[CTX]"]
 
 
     @classmethod
-    def from_processed_df(cls, df, special_tokens=["[PAD]", "[MASK]", "[CTX]", "[NULL]"]):
+    def from_processed_df(cls, df, special_tokens=["[PAD]", "[MASK]", "[NULL]", "[CTX]"]):
         raw_concepts = sorted(df['RawConcept'].unique())
         concepts = sorted(df['Concept'].unique())
         values = sorted(df['ValueToken'].unique())

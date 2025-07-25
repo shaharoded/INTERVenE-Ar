@@ -3,7 +3,6 @@ THIS MODULE IS INCOMPLETE AND THE TESTED SCENERIO DOES NOT YET REPRESENT THE TRA
 """
 
 import torch
-import math
 import pytest
 
 from transform_emr.utils import (

@@ -110,9 +110,9 @@ class EMREmbedding(nn.Module):
         super().__init__()
 
         # --- for compatibility -------------------------------------------------
-        self.padding_idx = 0 # Hard coded. Should never change.
-        self.output_dim = embed_dim  # keep public attr for compatibility
         self.tokenizer = tokenizer # keep public attr for compatibility
+        self.padding_idx = tokenizer.pad_token_id
+        self.output_dim = embed_dim  # keep public attr for compatibility
 
         # --- Token-level embeddings ---
         self.raw_concept_embed = nn.Embedding(len(tokenizer.rawconcept2id), embed_dim) # Embed for "GLUCOSE_MEASURE"
@@ -139,7 +139,7 @@ class EMREmbedding(nn.Module):
         self.context_proj = nn.Linear(ctx_dim, embed_dim, bias=False)
 
         # --- Final projection ---
-        concat_dim = 5 * embed_dim  # concept + value + pos + time
+        concat_dim = 5 * embed_dim  # raw + concept + value + pos + time
         self.final_proj = nn.Linear(concat_dim, embed_dim)
 
         # --- regularisation ----------------------------------------------
