@@ -566,91 +566,77 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
     nb   = start_ids_per_base.numel()
     K    = int(K_meals.item())
 
-    # ---------------- interval prefix states ----------------
-    # map to interval meta
-    tok_base = base_id[position_ids]             # [B,T] (-1 if not interval)
-    tok_s    = is_start[position_ids]            # [B,T]
-    tok_e    = is_end[position_ids]              # [B,T]
+    # Map tokens → base / start / end
+    tok_base = base_id[position_ids]    # [B,T]
+    tok_s    = is_start[position_ids]   # [B,T]
+    tok_e    = is_end[position_ids]     # [B,T]
 
-    # one-hot over bases (ignore -1)
-    base_valid = tok_base >= 0                   # [B,T]
-    # flatten indices for scatter
+    # Build one-hots over bases
+    valid = tok_base >= 0
     scatter_idx = tok_base.clone()
-    scatter_idx[~base_valid] = 0  # dummy
-
+    scatter_idx[~valid] = 0
     start_oh = torch.zeros(B, T, nb, device=device, dtype=torch.int16)
-    end_oh   = torch.zeros_like(start_oh)
+    end_oh   = start_oh.clone()
+    b_idx = torch.arange(B, device=device)[:,None]
+    t_idx = torch.arange(T, device=device)[None,:]
+    start_oh[b_idx, t_idx, scatter_idx] = (tok_s & valid).to(start_oh.dtype)
+    end_oh  [b_idx, t_idx, scatter_idx] = (tok_e & valid).to(end_oh.dtype)
 
-    b_idx = torch.arange(B, device=device)[:, None]
-    t_idx = torch.arange(T, device=device)[None, :]
-
-    start_oh[b_idx, t_idx, scatter_idx] = (tok_s & base_valid)
-    end_oh[b_idx, t_idx, scatter_idx]   = (tok_e & base_valid)
-
-    # cumulative open counts up to (and including) t
-    starts_cum = start_oh.cumsum(dim=1)          # [B,T,n_b]
+    # Cumulative sums to know "open count" at each t
+    starts_cum = start_oh.cumsum(dim=1)
     ends_cum   = end_oh.cumsum(dim=1)
-    open_cum   = (starts_cum - ends_cum) > 0     # [B,T,n_b] bool
 
-    # Illegal END where not open
-    # Illegal_start where already open
-    # bonus END where open
-    # To paint into [B,T,V], we broadcast with per-base token ids
+    # Build "open state before t" by shifting right
+    prev_s = torch.zeros_like(starts_cum); prev_s[:,1:,:] = starts_cum[:,:-1,:]
+    prev_e = torch.zeros_like(ends_cum);   prev_e[:,1:,:] = ends_cum[:,:-1,:]
+    open_before = (prev_s - prev_e) > 0  # [B,T,nb]
+
+    # Prepare illegal / bonus matrices
     illegal = torch.zeros(B, T, V, device=device, dtype=torch.bool)
-    bonus   = torch.zeros_like(illegal)
+    bonus   = illegal.clone()
 
-    # Build [1,1,nb] -> [B,T,nb] helpers
-    end_tok_ids   = end_ids_per_base.view(1, 1, nb).expand(B, T, nb)
-    start_tok_ids = start_ids_per_base.view(1, 1, nb).expand(B, T, nb)
+    # 1) END rules: illegal if not open_before, bonus if open_before
+    end_ids = end_ids_per_base.view(1,1,nb).expand(B,T,nb)
+    illegal.scatter_(2, end_ids, ~open_before)
+    bonus.  scatter_(2, end_ids,  open_before)
 
-    # Mask matrices
-    need_end_closed   = ~open_cum          # END illegal if not open
-    need_start_closed =  open_cum          # START illegal if already open
-    good_end          =  open_cum          # END bonus if open
+    # 2) DUP-START: START when *that same* base was already open should be illegal
+    #    clamp base_id to ≥0 so gather never errors
+    base_idxs = tok_base.clamp(min=0).unsqueeze(-1)   # [B,T,1]
+    was_open  = open_before.gather(2, base_idxs).squeeze(-1)  # [B,T]
+    dup       = tok_s & (tok_base >= 0) & was_open
+    if dup.any():
+        b_d, t_d    = dup.nonzero(as_tuple=True)
+        start_toks  = position_ids[b_d, t_d]    # the token‐IDs of those STARTs
+        illegal[b_d, t_d, start_toks] = True
 
-    # Scatter to [B,T,V]
-    illegal.scatter_(2, end_tok_ids,   need_end_closed)
-    illegal.scatter_(2, start_tok_ids, need_start_closed)
-    bonus.scatter_(  2, end_tok_ids,   good_end)
+    # 3) CNF (conflicts): if any other value of same concept was open_before
+    if nb>0 and conflict_mat.any():
+        oc = open_before.to(torch.int32)                     # [B,T,nb]
+        cm = conflict_mat.to(torch.int32).T                   # [nb,nb]
+        conflict_active = (oc @ cm) > 0                       # [B,T,nb]
+        start_ids = start_ids_per_base.view(1,1,nb).expand(B,T,nb)
+        illegal.scatter_(2, start_ids, conflict_active)
 
-    # Value-conflict masking 
-    # Conflict_mat[nb,nb]: True if (j,k) conflict (same concept, different value)
-    if nb > 0 and conflict_mat.any():
-        # For each time step, which bases are conflicting-with-open ones?
-        # open_cum: [B,T,nb]; conflict_mat: [nb,nb]
-        # -> conflict_active[b,t,j] = OR_k ( open_cum[b,t,k] & conflict_mat[k,j] )
-        conflict_active = open_cum @ conflict_mat.T    # bool matmul
-        # Forbid START of j when conflict_active==True
-        illegal.scatter_(2, start_tok_ids, conflict_active)
-
-    # ---------------- meal prefix states ----------------
+    # --- Meal logic unchanged ---
     if K > 0:
         mr = meal_rank[position_ids]             # [B,T]
-        meal_mask = mr >= 0
-
-        # one-hot of meals per rank
+        mask = mr >= 0
         meal_oh = torch.zeros(B, T, K, device=device, dtype=torch.bool)
-        valid_idx = torch.nonzero(meal_mask, as_tuple=False)
-        if valid_idx.numel() > 0:
-            b_idx = valid_idx[:, 0]
-            t_idx = valid_idx[:, 1]
-            meal_oh[b_idx, t_idx, mr[meal_mask]] = True
+        idx = mask.nonzero(as_tuple=False)
+        if idx.numel():
+            b_i, t_i = idx[:,0], idx[:,1]
+            meal_oh[b_i, t_i, mr[mask]] = True
+        seen = meal_oh.cumsum(dim=1) > 0       # [B,T,K]
 
-        meal_seen = meal_oh.cumsum(dim=1) > 0    # [B,T,K]
-
-        # for each vocab token v that is a meal:
-        #   pred_rank[v] is predecessor rank. At time t, v illegal if meal_seen[b,t,pred_rank[v]] == False
-        meal_tok_mask = meal_rank >= 0
-        if meal_tok_mask.any():
-            pred_rank = meal_pred_rank[meal_tok_mask]        # [Nv]
-            tok_ids   = meal_tok_mask.nonzero(as_tuple=False).squeeze(1)  # [Nv]
-
-            # expand meal_seen predecessor info to [B,T,Nv]
-            pred_ok = meal_seen[:, :, pred_rank]             # indexing along K -> [B,T,Nv]
-
-            # place into big [B,T,V]
-            illegal[:, :, tok_ids] |= ~pred_ok
-            bonus[:,   :, tok_ids] |=  pred_ok
+        # For each meal token v, illegal if predecessor not seen yet
+        mtok = meal_rank >= 0
+        if mtok.any():
+            pred_ranks = meal_pred_rank[mtok]
+            v_ids      = mtok.nonzero(as_tuple=False).squeeze(-1)
+            ok         = seen[:,:,pred_ranks]     # [B,T,nv]
+            illegal[:,:,v_ids] |= ~ok
+            bonus  [:,:,v_ids] |=  ok
 
     return illegal, bonus
 

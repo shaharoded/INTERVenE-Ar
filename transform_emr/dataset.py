@@ -539,11 +539,13 @@ def collate_emr(batch, pad_token_id=0):
 
     Returns:
         Dictionary of padded tensors: [B, T_max] + context_vec [B, C]
+    
+    NOTE: Padding token id ([PAD]) is always 0. Time Padding should be 0.0.
     """
     batch_size = len(batch)
     max_len = max(len(x['position_ids']) for x in batch)
 
-    def pad_tensor(seq, pad_val=0, dtype=torch.long):
+    def pad_tensor(seq, pad_val=pad_token_id, dtype=torch.long):
         out = torch.full((batch_size, max_len), pad_val, dtype=dtype)
         for i, s in enumerate(seq):
             out[i, :len(s)] = s
