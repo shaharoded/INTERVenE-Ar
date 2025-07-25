@@ -611,30 +611,52 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
         illegal[b_d, t_d, start_toks] = True
 
     # 3) CNF (conflicts): if any other value of same concept was open_before
-    if nb>0 and conflict_mat.any():
-        oc = open_before.to(torch.int32)                     # [B,T,nb]
-        cm = conflict_mat.to(torch.int32).T                   # [nb,nb]
-        conflict_active = (oc @ cm) > 0                       # [B,T,nb]
-        start_ids = start_ids_per_base.view(1,1,nb).expand(B,T,nb)
-        illegal.scatter_(2, start_ids, conflict_active)
+    if nb > 0 and conflict_mat.any():
+        # 3) CNF (conflicts): START of a value is illegal if any conflicting base is already open
+        oc = open_before.to(torch.int32)                   # [B,T,nb]
+        cm = conflict_mat.to(torch.int32).T                 # [nb,nb]
+        conflict_active = (oc @ cm) > 0                     # [B,T,nb]
 
-    # --- Meal logic unchanged ---
-    if K > 0:
-        mr = meal_rank[position_ids]             # [B,T]
+        # only apply to actual START tokens of each base
+        conflict_active &= start_oh.bool()                  # [B,T,nb]
+
+        # OR‑add these into the illegal mask at the corresponding START token IDs
+        ids = start_ids_per_base                           # shape [nb]
+        illegal[:, :, ids] |= conflict_active              # in‑place OR
+
+    # --- Meal logic: allow starting anywhere, then enforce absolute cycle order ---
+    if K_meals > 0:
+        # 1) build a one‑hot of *where* meals occur in the GOLD prefix
+        mr   = meal_rank[position_ids]             # [B,T]
         mask = mr >= 0
-        meal_oh = torch.zeros(B, T, K, device=device, dtype=torch.bool)
+        meal_oh = torch.zeros(B, T, K_meals, device=device, dtype=torch.bool)
         idx = mask.nonzero(as_tuple=False)
         if idx.numel():
             b_i, t_i = idx[:,0], idx[:,1]
             meal_oh[b_i, t_i, mr[mask]] = True
-        seen = meal_oh.cumsum(dim=1) > 0       # [B,T,K]
 
-        # For each meal token v, illegal if predecessor not seen yet
-        mtok = meal_rank >= 0
+        # 2) compute “prefix_seen”: which ranks have appeared *before* time t
+        #    (we shift the cumsum right by one)
+        cum        = meal_oh.cumsum(dim=1) > 0          # [B,T,K_meals]
+        prefix_seen = cum.clone()
+        prefix_seen[:,1:,:] = cum[:,:-1,:]
+        prefix_seen[:,0,:] = False
+
+        # 3) decide legality:
+        #    • if *no* meal has ever been seen in the prefix → any meal is OK
+        #    • else → only the immediate successor (pred_rank) is OK
+        mtok       = meal_rank >= 0                     # [V]
         if mtok.any():
-            pred_ranks = meal_pred_rank[mtok]
-            v_ids      = mtok.nonzero(as_tuple=False).squeeze(-1)
-            ok         = seen[:,:,pred_ranks]     # [B,T,nv]
+            v_ids       = mtok.nonzero(as_tuple=False).squeeze(-1)  # meal token IDs
+            pred_ranks  = meal_pred_rank[ mtok ]                  # [nv]
+            # a) predecessor rule
+            ok_pred     = prefix_seen[:,:,pred_ranks]             # [B,T,nv]
+            # b) free‐pass if absolutely no meal seen yet
+            any_seen    = prefix_seen.any(dim=2, keepdim=True)    # [B,T,1]
+            ok_initial  = ~any_seen                                 # [B,T,1]
+            ok          = ok_pred | ok_initial                     # [B,T,nv]
+
+            # 4) apply to illegal/bonus
             illegal[:,:,v_ids] |= ~ok
             bonus  [:,:,v_ids] |=  ok
 

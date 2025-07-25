@@ -40,7 +40,7 @@ def mini_tokenizer():
         "A_TREND_dec_START", "A_TREND_dec_END",
         "A_TREND_inc_START", "A_TREND_inc_END",
         # Meals
-        "MEAL_B", "MEAL_L", "MEAL_D",
+        "MEAL_Breakfast", "MEAL_Lunch", "MEAL_Dinner", "MEAL_Night",
         # Outcomes
         "DEATH", "RELEASE"
     ]
@@ -68,12 +68,13 @@ def mini_tokenizer():
         "A_STATE_High": 1,
         "A_TREND_dec": 2,
         "A_TREND_inc": 3,
-        "MEAL_B": 4,
-        "MEAL_L": 5,
-        "MEAL_D": 6,
-        "ADMISSION": 7,
-        "DEATH": 8,
-        "RELEASE": 9
+        "MEAL_Breakfast": 4,
+        "MEAL_Lunch": 5,
+        "MEAL_Dinner": 6,
+        "MEAL_Night": 7,
+        "ADMISSION": 8,
+        "DEATH": 9,
+        "RELEASE": 10
     }
     special_tokens = ["[PAD]", "[MASK]", "[CTX]", "[NULL]"]
     token_weights = torch.ones(len(toks))
@@ -171,7 +172,7 @@ def test_build_mlm_masking_visual_and_assert():
         tk.token2id["RELEASE"],               # forbidden
         tk.token2id["A_STATE_High_START"],    # eligible
         tk.token2id["A_TREND_inc_START"],     # eligible
-        tk.token2id["MEAL_B"],                # eligible
+        tk.token2id["MEAL_Breakfast"],        # eligible
         tk.token2id["A_TREND_inc_END"],       # eligible
         tk.token2id["A_STATE_High_END"],      # eligible
     ]
