@@ -148,9 +148,22 @@ def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.15):
     forbid[forbid_ids] = True
 
     eligible = ~forbid[pos_ids]
-    # sample
-    prob = torch.rand(B, T, device=device) < p
-    to_mask = prob & eligible
+    # Sample exactly p * (#eligible) positions ---
+    # total eligible count
+    E = int(eligible.sum().item())
+    # how many to mask
+    N = int(round(p * E))
+    if N > 0:
+        # Flattened indices of all eligible slots
+        # idx is shape [E, 2] of (batch_idx, time_idx)
+        idx = eligible.nonzero(as_tuple=False)
+        # shuffle and pick first N
+        perm = torch.randperm(E, device=device)[:N]
+        pick = idx[perm]              # shape [N,2]
+        to_mask = torch.zeros_like(eligible)
+        to_mask[pick[:,0], pick[:,1]] = True
+    else:
+        to_mask = torch.zeros_like(eligible)
 
     # random 80/10/10 (like BERT)?
     # Keep it simple: replace all with [MASK]
@@ -366,171 +379,6 @@ def build_luts(tokenizer):
     }
 
 
-def penalty_interval_structure(
-    pred_ids: torch.LongTensor,
-    gt_ids:   torch.LongTensor,
-    is_start:             torch.BoolTensor,
-    is_end:               torch.BoolTensor,
-    base_id:              torch.LongTensor,
-    start_ids_per_base:   torch.LongTensor,
-    end_ids_per_base:     torch.LongTensor,
-    meal_rank:            torch.LongTensor,
-    meal_pred_rank:       torch.LongTensor,
-    K_meals:              torch.Tensor,
-    conflict_mat:         torch.BoolTensor,
-    window:               int = 5,
-) -> torch.Tensor:
-    """
-    Computes a structural-violation penalty for interval tokens, covering:
-      FSM : END without an open START
-      DUP : START when same base already open
-      UNC : START never closed by END (sequence ended)
-      CNF : START while a conflicting base is open (same concept, different value)
-
-    Returns a scalar ∈ [0,1]:
-      (new_timestep_violations + new_unc_violations) /
-      (interval_token_count + batch_size)
-
-    Forgiveness: if a violation of the same token_id and type
-    occurs in the GT sequence within ±`window` time steps,
-    it is forgiven (not counted as new). Unclosed (UNC) violations
-    are forgiven if the same base remains unclosed in GT.
-
-    Args:
-      pred_ids, gt_ids: [B, T] LongTensor
-      is_start, is_end, base_id: [V] Bool/Long tensors
-      conflict_mat: [nb, nb] Bool
-      window: integer radius for forgiving GT violations around each t
-    """
-    B, T = pred_ids.shape
-
-    # 1. Illegal masks for each token, [B, T, V]
-    illegal_pred, _ = compute_legality_masks_tf(
-        pred_ids, is_start, is_end,
-        base_id, start_ids_per_base, end_ids_per_base,
-        meal_rank, meal_pred_rank, K_meals, conflict_mat
-    )
-    illegal_gt, _ = compute_legality_masks_tf(
-        gt_ids,   is_start, is_end,
-        base_id, start_ids_per_base, end_ids_per_base,
-        meal_rank, meal_pred_rank, K_meals, conflict_mat
-    )
-
-    # 2. Gather illegal flags for each pred token at each (b,t)
-    idx = pred_ids.unsqueeze(-1)  # [B, T, 1]
-    pred_illegal = illegal_pred.gather(2, idx).squeeze(-1)  # [B, T]
-    gt_illegal   = illegal_gt.  gather(2, idx).squeeze(-1)  # [B, T]
-
-    # 3. Windowed GT forgiveness via 1D max-pooling
-    gt_illegal_float = gt_illegal.float().unsqueeze(1)  # [B,1,T]
-    padded = F.pad(gt_illegal_float, (window, window), mode='constant', value=0)
-    gt_window = F.max_pool1d(padded, kernel_size=2*window+1, stride=1).squeeze(1)  # [B,T]
-
-    # 4. New timestep violations (FSM, DUP, CNF)
-    new_ts_viol = pred_illegal & (~gt_window.bool())  # [B, T]
-    count_ts_viol = new_ts_viol.float().sum()
-
-    # 5. Unclosed-interval (UNC) violations at sequence end
-    # Compute open-counts per base for pred and GT via cumsum
-    # Map each token to its base index or -1
-    base_idx = base_id[pred_ids]  # [B,T]
-    start_mask = is_start[pred_ids]  # [B,T]
-    end_mask   = is_end  [pred_ids]  # [B,T]
-
-    # Build one-hot per-base start/end counts
-    nb = conflict_mat.shape[0]
-    # Expand to [B,T,nb]
-    b_idx = torch.arange(B, device=pred_ids.device).unsqueeze(1).expand(-1, T)
-    base_onehot = F.one_hot(base_idx*nb + base_idx, B*nb).view(B, nb)
-    # Instead, simpler: count per-base start and end in pred and gt
-    # Using scatter_add
-    starts_pred = torch.zeros(B, nb, device=pred_ids.device)
-    ends_pred   = torch.zeros(B, nb, device=pred_ids.device)
-    starts_gt   = torch.zeros(B, nb, device=pred_ids.device)
-    ends_gt     = torch.zeros(B, nb, device=pred_ids.device)
-
-    starts_pred.scatter_add_(1, base_idx[start_mask], torch.ones_like(base_idx[start_mask], dtype=torch.float))
-    ends_pred.  scatter_add_(1, base_idx[end_mask],   torch.ones_like(base_idx[end_mask],   dtype=torch.float))
-    starts_gt.scatter_add_(1, base_id[gt_ids][is_start[gt_ids]], torch.ones_like(base_id[gt_ids][is_start[gt_ids]], dtype=torch.float))
-    ends_gt.  scatter_add_(1, base_id[gt_ids][is_end[gt_ids]],   torch.ones_like(base_id[gt_ids][is_end[gt_ids]],   dtype=torch.float))
-
-    # Open count residual
-    open_pred = (starts_pred - ends_pred) > 0  # [B, nb]
-    open_gt   = (starts_gt   - ends_gt)   > 0  # [B, nb]
-    new_unc_viol = (open_pred & (~open_gt)).float().sum()  # # unclosed bases in pred not in GT
-
-    # 6. Normalize: interval tokens + batch-size for UNC
-    interval_mask = (base_idx >= 0)
-    denom = interval_mask.float().sum().clamp_min(1.0) + B
-
-    penalty = (count_ts_viol + new_unc_viol) / denom
-    return penalty
-
-
-def penalty_meal_order(pred_ids:  torch.LongTensor, meal_rank: torch.LongTensor) -> torch.Tensor:
-    """
-    Enforces cyclic order among meals: B→L→D→N→B...
-    We ignore non-meal tokens (they can appear anywhere in between).
-
-    Implementation:
-      1. Extract only meal ids per sequence (mask ranks>=0).
-      2. Compare each consecutive pair in that filtered list.
-
-    pred_ids  : [B,T]
-    meal_rank : [V]  (-1 non-meal, else 0..K-1)
-
-    return scalar ∈ [0,1] = (#wrong meal transitions)/(#meal transitions)
-    """
-
-    """
-    Computes a cyclic-meal-order penalty: B→L→D→N→B...
-    Returns a scalar ∈ [0,1]: the fraction of adjacent meal transitions
-    in the predicted sequence that violate the expected cycle.
-
-    Steps:
-      1. Map pred_ids → ranks (with -1 for non-meal tokens).
-      2. Compress each batch sequence into its meal-only sequence M of shape [B, max_meals].
-      3. Compute expected next-meal rank = (M[:, :-1] + 1) % K.
-      4. Count wrong transitions (curr != expected) and normalize by total transitions.
-
-    Fully batched, GPU-friendly, and differentiable.
-    """
-    device = pred_ids.device
-    ranks = meal_rank[pred_ids]  # [B,T]
-    B, T = ranks.shape
-    mask = ranks >= 0            # [B,T]
-    if not mask.any():
-        return torch.tensor(0.0, device=device)
-
-    # 1. Identify meal positions per sequence
-    mask_int = mask.int()
-    meal_idx = torch.cumsum(mask_int, dim=1)  # [B, T]
-    meal_counts = meal_idx[:, -1]             # [B]
-    max_meals = int(meal_counts.max().item())
-
-    # 2. Scatter predicted ranks into a compact [B,max_meals] matrix
-    b_t = mask.nonzero(as_tuple=False)        # [N,2] of (b, t)
-    b_idx, t_idx = b_t[:, 0], b_t[:, 1]
-    k_idx = meal_idx[b_idx, t_idx] - 1       # [N]
-
-    M = torch.full((B, max_meals), -1, dtype=ranks.dtype, device=device)
-    flat_M = M.view(-1)
-    flat_idx = b_idx * max_meals + k_idx
-    flat_M[flat_idx] = ranks[b_idx, t_idx]
-    M = flat_M.view(B, max_meals)
-
-    # 3. Compute transitions
-    prev = M[:, :-1]
-    curr = M[:, 1:]
-    valid = (prev >= 0) & (curr >= 0)
-    K = int(meal_rank.max().item()) + 1
-    expected = (prev + 1) % K
-
-    wrong = ((curr != expected) & valid).float().sum()
-    total = valid.float().sum().clamp_min(1.0)
-    return wrong / total
-
-
 def compute_legality_masks_tf(position_ids: torch.LongTensor,
                               is_start: torch.BoolTensor,
                               is_end:   torch.BoolTensor,
@@ -547,14 +395,24 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
     illegal[B,T,V]  True → forbid v at step t
     bonus  [B,T,V]  True → boost v at step t
 
+    Terms:
+    If token== 'GLUCOSE_TREND_inc_START', base(tok) == 'GLUCOSE_TREND_inc'
+    If token== 'GLUCOSE_TREND_inc_START', concept(tok) == 'GLUCOSE_TREND'
+
     Interval logic (per base):
-      • END illegal if base not open yet
-      • START illegal if base already open
-      • END bonus  if base open
-      • START/END of concept_valX is illegal if concept_valY is still open.
+      • END is illegal if base not open yet (You can't see 'GLUCOSE_TREND_inc_END' before opening 
+      it 'GLUCOSE_TREND_inc_START'). Enforced using base(tok).
+      • START illegal if base already open 
+      (You can't have 'GLUCOSE_TREND_inc_START' after 'GLUCOSE_TREND_inc_START' without seeing
+        'GLUCOSE_TREND_inc_END'). Enforced using base(tok).
+      • END bonus  if base open (to push the model to close intervals). Enforced using base(tok).
+      • START of concept(tok) is illegal if concept(tok) is still open 
+        (meaning you can't have 'GLUCOSE_TREND_inc_START' after 'GLUCOSE_TREND_dec_START' without seeing
+        'GLUCOSE_TREND_inc_END'). Enforced using concept(tok).
 
     Meal logic:
-      cyclic order; meal m illegal if predecessor rank not seen yet, bonus if seen.
+      cyclic order; meal m illegal if predecessor rank not seen yet, bonus if seen. 
+      The first meal is never illegal, only the following ones.
 
     All done without loops over T (only broadcast/cumsums).
 
@@ -564,7 +422,6 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
     B, T = position_ids.shape
     V    = is_start.numel()
     nb   = start_ids_per_base.numel()
-    K    = int(K_meals.item())
 
     # Map tokens → base / start / end
     tok_base = base_id[position_ids]    # [B,T]
@@ -661,6 +518,186 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
             bonus  [:,:,v_ids] |=  ok
 
     return illegal, bonus
+
+
+def penalty_interval_structure(
+    pred_ids: torch.LongTensor,
+    gt_ids:   torch.LongTensor,
+    is_start:             torch.BoolTensor,
+    is_end:               torch.BoolTensor,
+    base_id:              torch.LongTensor,
+    start_ids_per_base:   torch.LongTensor,
+    end_ids_per_base:     torch.LongTensor,
+    meal_rank:            torch.LongTensor,
+    meal_pred_rank:       torch.LongTensor,
+    K_meals:              torch.Tensor,
+    conflict_mat:         torch.BoolTensor,
+    window:               int = 5,
+) -> torch.Tensor:
+    """
+    Computes a structural-violation penalty for interval tokens, covering:
+      FSM : END without an open START
+      DUP : START when same base already open
+      UNC : START never closed by END (sequence ended)
+      CNF : START while a conflicting base is open (same concept, different value)
+
+    Returns a scalar ∈ [0,1]:
+      (new_timestep_violations + new_unc_violations) /
+      (interval_token_count + batch_size)
+
+    Forgiveness: if a violation of the same token_id and type
+    occurs in the GT sequence within ±`window` time steps,
+    it is forgiven (not counted as new). Unclosed (UNC) violations
+    are forgiven if the same base remains unclosed in GT.
+
+    Args:
+      pred_ids, gt_ids: [B, T] LongTensor
+      is_start, is_end, base_id: [V] Bool/Long tensors
+      conflict_mat: [nb, nb] Bool
+      window: integer radius for forgiving GT violations around each t
+    """
+    B, T = pred_ids.shape
+
+    # 1) Compute illegal masks for pred & GT
+    illegal_pred, _ = compute_legality_masks_tf(
+        pred_ids, is_start, is_end,
+        base_id, start_ids_per_base, end_ids_per_base,
+        meal_rank, meal_pred_rank, K_meals, conflict_mat
+    )
+    illegal_gt, _ = compute_legality_masks_tf(
+        gt_ids,   is_start, is_end,
+        base_id, start_ids_per_base, end_ids_per_base,
+        meal_rank, meal_pred_rank, K_meals, conflict_mat
+    )
+
+    # Gather illegal flags per token
+    # 2a) Gather illegal flags per token for pred **and** GT
+    pred_illegal = illegal_pred.gather(2, pred_ids.unsqueeze(-1)).squeeze(-1)  # [B,T]
+    gt_illegal   = illegal_gt.  gather(2, gt_ids.  unsqueeze(-1)).squeeze(-1)  # [B,T]
+
+    # 2) Forgiveness window over GT
+    gt_win = F.max_pool1d(
+        gt_illegal.float().unsqueeze(1),
+        kernel_size=2*window+1, stride=1, padding=window
+    ).squeeze(1).bool()  # [B,T]
+
+    # 3) New-timestep violations
+    new_ts_viol = pred_illegal & (~gt_win)
+    count_ts_viol = new_ts_viol.float().sum()
+
+    # 4) Unclosed (UNC) violations: count residual opens
+    # Map tokens → base indices
+    base_idx = base_id[pred_ids]  # [B,T]
+    # Masks where start/end occurred and base_idx >=0
+    start_mask = is_start[pred_ids] & (base_idx >= 0)
+    end_mask   = is_end  [pred_ids] & (base_idx >= 0)
+
+    nb = conflict_mat.shape[0]
+    # Count starts/ends via scatter_add
+    starts_pred = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
+    ends_pred   = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
+    starts_gt   = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
+    ends_gt     = torch.zeros(B, nb, device=pred_ids.device, dtype=torch.float)
+
+    # Predicted
+    if start_mask.any():
+        idxs = base_idx[start_mask]
+        b_idxs, t_idxs = (start_mask).nonzero(as_tuple=True)
+        # scatter per batch
+        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
+            starts_pred[b, tid] += 1.0
+    if end_mask.any():
+        idxs = base_idx[end_mask]
+        b_idxs, t_idxs = (end_mask).nonzero(as_tuple=True)
+        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
+            ends_pred[b, tid] += 1.0
+    # GT
+    base_idx_gt = base_id[gt_ids]
+    mask_s_gt = is_start[gt_ids] & (base_idx_gt >= 0)
+    mask_e_gt = is_end  [gt_ids] & (base_idx_gt >= 0)
+    if mask_s_gt.any():
+        idxs = base_idx_gt[mask_s_gt]
+        b_idxs, t_idxs = mask_s_gt.nonzero(as_tuple=True)
+        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
+            starts_gt[b, tid] += 1.0
+    if mask_e_gt.any():
+        idxs = base_idx_gt[mask_e_gt]
+        b_idxs, t_idxs = mask_e_gt.nonzero(as_tuple=True)
+        for b, tid in zip(b_idxs.tolist(), idxs.tolist()):
+            ends_gt[b, tid] += 1.0
+
+    open_pred = (starts_pred - ends_pred) > 0  # [B, nb]
+    open_gt   = (starts_gt   - ends_gt)   > 0  # [B, nb]
+    new_unc_viol = (open_pred & (~open_gt)).float().sum()
+
+    # 5) Normalize by interval tokens + batch
+    denom = ((base_idx >= 0).float().sum() + B).clamp_min(1.0)
+    penalty = (count_ts_viol + new_unc_viol) / denom
+    return penalty
+
+def penalty_meal_order(pred_ids:  torch.LongTensor, meal_rank: torch.LongTensor) -> torch.Tensor:
+    """
+    Enforces cyclic order among meals: B→L→D→N→B...
+    We ignore non-meal tokens (they can appear anywhere in between).
+
+    Implementation:
+      1. Extract only meal ids per sequence (mask ranks>=0).
+      2. Compare each consecutive pair in that filtered list.
+
+    pred_ids  : [B,T]
+    meal_rank : [V]  (-1 non-meal, else 0..K-1)
+
+    return scalar ∈ [0,1] = (#wrong meal transitions)/(#meal transitions)
+    """
+
+    """
+    Computes a cyclic-meal-order penalty: B→L→D→N→B...
+    Returns a scalar ∈ [0,1]: the fraction of adjacent meal transitions
+    in the predicted sequence that violate the expected cycle.
+
+    Steps:
+      1. Map pred_ids → ranks (with -1 for non-meal tokens).
+      2. Compress each batch sequence into its meal-only sequence M of shape [B, max_meals].
+      3. Compute expected next-meal rank = (M[:, :-1] + 1) % K.
+      4. Count wrong transitions (curr != expected) and normalize by total transitions.
+
+    Fully batched, GPU-friendly, and differentiable.
+    """
+    device = pred_ids.device
+    ranks = meal_rank[pred_ids]  # [B,T]
+    B, T = ranks.shape
+    mask = ranks >= 0            # [B,T]
+    if not mask.any():
+        return torch.tensor(0.0, device=device)
+
+    # 1. Identify meal positions per sequence
+    mask_int = mask.int()
+    meal_idx = torch.cumsum(mask_int, dim=1)  # [B, T]
+    meal_counts = meal_idx[:, -1]             # [B]
+    max_meals = int(meal_counts.max().item())
+
+    # 2. Scatter predicted ranks into a compact [B,max_meals] matrix
+    b_t = mask.nonzero(as_tuple=False)        # [N,2] of (b, t)
+    b_idx, t_idx = b_t[:, 0], b_t[:, 1]
+    k_idx = meal_idx[b_idx, t_idx] - 1       # [N]
+
+    M = torch.full((B, max_meals), -1, dtype=ranks.dtype, device=device)
+    flat_M = M.view(-1)
+    flat_idx = b_idx * max_meals + k_idx
+    flat_M[flat_idx] = ranks[b_idx, t_idx]
+    M = flat_M.view(B, max_meals)
+
+    # 3. Compute transitions
+    prev = M[:, :-1]
+    curr = M[:, 1:]
+    valid = (prev >= 0) & (curr >= 0)
+    K = int(meal_rank.max().item()) + 1
+    expected = (prev + 1) % K
+
+    wrong = ((curr != expected) & valid).float().sum()
+    total = valid.float().sum().clamp_min(1.0)
+    return wrong / total
+
 
 
 def apply_masks_to_logits(logits, illegal_mask, bonus_mask, bonus_boost=0.2):
