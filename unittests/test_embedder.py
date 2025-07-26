@@ -96,10 +96,17 @@ def test_forward_with_decoder_logits(mini_tokenizer):
         'abs_ts':          torch.zeros(B, T),
         'patient_contexts': torch.zeros(B, ctx_dim)
     }
+    batch = {
+     "raw_concept_ids": dummy['raw_concept_ids'],
+     "concept_ids":     dummy['concept_ids'],
+     "value_ids":       dummy['value_ids'],
+     "position_ids":    dummy['position_ids'],
+     "abs_ts":          dummy['abs_ts'],
+     # note: forward_with_decoder pulls patient_contexts from "context_vec"
+     "context_vec":     dummy['patient_contexts'],
+    }
     logits = model.forward_with_decoder(
-        dummy['raw_concept_ids'], dummy['concept_ids'],
-        dummy['value_ids'], dummy['position_ids'],
-        dummy['abs_ts'], dummy['patient_contexts']
+        batch
     )
     # forward_with_decoder predicts next-token logits: [B, T, vocab_size]
     vocab_size = len(tokenizer.token2id)
