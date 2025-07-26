@@ -462,7 +462,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 p_meal = penalty_meal_order(pred_ids, luts["meal_rank"])
                 p_struct = penalty_interval_structure(pred_ids, target_ids, 
                                                         luts["is_start"], luts["is_end"], 
-                                                        luts["base_id"], luts["conflict_mat"])
+                                                        luts["base_id"], luts["start_ids_per_base"],
+                                                        luts["end_ids_per_base"], luts["meal_rank"],
+                                                        luts["meal_pred_rank"], luts["K_meals"],
+                                                        luts["conflict_mat"], 
+                                                        window=training_settings['bce_k_window'])
 
                 # Average the penalties to bound in [0, 1] + smooth
                 generative_penalty = torch.log1p((p_meal + p_struct) / 2.0)
