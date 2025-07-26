@@ -452,6 +452,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     vocab_size=logits.size(-1),
                     k=training_settings["bce_k_window"]
                 )
+                multi_hot[illegal_mask] = 0   # zero‑out illegal targets
+                
                 # Calculate BCE loss
                 loss_fn = nn.BCEWithLogitsLoss(pos_weight=model.embedder.tokenizer.token_weights.to(logits.device))
                 loss_bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
@@ -546,3 +548,4 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
             continue
 
     plot_losses(train_losses, val_losses)
+    return model, train_losses, val_losses
