@@ -27,7 +27,7 @@ event-prediction-in-diabetes-care/
 │   ├── train/
 │   └── test/
 │
-├── tests/                             # Unit and integration tests
+├── unittests/                         # Unit and integration tests
 │
 ├── .gitignore
 ├── requirements.txt
@@ -155,12 +155,12 @@ Run all tests:
 
 Without validation prints:
 ```bash
-pytest tests/
+pytest unittests/
 ```
 
 With validation prints:
 ```bash
-pytest -q -s tests/
+pytest -q -s unittests/
 ```
 
 ---
