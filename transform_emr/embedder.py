@@ -10,7 +10,7 @@ from tqdm import tqdm
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
 from transform_emr.config.model_config import *
-from transform_emr.utils import get_multi_hot_targets, build_mlm
+from transform_emr.utils import get_multi_hot_targets, build_mlm, plot_losses
 
 torch.serialization.add_safe_globals([
     EMRTokenizer,
@@ -460,5 +460,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         else:
             # If warmup isn't complete - do nothing.
             continue
-
+    
+    plot_losses(train_losses, val_losses)
     return embedder, train_losses, val_losses
