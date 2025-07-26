@@ -329,7 +329,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     """
     Trains a Transformer-based EMR sequence model in Phase 2 (decoder stage),
     using a pretrained embedder and structured multi-loss optimization.
-    Total Loss = λ1 * BCE + λ2 * Penalty + λ3 * Time Loss (τt)
+    Total Loss = λ1 * BCE + λpen * Penalty + λt * Time Loss (τt) + λt_pen * Time penalty
 
     Gradually applying curriculum and CBM during `warmup_epochs`, then implements early stopping based on best total loss. 
     Supports resume-from-checkpoint training.
@@ -454,6 +454,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 )
                 multi_hot[illegal_mask] = 0   # zero‑out illegal targets
                 
+                # Label smoothing
+                ε = 0.05
+                multi_hot = multi_hot * (1 - ε) + ε       # ones → 0.95, zeros → 0.05
+                
                 # Calculate BCE loss
                 loss_fn = nn.BCEWithLogitsLoss(pos_weight=model.embedder.tokenizer.token_weights.to(logits.device))
                 loss_bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
@@ -472,7 +476,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # Average the penalties to bound in [0, 1] + smooth
                 generative_penalty = torch.log1p((p_meal + p_struct) / 2.0)
-                generative_penalty = training_settings["phase2_penalty_weight"] * generative_penalty # Apply penalty weight
+                λpen = linear_schedule(epoch, 
+                                       training_settings['warmup_epochs'], 
+                                       training_settings["phase2_penalty_weight"])
+                generative_penalty = λpen * generative_penalty # Apply penalty weight
 
                 # === Loss: Δt + monotonicity ===
                 # Predict abs_ts[:, 1:] using model abs_t_head
@@ -484,7 +491,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Base MSE loss
                 abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
                 abs_t_loss = (abs_t_loss * mask).sum() / mask.sum().clamp(min=1)
-                abs_t_loss = training_settings["phase2_dt_weight"] * abs_t_loss
+                λt = linear_schedule(epoch, 
+                        training_settings['warmup_epochs'], 
+                        training_settings["phase2_dt_weight"])
+                abs_t_loss = λt * abs_t_loss
 
                 # Temporal Monotonicity Penalty ===
                 # Penalize predicted time going backwards: max(0, prev - curr)
@@ -492,7 +502,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 monotonic_penalty = F.relu(-delta_diff)              # only penalize decreases
                 monotonic_mask = mask[:, 1:] * mask[:, :-1]          # valid when both t and t-1 are not PAD
                 monotonic_penalty = (monotonic_penalty * monotonic_mask).sum() / monotonic_mask.sum().clamp(min=1)
-                abs_t_loss += training_settings["phase2_dt_monotonic_penalty"] * monotonic_penalty
+                λt_monotonic = linear_schedule(epoch, 
+                        training_settings['warmup_epochs'], 
+                        training_settings["phase2_dt_monotonic_penalty"])
+                abs_t_loss += λt_monotonic * monotonic_penalty
 
                 # === Loss: Total Loss ===
                 loss = loss_bce + generative_penalty + abs_t_loss
