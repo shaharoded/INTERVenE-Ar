@@ -470,9 +470,9 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
     # 3) CNF (conflicts): if any other value of same concept was open_before
     if nb > 0 and conflict_mat.any():
         # 3) CNF (conflicts): START of a value is illegal if any conflicting base is already open
-        oc = open_before.to(torch.int32)                   # [B,T,nb]
-        cm = conflict_mat.to(torch.int32).T                 # [nb,nb]
-        conflict_active = (oc @ cm) > 0                     # [B,T,nb]
+        oc = open_before.to(torch.float32)                   # [B,T,nb]
+        cm = conflict_mat.to(torch.float32).T                # [nb,nb]
+        conflict_active = (oc @ cm) > 0                      # [B,T,nb]
 
         # only apply to actual START tokens of each base
         conflict_active &= start_oh.bool()                  # [B,T,nb]
