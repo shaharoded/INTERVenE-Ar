@@ -35,4 +35,3 @@ RELEASE_TOKEN = "RELEASE"
 TERMINAL_OUTCOMES = [RELEASE_TOKEN, DEATH_TOKEN]
 
 MEAL_TOKENS = ["MEAL_Breakfast", "MEAL_Lunch", "MEAL_Dinner", "Meal_Night"] # Keep ordered! concept_value tokens
-meal2rank = {name: i for i, name in enumerate(MEAL_TOKENS)}
