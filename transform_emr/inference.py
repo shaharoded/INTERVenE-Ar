@@ -213,7 +213,7 @@ def infer_event_stream(model,
             next_logits = logits[:, -1, :].clone()  # [1,V]
 
             # hard legality mask
-            illegal = step_illegal_mask(open_counts, seen_meals, last_tokens)
+            illegal = step_illegal_mask(open_counts, seen_meals)
             next_logits.masked_fill_(illegal.unsqueeze(0), -float("inf"))
 
             # Avoid repetition (soft):

@@ -47,6 +47,7 @@ class DataProcessor:
     def run(self):
         # Process on temporal_df
         self._validate_and_align_inputs()
+        self._fix_back_to_back_intervals()
         self._truncate_after_terminal_event()
         self._normalize_time()
         self._expand_tokens()
@@ -129,6 +130,28 @@ class DataProcessor:
         # 5. Final integrity checks
         assert self.context_df['PatientID'].is_unique, "PatientID must be unique in context_df after alignment"
         assert set(self.df['PatientID']) == set(self.context_df['PatientID']), "Mismatched PatientIDs after alignment"
+    
+
+    def _fix_back_to_back_intervals(self, epsilon=pd.Timedelta(seconds=1)):
+        """
+        If an interval starts at exactly the same timestamp another one ends
+        (same patient), shift the *start* forward by `epsilon` to preserve
+        START/END ordering for tokenisation.
+        """
+        df = self.df.sort_values(['PatientID', 'StartDateTime']).copy()
+
+        same_time = (
+            (df['StartDateTime']
+            == df.groupby('PatientID')['EndDateTime'].shift(1))
+        )
+
+        # shift only the conflicted rows
+        df.loc[same_time, 'StartDateTime'] += epsilon
+        # Also shift EndDateTime if duration would otherwise be negative/zero
+        need_fix = df['EndDateTime'] <= df['StartDateTime']
+        df.loc[need_fix, 'EndDateTime'] = df.loc[need_fix, 'StartDateTime'] + epsilon
+
+        self.df = df
 
 
     def _truncate_after_terminal_event(self):

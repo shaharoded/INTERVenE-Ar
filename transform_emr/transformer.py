@@ -553,7 +553,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         model.save(ckpt_last, epoch, best_val, optimizer, scheduler)
 
         # Save best model 
-        if (vl_loss < best_val - 1e-3) and (epoch >= training_settings["warmup_epochs"]):
+        if (vl_loss < best_val - 1e-4) and (epoch >= training_settings["warmup_epochs"]):
             best_val = vl_loss
             model.save(ckpt_path, epoch, best_val, optimizer, scheduler)
             bad_epochs = 0
