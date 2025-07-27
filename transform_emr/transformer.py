@@ -458,8 +458,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 ε = 0.05
                 multi_hot = multi_hot * (1 - ε) + ε       # ones → 0.95, zeros → 0.05
                 
-                # Calculate BCE loss
-                loss_fn = nn.BCEWithLogitsLoss(pos_weight=model.embedder.tokenizer.token_weights.to(logits.device))
+                # Calculate Focal BCE loss
+                loss_fn  = FocalBCELoss(token_weights=model.embedder.tokenizer.token_weights.to(logits.device), gamma=1.5)
                 loss_bce = loss_fn(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
                 loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
 

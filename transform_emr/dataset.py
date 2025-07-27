@@ -1,10 +1,12 @@
 import os
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from joblib import dump
 import numpy as np
+from collections import Counter
+from typing import Dict, Optional
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import *
@@ -304,6 +306,7 @@ class EMRTokenizer:
     """
     A custom tokenizer objest to match this model's requirement.
     build this object with your full training data to ensure it builds properly.
+    Token weights are determined by token frequency in cohort.
 
     Attributes:
         token2id (Dict[str, int]): Full vocabulary mapping ("GLUCOSE_STATE_HIGH_START").
@@ -365,17 +368,17 @@ class EMRTokenizer:
         concept2id = {tok: i for i, tok in enumerate(concepts)}
         value2id = {tok: i for i, tok in enumerate(values)}
 
-        # Initialize weights
+        # Initialize weights (data driven)
         token_weights = torch.ones(len(token2id))
 
         for outcome in OUTCOMES:
             tok_id = token2id.get(outcome)
             if tok_id is not None:
-                token_weights[tok_id] = 5.0
+                token_weights[tok_id] = 10.0
         for term in TERMINAL_OUTCOMES:
             tok_id = token2id.get(term)
             if tok_id is not None:
-                token_weights[tok_id] = 10.0
+                token_weights[tok_id] = 15.0
         for ignore_tok in special_tokens + [ADMISSION_TOKEN]:
             tok_id = token2id.get(ignore_tok)
             if tok_id is not None:
@@ -568,3 +571,58 @@ def collate_emr(batch, pad_token_id=0):
         'context_vec': context_vecs,
         'targets': position_ids.clone()
     }
+
+
+def get_dataloader(
+        dataset,
+        batch_size: int,
+        collate_fn,
+        *,
+        oversample: bool = False,
+        num_workers: int = os.cpu_count(),
+        replacement: bool = True,
+        class_weights: Optional[Dict] = None,
+):
+    """
+    Build a DataLoader for an EMRDataset.
+    If `oversample=True`, uses a WeightedRandomSampler to balance terminal outcomes.
+    """
+
+    # ---------- helper ----------
+    def _label_visit(token_df):
+        ids = set(token_df["PositionID"].tolist())
+        tid = dataset.tokenizer.token2id
+        if tid[DEATH_TOKEN]   in ids: return 1      # DEATH
+        elif tid[RELEASE_TOKEN] in ids: return 2      # RELEASE
+        return 0                                    # in‑hospital (not relevant to retro-analysis)
+
+    # ---------- no oversampling ----------
+    if not oversample:
+        return DataLoader(dataset,
+                          batch_size=batch_size,
+                          shuffle=True,
+                          collate_fn=collate_fn,
+                          num_workers=num_workers,
+                          pin_memory=True)
+
+    # ---------- build sample weights ----------
+    labels = [_label_visit(dataset.patient_groups[pid])
+              for pid in dataset.patient_ids]
+
+    if class_weights is None:
+        counts = Counter(labels)
+        class_weights = {c: 1.0 / max(1, n) for c, n in counts.items()}
+
+    sample_w = torch.tensor([class_weights[l] for l in labels],
+                            dtype=torch.float32)
+
+    sampler = WeightedRandomSampler(sample_w,
+                                    num_samples=len(sample_w),
+                                    replacement=replacement)
+
+    return DataLoader(dataset,
+                      batch_size=batch_size,
+                      sampler=sampler,
+                      collate_fn=collate_fn,
+                      num_workers=num_workers,
+                      pin_memory=True)

@@ -2,18 +2,16 @@
 pre-train.py
 =====================
 A two-phase transformer training process:
-Phase‑1 : call embedding.train()  ------------>  pretrained_embedder.pt
-Phase‑2 : GPT( pretrained_embedder, fine-tuned during training )  ->  best.pt
+Phase-1 : call embedding.train()  ------------>  pretrained_embedder.pt
+Phase-2 : GPT( pretrained_embedder, fine-tuned during training )  ->  best.pt
 """
-
-from torch.utils.data import DataLoader
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from pathlib import Path
 
 # ───────── local code ─────────────────────────────────────────────────── #
-from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr
+from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr, get_dataloader
 from transform_emr.embedder import EMREmbedding, train_embedder
 from transform_emr.transformer import GPT, train_transformer
 from transform_emr.utils import *
@@ -106,9 +104,10 @@ def prepare_data(sample=False):
     f"but got {train_ds.context_df.shape[1]}. Columns: {list(train_ds.context_df.columns)}"
     )
 
-    train_dl = DataLoader(train_ds, batch_size=TRAINING_SETTINGS.get('batch_size'), shuffle=True, collate_fn=collate_emr, num_workers=os.cpu_count())
-    val_dl   = DataLoader(val_ds,  batch_size=TRAINING_SETTINGS.get('batch_size'), shuffle=False, collate_fn=collate_emr, num_workers=os.cpu_count())
-    return train_dl, val_dl, tokenizer
+    embedder_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False) # Regular, no shuffle
+    transformer_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=True) # Balanced batches
+    val_dl = get_dataloader(val_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False) # Regular, no shuffle
+    return embedder_train_dl, transformer_train_dl, val_dl, tokenizer
 
 def phase_one(embedder, train_dl, val_dl, resume=True):
     return train_embedder(
@@ -132,7 +131,7 @@ def phase_two(model, train_dl, val_dl, resume=True):
 
 
 def run_two_phase_training():
-    train_dl, val_dl, tokenizer = prepare_data()
+    embedder_train_dl, transformer_train_dl, val_dl, tokenizer = prepare_data()
 
     # --- Phase 1: Train or resume embedder ---
     ckpt_embedder_path = Path(EMBEDDER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
@@ -147,7 +146,7 @@ def run_two_phase_training():
             embed_dim=MODEL_CONFIG.get("embed_dim")
         )
 
-    embedder, _, _ = phase_one(embedder=embedder, train_dl=train_dl, val_dl=val_dl, resume=True)
+    embedder, _, _ = phase_one(embedder=embedder, train_dl=embedder_train_dl, val_dl=val_dl, resume=True)
 
     # --- Phase 2: Train or resume transformer ---
     ckpt_last_path = Path(TRANSFORMER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
@@ -157,12 +156,12 @@ def run_two_phase_training():
     else:
         model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
 
-    phase_two(model=model, train_dl=train_dl, val_dl=val_dl, resume=True)
+    model, _, _ = phase_two(model=model, train_dl=transformer_train_dl, val_dl=val_dl, resume=True)
 
 
 
 if __name__ == "__main__":
-    train_dl, val_dl, tokenizer = prepare_data()
+    embedder_train_dl, transformer_train_dl, val_dl, tokenizer = prepare_data()
 
     # --- Phase 1: Train or resume embedder ---
     ckpt_embedder_path = Path(EMBEDDER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
@@ -178,7 +177,7 @@ if __name__ == "__main__":
             embed_dim=MODEL_CONFIG.get("embed_dim")
         )
 
-    # embedder, _, _ = phase_one(embedder=embedder, train_dl=train_dl, val_dl=val_dl, resume=True)
+    # embedder, _, _ = phase_one(embedder=embedder, train_dl=embedder_train_dl, val_dl=val_dl, resume=True)
 
     # --- Phase 2: Train or resume transformer ---
     ckpt_last_path = Path(TRANSFORMER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
@@ -189,4 +188,4 @@ if __name__ == "__main__":
     else:
         model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
 
-    phase_two(model=model, train_dl=train_dl, val_dl=val_dl, resume=True)
+    phase_two(model=model, train_dl=transformer_train_dl, val_dl=val_dl, resume=True)

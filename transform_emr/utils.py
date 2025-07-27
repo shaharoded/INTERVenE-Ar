@@ -6,13 +6,56 @@ General util functions for the package
 """
 import matplotlib.pyplot as plt
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import (
-    ADMISSION_TOKEN, TERMINAL_OUTCOMES, MEAL_TOKENS
+    ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, MEAL_TOKENS
 )
+
+
+class FocalBCELoss(nn.Module):
+    """
+    Class-balanced focal BCE
+    • API-compatible with nn.BCEWithLogitsLoss
+    • token_weights  - per-token α vector  (Tensor[V])
+    • gamma          - focusing parameter (1-3 works well)
+    """
+    def __init__(self,
+                 token_weights: torch.Tensor,
+                 gamma: float = 1.5,
+                 reduction: str = "mean"):
+        super().__init__()
+        self.register_buffer("alpha", token_weights.float().clone())
+        self.gamma     = gamma
+        self.reduction = reduction
+
+    def forward(self,
+                logits:  torch.Tensor,      # [B, T, V] or [*, V]
+                targets: torch.Tensor):     # same shape, {0,1}
+        # Binary cross‑entropy per element
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction="none")
+
+        # Probabilities and modulating factor
+        probs   = torch.sigmoid(logits)
+        p_t     = probs*targets + (1-probs)*(1-targets)           # [*, V]
+        mod_fac = (1.0 - p_t).pow(self.gamma)
+
+        # Class‑balance α – broadcast to match logits shape
+        alpha_t = self.alpha.view(*([1]*(logits.ndim-1)), -1)     # […, V]
+        alpha_t = alpha_t*targets + (1-alpha_t)*(1-targets)
+
+        loss = alpha_t * mod_fac * bce
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:                       # "none"
+            return loss
 
 
 def get_multi_hot_targets(position_ids: torch.Tensor,
@@ -131,6 +174,8 @@ def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.15):
     warmup_epochs: int, total number of warmup epochs from training_config
     forbid_ids: LongTensor of ids that must never be masked (PAD, CTX, ADMISSION, TERMINALS...)
     max_ratio: float, max masking ratio of the input
+
+    NOTE: This basically means that masked tokens are marked as acceptable noise. 
     """    
     p = linear_schedule(epoch, warmup_epochs, max_p)
 
@@ -351,6 +396,7 @@ def build_luts(tokenizer):
         getattr(tokenizer, "null_token_id", None),
         tokenizer.token2id.get(ADMISSION_TOKEN),
         *[tokenizer.token2id.get(t) for t in TERMINAL_OUTCOMES],
+        *[tokenizer.token2id.get(t) for t in OUTCOMES],
         *[tokenizer.token2id.get(t) for t in MEAL_TOKENS],
         *start_ids.tolist(),
         *end_ids.tolist(),
