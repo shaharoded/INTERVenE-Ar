@@ -459,12 +459,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     padding_idx=model.embedder.padding_idx,
                     vocab_size=logits.size(-1),
                     k=training_settings["bce_k_window"]
-                )
-                multi_hot[illegal_mask] = 0   # zero‑out illegal targets
-                
+                )                
                 # Label smoothing
                 eps = 0.05
-                multi_hot = multi_hot * (1 - eps) + eps       # ones → 0.95, zeros → 0.05
+                multi_hot = multi_hot * (1 - eps)             # 1 → 0.95, 0 → 0
+                multi_hot[illegal_mask] = 0                   # zero‑out illegal targets
                 
                 # Calculate Focal BCE loss
                 loss_bce = criterion(pred_logits, multi_hot) # [B, T, V] vs. [B, T, V]
