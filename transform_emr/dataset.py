@@ -370,6 +370,8 @@ class EMRTokenizer:
         concept2id = {tok: i for i, tok in enumerate(concepts)}
         value2id = {tok: i for i, tok in enumerate(values)}
 
+        # === Define Token Weights ===
+        # Only used for regular BCELoss (Embedder), not Focal (Transformer)
         # Initialize weights (data driven)
         token_weights = torch.ones(len(token2id))
 
