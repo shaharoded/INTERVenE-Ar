@@ -16,6 +16,7 @@ def mini_tokenizer():
     special_tokens = toks[:4]
     token_weights = torch.ones(len(toks))
     important_ids = torch.tensor([], dtype=torch.long)
+    token_counts = torch.tensor([], dtype=torch.long)
 
     tk = EMRTokenizer(
         token2id=token2id,
@@ -24,7 +25,8 @@ def mini_tokenizer():
         value2id=value2id,
         special_tokens=special_tokens,
         token_weights=token_weights,
-        important_token_ids=important_ids
+        important_token_ids=important_ids,
+        token_counts = token_counts
     )
     # assign special token attributes
     tk.pad_token_id = token2id['[PAD]']

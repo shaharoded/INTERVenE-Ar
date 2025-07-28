@@ -76,6 +76,8 @@ def mini_tokenizer():
     special_tokens = ["[PAD]", "[MASK]", "[CTX]", "[NULL]"]
     token_weights = torch.ones(len(toks))
     important_token_ids = torch.tensor([], dtype=torch.long)
+    token_counts = torch.tensor([], dtype=torch.long)
+
 
     tk = EMRTokenizer(
         token2id=token2id,
@@ -84,7 +86,8 @@ def mini_tokenizer():
         value2id=value2id,
         special_tokens=special_tokens,
         token_weights=token_weights,
-        important_token_ids=important_token_ids
+        important_token_ids=important_token_ids,
+        token_counts = token_counts
     )
     # assign special attributes
     tk.pad_token_id  = token2id['[PAD]']
@@ -556,8 +559,8 @@ def test_apply_masks_to_logits():
     boost = 0.3
     out = apply_masks_to_logits(logits.clone(), illegal, bonus, bonus_boost=boost)
     # Expected: illegal -> -inf
-    assert out[0,0,1].item() == -float('inf'), f"Expected -inf at [0,0,1], got {out[0,0,1]}"
-    assert out[1,1,4].item() == -float('inf'), f"Expected -inf at [1,1,4], got {out[1,1,4]}"
+    assert out[0,0,1].item() == -1e9, f"Expected -1e9 at [0,0,1], got {out[0,0,1]}"
+    assert out[1,1,4].item() == -1e9, f"Expected -1e9 at [1,1,4], got {out[1,1,4]}"
     # Expected: bonus -> logits + boost
     exp00 = logits[0,1,0] + boost
     exp12 = logits[1,0,2] + boost
@@ -573,7 +576,7 @@ def test_apply_masks_to_logits():
         for t in range(2):
             for v in range(5):
                 if illegal[b,t,v]:
-                    assert out2[b,t,v].item() == -float('inf')
+                    assert out2[b,t,v].item() == -1e9
                 else:
                     assert abs(out2[b,t,v].item() - logits[b,t,v].item()) < 1e-6
     print("test_apply_masks_to_logits: all cases passed.")
