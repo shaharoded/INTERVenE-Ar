@@ -362,6 +362,10 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     low_e  = tk.token2id['A_STATE_Low_END']
     high_s = tk.token2id['A_STATE_High_START']
     high_e = tk.token2id['A_STATE_High_END']
+    inc_s  = tk.token2id['A_TREND_inc_START']
+    inc_e  = tk.token2id['A_TREND_inc_END']
+    dec_s  = tk.token2id['A_TREND_dec_START']
+    dec_e  = tk.token2id['A_TREND_dec_END']
     pad    = tk.pad_token_id
 
     # --- Verify start/end flags and base conflicts ---
@@ -369,9 +373,18 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     assert l['is_start'][high_s]
     assert l['is_end'][low_e]
     assert l['is_end'][high_e]
-    low_b, high_b = l['base_id'][low_s].item(), l['base_id'][high_s].item()
+
+    # convert *all* four interval groups to base‑ids
+    low_b   = l['base_id'][low_s].item()
+    high_b  = l['base_id'][high_s].item()
+    inc_b   = l['base_id'][inc_s].item()
+    dec_b   = l['base_id'][dec_s].item()
+
     assert low_b != high_b, "Low and High should be separate bases"
-    assert l['conflict_mat'][low_b, high_b], "Conflict (CNF) should be True for Low vs High"
+    assert l['conflict_mat'][low_b, high_b], "CNF should be True for Low vs High"
+    assert l['conflict_mat'][inc_b, dec_b], "CNF should be True for inc vs dec"
+    assert not l['conflict_mat'][inc_b, inc_b], "CNF should be False for same value"
+    assert not l['conflict_mat'][inc_b, high_b], "CNF should be False for STATE vs TREND"
 
     # 1) Correct interval order
     seq_ok = torch.tensor([[low_s, low_e, pad]])

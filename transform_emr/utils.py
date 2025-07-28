@@ -354,12 +354,14 @@ def build_luts(tokenizer):
             core = tok
 
         # ----- concept & value ids -----
-        parts = core.split("_")
-        # concept key = first two chunks if exist, else the whole core (e.g. "GLUCOSE_TREND")
-        concept_key = "_".join(parts[:2]) if len(parts) >= 2 else core
-        # value key   = the full core (e.g. "GLUCOSE_TREND_INC")
-        value_key   = core
+        parts = core.split("_") # A_STATE_High, A_TREND_Dec, events
+        # concept  = everything except the final value segment
+        #           e.g.  A_STATE_Low   ->  A_STATE
+        #                 A_TREND_inc   ->  A_TREND
+        concept_key = "_".join(parts[:-1])
+        value_key   = core # Will also represent events, contexts
 
+        # Use position-id on V to mark the unifying mark of that hierarchy
         tok2concept[tid] = tokenizer.concept2id.get(concept_key, -1)
         tok2value[tid]   = tokenizer.value2id.get(value_key,   -1)
 
@@ -839,6 +841,7 @@ def audit_generated_stream(
     ) -> None:
     """
     Prints a step-by-step structural audit of a context+generation stream.
+    Used for model manual tests after training, to validate poor results.
 
     After the row-by-row trace it prints the whole DataFrame (Token,
     IsInput, Note).  No return value.
@@ -903,15 +906,15 @@ def audit_generated_stream(
 
         # meal order
         if r >= 0:
-            if seen_meals.any():          # not the first meal
-                expected = (seen_meals.nonzero()[-1].item() + 1) % K
-                if r != expected:
+            if 'next_meal' not in locals():               # first meal we ever see
+                next_meal = (r + 1) % K                   # set expectation
+            else:
+                if r != next_meal:                        # wrong meal → violation
                     problems.append("MEAL")
-            seen_meals[r] = True
+                next_meal = (r + 1) % K                   # advance expectation
 
         notes.append(";".join(problems))
-        _print(idx, tok, is_inp, problems, token_w)
-
+        
     # ------------- final full table -------------------- #
     df_out = results_df.copy()
     df_out['Note'] = notes
