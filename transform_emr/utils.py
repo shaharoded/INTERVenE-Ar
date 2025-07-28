@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 from typing import Optional, Union
 
 
@@ -829,3 +830,93 @@ def build_rep_penalty(last_tokens, V, window=5, strength=0.6, device=None):
     # reverse so newest aligns with decay[0]
     rep_vec.index_add_(0, idx.flip(0), decay)
     return rep_vec * strength
+
+
+def audit_generated_stream(
+        results_df: pd.DataFrame,
+        tokenizer,
+        token_w: int = 50,        # Max width of the “Token” column
+    ) -> None:
+    """
+    Prints a step-by-step structural audit of a context+generation stream.
+
+    After the row-by-row trace it prints the whole DataFrame (Token,
+    IsInput, Note).  No return value.
+    """
+    # ------------- helpers ------------- #
+    def _print(idx, tok, is_inp, problems, token_w):
+        clipped = (tok[:token_w - 3] + "...") if len(tok) > token_w else tok
+        note    = ";".join(problems)
+        print(f"{idx:4d}  {clipped:<{token_w}}  {int(is_inp):>5d}  {note}")
+    
+    # ------------- look‑ups & runtime state ------------- #
+    l = build_luts(tokenizer)
+    is_start, is_end   = l['is_start'], l['is_end']
+    base_id            = l['base_id']
+    meal_rank          = l['meal_rank']
+    conflict_mat       = l['conflict_mat']
+    nb                 = int(l['start_ids_per_base'].numel())
+    K                  = int(l['K_meals'].item())
+
+    open_counts = torch.zeros(nb, dtype=torch.int16)
+    seen_meals  = torch.zeros(K,  dtype=torch.bool) if K else None
+
+    t2id = tokenizer.token2id
+    notes = []                                            # per‑row notes
+
+    # ------------- pretty header for live trace -------- #
+    hdr = f"{'Idx':>4}  {'Token':<{token_w}}  IsInp  Note"
+    print(hdr)
+    print("-" * len(hdr))
+
+    # ------------- iterate over stream ----------------- #
+    for idx, (tok, is_inp) in enumerate(zip(results_df['Token'],
+                                            results_df['IsInput'])):
+        tid = t2id.get(tok, None)
+        problems = []
+
+        # UNK
+        if tid is None:
+            problems.append("UNK")
+            notes.append(";".join(problems))
+            _print(idx, tok, is_inp, problems, token_w)
+            continue
+
+        b = base_id[tid].item()
+        s = bool(is_start[tid])
+        e = bool(is_end[tid])
+        r = meal_rank[tid].item()
+
+        # interval FSM / DUP / CNF
+        if e:
+            if b < 0 or open_counts[b] == 0:
+                problems.append("FSM")
+            else:
+                open_counts[b] -= 1
+        elif s:
+            if open_counts[b] > 0:
+                problems.append("DUP")
+            if conflict_mat.any() and (open_counts > 0).any():
+                if (conflict_mat[b] & (open_counts > 0)).any():
+                    problems.append("CNF")
+            open_counts[b] += 1
+
+        # meal order
+        if r >= 0:
+            if seen_meals.any():          # not the first meal
+                expected = (seen_meals.nonzero()[-1].item() + 1) % K
+                if r != expected:
+                    problems.append("MEAL")
+            seen_meals[r] = True
+
+        notes.append(";".join(problems))
+        _print(idx, tok, is_inp, problems, token_w)
+
+    # ------------- final full table -------------------- #
+    df_out = results_df.copy()
+    df_out['Note'] = notes
+
+    pd.set_option("display.max_rows", None)
+    print("\n=== Full trajectory with annotations ===")
+    print(df_out[['Token', 'IsInput', 'Note']]
+          .to_string(index=True, col_space={'Token': token_w}))
