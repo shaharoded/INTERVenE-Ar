@@ -465,11 +465,17 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
 def test_penalty_interval_structure_and_meal_order(mini_tokenizer):
     tk = mini_tokenizer
     l  = build_luts(tk)
-
-    # --- Penalty: interval structure with forgiveness ---
+    
+    # --- Define tokens ---
+    b    = tk.token2id['MEAL_Breakfast']
+    lu = tk.token2id['MEAL_Lunch']
+    d    = tk.token2id['MEAL_Dinner']
+    n    = tk.token2id['MEAL_Night']
     low_s  = tk.token2id['A_STATE_Low_START']
     low_e  = tk.token2id['A_STATE_Low_END']
     pad    = tk.pad_token_id
+
+    # --- Penalty: interval structure with forgiveness ---
     window=1
     # GT and pred share same FSM violation at t=0 => forgiven (penalty=0)
     gt = torch.tensor([[low_e, low_s, pad]])
@@ -485,9 +491,9 @@ def test_penalty_interval_structure_and_meal_order(mini_tokenizer):
 
     # Pred has an extra FSM violation at t=1 not in GT => penalty > 0
     # GT has a low_e violation at t=0
-    gt2   = torch.tensor([[ low_e, pad, pad, pad ]])
+    gt2   = torch.tensor([[ b, low_e, pad, pad, pad, pad]])
     # Put your new bad END at t=3, which is >1 step away
-    pred2 = torch.tensor([[ pad,   pad, pad, low_e ]])
+    pred2 = torch.tensor([[ b, lu, d, n, b, low_e]])
 
     p_new = penalty_interval_structure(
         pred2, gt2,
@@ -520,21 +526,23 @@ def test_penalty_interval_structure_and_meal_order(mini_tokenizer):
     assert p_new > 0, "Violation more than 1 step away should not be forgiven"
 
     # --- Penalty: meal order ---
-    b    = tk.token2id['MEAL_Breakfast']
-    lu = tk.token2id['MEAL_Lunch']
-    d    = tk.token2id['MEAL_Dinner']
-    n    = tk.token2id['MEAL_Night']
-    # Legal transitions: B→L→D => 0 penalty
-    seq_ok = torch.tensor([[lu, d, n, b]])
+    # Legal transitions: L→D→N→B => 0 penalty
+    seq_ok = torch.tensor([[lu, low_s, d, n, low_e, b]])
     p_meal_ok = penalty_meal_order(seq_ok, l['meal_rank'])
     print('legal transition: L→D→N→B => penalty=', p_meal_ok)
     assert p_meal_ok == 0, f"No penalty for legal cycle, got {p_meal_ok}"
 
-    # Illegal transition: B→D→L => penalty > 0
-    seq_bad = torch.tensor([[b, lu, n, d, lu]])
+    # Illegal transition: B→L→N→D→L => penalty > 0
+    seq_bad = torch.tensor([[b, lu, low_s, low_e, n, d, lu]])
     p_meal_bad = penalty_meal_order(seq_bad, l['meal_rank'])
     print('Illegal transition: B→L→N→D→L => penalty=', p_meal_bad)
     assert p_meal_bad > 0, f"Penalty should be positive for incorrect meal cycle, got {p_meal_bad}"
+
+    # Illegal transition: B→B→L→D => penalty > 0
+    seq_bad = torch.tensor([[b, low_e, low_s, b, low_e, lu, d]])
+    p_meal_bad = penalty_meal_order(seq_bad, l['meal_rank'])
+    print('Illegal transition: B→B→L→D => penalty=', p_meal_bad)
+    assert p_meal_bad > 0, f"Penalty should be positive for repeating meal, got {p_meal_bad}"
 
 
 def test_apply_masks_to_logits():
