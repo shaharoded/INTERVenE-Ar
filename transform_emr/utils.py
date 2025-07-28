@@ -35,7 +35,7 @@ class FocalBCELoss(nn.Module):
                     beta: float = 0.999,
                     min_count: int = 5,
                     clip_max: float = 8.0,
-                    gamma: float = 1.5,
+                    gamma: float = 1.0,
                     reduction: str = "mean"):
         alpha = cls._calc_alpha(counts, beta=beta,
                                 min_count=min_count, clip_max=clip_max)
@@ -186,7 +186,7 @@ def linear_schedule(epoch: int, warmup: int, max_val: float) -> float:
     return max_val * min(epoch / warmup, 1.0)
 
 
-def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.15):
+def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.25):
     """
     Transformer CBM (Curriculum by Masking) Helper.
     Logic: Mask tokens that won't hurt the general timeline or conflict with penalties.

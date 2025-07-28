@@ -372,7 +372,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     beta=0.999,
                     min_count=5,
                     clip_max=8.0,
-                    gamma=1.5,
+                    gamma=1.0,
                     reduction="mean",
                 ).to(device)
 
@@ -414,7 +414,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                       training_settings["warmup_epochs"], 
                                       model.embedder.tokenizer, 
                                       luts["forbid_mask_ids"], 
-                                      max_p=0.15
+                                      max_p=0.25
                                       )
 
                 # === Original logits from Model ===
