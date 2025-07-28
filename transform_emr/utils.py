@@ -316,8 +316,8 @@ def build_luts(tokenizer):
         "meal_pred_rank"    : Long[V]   (-1 non-meal)
 
         # per-base (nb = #interval bases)
-        "start_ids_per_base": Long[nb]  id of *_START  (‑1 if missing)
-        "end_ids_per_base"  : Long[nb]  id of *_END    (‑1 if missing)
+        "start_ids_per_base": Long[nb]  id of *_START  (-1 if missing)
+        "end_ids_per_base"  : Long[nb]  id of *_END    (-1 if missing)
         "conflict_mat"      : Bool[nb, nb]  (same concept & different value)
 
         # misc
