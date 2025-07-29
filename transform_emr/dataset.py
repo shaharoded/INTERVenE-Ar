@@ -625,12 +625,28 @@ def get_dataloader(
     """
 
     # ---------- helper ----------
-    def _label_visit(token_df):
+    def _label_visit(token_df, tokenizer):
+        """
+        Return an int label per patient trajectory:
+
+            0 = DEATH present
+            1 = ≥1 COMPLICATION present (no DEATH)
+            2 = RELEASE present only
+            3 = OTHER / still-in-hospital (no terminal/outcome token)
+
+        These labels feed a WeightedRandomSampler so that DEATH and COMPLICATION
+        patients are drawn more often without duplicating rows.
+        """
         ids = set(token_df["PositionID"].tolist())
-        tid = dataset.tokenizer.token2id
-        if tid[DEATH_TOKEN]   in ids: return 1      # DEATH
-        elif tid[RELEASE_TOKEN] in ids: return 2      # RELEASE
-        return 0                                    # in‑hospital (not relevant to retro-analysis)
+        tid = tokenizer.token2id
+
+        if tid[DEATH_TOKEN] in ids:
+            return 0
+        if any(tid.get(c) in ids for c in OUTCOMES if c in tid):
+            return 1 
+        if tid[RELEASE_TOKEN] in ids:
+            return 2
+        return 3          # no terminal/outcome yet
 
     # ---------- no oversampling ----------
     if not oversample:
@@ -642,7 +658,7 @@ def get_dataloader(
                           pin_memory=True)
 
     # ---------- build sample weights ----------
-    labels = [_label_visit(dataset.patient_groups[pid])
+    labels = [_label_visit(dataset.patient_groups[pid], dataset.tokenizer)
               for pid in dataset.patient_ids]
 
     if class_weights is None:
