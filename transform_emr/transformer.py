@@ -246,9 +246,10 @@ class GPT(nn.Module):
             optimizer,
             max_lr=training_settings["phase2_learning_rate"],
             total_steps=training_settings["phase2_n_epochs"] * len(train_dl),
-            pct_start=0.1,
+            pct_start=0.2,
             anneal_strategy="cos",
-            cycle_momentum=False
+            div_factor  = 10,       # ← start‑LR = LR / 10
+            final_div_factor = 10,  # floor‑LR = 1e‑5 as well (cos tail reaches this)
         )
 
     # ---------------------------------------------------- forward & loss ---- #
@@ -371,8 +372,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     counts=model.embedder.tokenizer.token_counts,
                     beta=0.999,
                     min_count=5,
-                    clip_max=8.0,
-                    gamma=1.0,
+                    clip_max=4.0,
+                    gamma=0.25,
                     reduction="mean",
                 ).to(device)
 
@@ -401,7 +402,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     train_losses, val_losses = [], []
 
     def run_epoch(loader, epoch, train_flag=False):
-        model.train() if train_flag else model.eval()
+        if train_flag:
+            model.train()
+        else:
+            model.eval()
+            metric = F1Aggregator(tokenizer=model.embedder.tokenizer, device=device) # For epoch evaluation
+
         total_loss = total_bce = total_penalty = total_dt = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
@@ -523,31 +529,40 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     scheduler.step()
+                else:
+                    # Update validation classification metric
+                    metric.update(pred_ids, target_ids)
 
+
+                # Update loss
                 total_loss += loss.item()
                 total_bce += loss_bce.item()
                 total_penalty += generative_penalty.item()
                 total_dt += abs_t_loss.item()
         
+        val_f1 = None if train_flag else metric.compute()
         n_batches = len(loader)
 
         return (
             total_loss / n_batches,
             total_bce / n_batches,
             total_penalty / n_batches,
-            total_dt / n_batches
+            total_dt / n_batches,
+            val_f1
         )
     
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_pen, tr_dt = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_pen, vl_dt = run_epoch(val_dl, epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_pen, tr_dt, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_pen, vl_dt, val_f1 = run_epoch(val_dl, epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Training Transformer]: Epoch {epoch:02d}
         --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, Pen={tr_pen:.4f}, Δt={tr_dt:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Δt={vl_dt:.4f})""")
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Δt={vl_dt:.4f})
+        --> Val-F1  RELEASE:{val_f1['REL']:.4f}  DEATH:{val_f1['DTH']:.4f}  COMPLICATION:{val_f1['CMP']:.4f}""")
+
 
         # Save latest
         model.save(ckpt_last, epoch, best_val, optimizer, scheduler)

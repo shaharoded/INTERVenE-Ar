@@ -12,22 +12,34 @@ import numpy as np
 import pandas as pd
 from typing import Optional, Union
 
-
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import (
-    ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, MEAL_TOKENS
+    ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, DEATH_TOKEN, RELEASE_TOKEN, MEAL_TOKENS
 )
 
 
 class FocalBCELoss(nn.Module):
     """
-    Focal BCE - drop-in for nn.BCEWithLogitsLoss to balance loss on rare tokens.
-    --------------------------------------------------
-    • Either pass a ready α-vector (same shape as `token_weights`)
-      OR build one from raw counts via `from_counts`.
-    • Everything (clipping, min_count floor, focal γ) is self-contained.
-    """
+    Focal BCE - class-balanced BCE with focal modulation.
 
+    Loss:  –αₜ · (1 - pₜ)^γ · log pₜ,   pₜ = σ(logits) of the ground-truth bit.
+
+    Hyper-params
+    ------------
+    α / counts :  pass an α-vector directly **or** call `from_counts(counts, …)`
+                  to derive it from token frequencies.
+    beta       :  smoothing for α; larger β ⇒ rarer tokens get larger weights
+                  (default 0.999).
+    min_count  :  floor on counts before weighting (default 5).
+    clip_max   :  hard cap on α to avoid extreme gradients (default 8.0).
+    gamma      :  focal exponent. 0 → plain BCE; 0.5 mild; 1 standard;
+                  >1 strongly focuses on hard / rare tokens.
+    reduction  :  "none" | "mean" | "sum" (as in PyTorch losses).
+
+    Usage
+    -----
+    >>> crit = FocalBCELoss.from_counts(token_counts, gamma=0.5).to(device)
+    """
     # -------- factory ----------------------------------------------------
     @classmethod
     def from_counts(cls,
@@ -85,6 +97,84 @@ class FocalBCELoss(nn.Module):
         alpha  = (1.0 - beta) / (eff + 1e-6)
         return alpha.clamp(max=clip_max)
 
+
+class F1Aggregator:
+    """
+    Epoch-level micro-F1 aggregator accross batches.
+
+        0 = RELEASE
+        1 = DEATH
+        2.. = individual complication tokens
+
+    • TP_c = min(pred_count_c , true_count_c)
+    • FP_c = max(pred_count_c - true_count_c , 0)
+    • FN_c = max(true_count_c - pred_count_c , 0)
+    """
+    def __init__(self, tokenizer, device="cpu"):
+        self.tok = tokenizer
+        self.dev = device
+
+        # -- id look‑ups -----------------------------------------------------
+        self.rel_id = tokenizer.token2id.get("RELEASE")
+        self.dth_id = tokenizer.token2id.get("DEATH")
+
+        self.cmp_tokens = [t for t in OUTCOMES
+                           if t not in ("RELEASE", "DEATH") and t in tokenizer.token2id]
+
+        self.cmp_ids = torch.tensor([tokenizer.token2id[t] for t in self.cmp_tokens],
+                                    device=device)           # [C]
+
+        n_slots = 2 + len(self.cmp_ids)                      # 2 terminals + C complications
+        self.tp = torch.zeros(n_slots, device=device)
+        self.fp = torch.zeros(n_slots, device=device)
+        self.fn = torch.zeros(n_slots, device=device)
+
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def _counts(self, ids):
+        """ids: tensor [...]; returns tensor [2+C] counts per class."""
+        flat = ids.view(-1)
+
+        n_rel = (flat == self.rel_id).sum() if self.rel_id is not None else 0
+        n_dth = (flat == self.dth_id).sum() if self.dth_id is not None else 0
+
+        # vectorised counts per complication token
+        n_cmp = (flat.unsqueeze(1) == self.cmp_ids).sum(dim=0).float()  # [C]
+
+        return torch.cat([n_rel.unsqueeze(0),
+                          n_dth.unsqueeze(0),
+                          n_cmp]).to(torch.float32)                     # [2+C]
+
+    # ------------------------------------------------------------------
+    def update(self, pred_ids, tgt_ids):
+        p = self._counts(pred_ids)
+        t = self._counts(tgt_ids)
+
+        self.tp += torch.min(p, t)
+        self.fp += torch.clamp(p - t, min=0)
+        self.fn += torch.clamp(t - p, min=0)
+
+    # ------------------------------------------------------------------
+    def compute(self):
+        # indices 0 and 1 are REL / DTH
+        scores = {}
+        for idx, lbl in enumerate(("REL", "DTH")):
+            denom = 2 * self.tp[idx] + self.fp[idx] + self.fn[idx]
+            scores[lbl] = None if denom == 0 else (2 * self.tp[idx] / denom).item()
+
+        # aggregate micro counts over all complication tokens (idx ≥2)
+        tp_cmp = self.tp[2:].sum()
+        fp_cmp = self.fp[2:].sum()
+        fn_cmp = self.fn[2:].sum()
+        denom  = 2 * tp_cmp + fp_cmp + fn_cmp
+        scores["CMP"] = None if denom == 0 else (2 * tp_cmp / denom).item()
+
+        return scores
+
+    # ------------------------------------------------------------------
+    def reset(self):
+        self.tp.zero_(); self.fp.zero_(); self.fn.zero_()
+    
 
 def get_multi_hot_targets(position_ids: torch.Tensor,
                           padding_idx: int,
