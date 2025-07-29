@@ -88,52 +88,53 @@ def infer_event_stream(model,
             tok.value2id.get(value, tok.mask_token_id)
         )
 
-    def step_illegal_mask(open_counts, seen_meals):
+    def step_illegal_mask(open_counts, next_meal_rank):
         """
-        Build a bool mask [V] of illegal ids given current state.
+        Build a Boolean mask [V] of illegal token ids given current state.
+
+        Parameters
+        ----------
+        open_counts     : Long[nb]   how many times each interval base is open. Initially infered using input context.
+        next_meal_rank  : int | None expected next meal rank (0..K-1) or None
         """
-        V = luts["is_start"].numel()
+        V       = luts["is_start"].numel()
         illegal = torch.zeros(V, dtype=torch.bool, device=device)
 
-        # ----- interval open/closed logic -----
-        closed  = (open_counts <= 0)          # [nb]
-        opened  = (open_counts >  0)          # [nb]
+        # ------------------------------------------------------------------
+        # 1. Interval logic (FSM / DUP)
+        # ------------------------------------------------------------------
+        closed  = (open_counts <= 0)            # [nb] 1 ⇔ no open interval
+        opened  = (open_counts >  0)            # [nb] 1 ⇔ at least one START seen
 
-        # END illegal if base closed
-        if closed.any():
+        if closed.any():                        # END not allowed if base closed
             illegal[luts["end_ids_per_base"][closed]] = True
 
-        # START illegal if base already open
-        if opened.any():
+        if opened.any():                        # START not allowed if base open
             illegal[luts["start_ids_per_base"][opened]] = True
 
-        # ----- value-conflict logic -----
-        # Any base that is open forbids START for any other base with same concept but different value
+        # ------------------------------------------------------------------
+        # 2. Value‑conflict logic  (same concept, different value)
+        # ------------------------------------------------------------------
         if opened.any():
-            # conflict_mat[open] -> [#open, nb] → reduce across rows
-            conflicting_bases = luts["conflict_mat"][opened].any(dim=0)  # [nb]
-            # we only care about those NOT already open (otherwise dup rule already covers)
-            conflicting_bases &= ~opened
-            if conflicting_bases.any():
-                illegal[luts["start_ids_per_base"][conflicting_bases]] = True
+            # Gather all bases that conflict with *any* currently open base
+            conflicting = luts["conflict_mat"][opened].any(dim=0) & ~opened
+            if conflicting.any():
+                # Mark their START id so that you cannot open a violating interval
+                illegal[luts["start_ids_per_base"][conflicting]] = True
 
-        # ----- meals -----
-        K = (luts["meal_rank"] >= 0).max().item() and int(luts["meal_rank"].max().item()) + 1 or 0
-        if K > 0:
-            ranks = luts["meal_rank"]                     # [V]
-            is_meal = ranks >= 0
-            if is_meal.any():
-                pred_rank = (ranks - 1) % K               # needed predecessor
-                # seen_meals: [K] -> [V]
-                pred_seen = torch.zeros(V, dtype=torch.bool, device=device)
-                # fill only meal slots
-                for r in range(K):
-                    ids_r = (ranks == r).nonzero(as_tuple=False).squeeze(1)
-                    if ids_r.numel():
-                        pred_seen[ids_r] = seen_meals[pred_rank[ids_r]]
-                illegal |= (~pred_seen) & is_meal
+        # ------------------------------------------------------------------
+        # 3. Meal order (strict cycle B‑L‑D‑N‑B ...)
+        # ------------------------------------------------------------------
+        ranks   = luts["meal_rank"]             # [V]  -1 for non‑meal
+        is_meal = ranks >= 0
+        if is_meal.any() and next_meal_rank is not None:
+            illegal_meal = is_meal & (ranks != next_meal_rank)
+            illegal |= illegal_meal
+        # (If next_meal_rank is None we are still before the first meal → no mask)
 
-        # never generate PAD/MASK
+        # ------------------------------------------------------------------
+        # 4. Never generate PAD / MASK tokens
+        # ------------------------------------------------------------------
         illegal[pad_id]  = True
         illegal[mask_id] = True
 
@@ -178,8 +179,8 @@ def infer_event_stream(model,
         n_b = luts["start_ids"].numel()
         open_counts = torch.zeros(n_b, dtype=torch.int32, device=device)
 
-        K = (luts["meal_rank"] >= 0).max().item() and int(luts["meal_rank"].max().item()) + 1 or 0
-        seen_meals  = torch.zeros(K, dtype=torch.bool, device=device) if K>0 else None
+        K = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
+        next_meal_rank = None            # strict meal cycle pointer
 
         # walk through seed tokens to set state
         for t in range(pos_ids.size(1)):
@@ -193,7 +194,7 @@ def infer_event_stream(model,
             if K>0:
                 mr = luts["meal_rank"][tid]
                 if mr >= 0:
-                    seen_meals[mr] = True
+                    next_meal_rank = (mr + 1) % K
 
         # list of generated tokens for repetition filter
         last_tokens = []
@@ -213,7 +214,7 @@ def infer_event_stream(model,
             next_logits = logits[:, -1, :].clone()  # [1,V]
 
             # hard legality mask
-            illegal = step_illegal_mask(open_counts, seen_meals)
+            illegal = step_illegal_mask(open_counts, next_meal_rank)
             next_logits.masked_fill_(illegal.unsqueeze(0), -float("inf"))
 
             # Avoid repetition (soft):
@@ -270,7 +271,7 @@ def infer_event_stream(model,
             if K>0:
                 mr = luts["meal_rank"][tid]
                 if mr >= 0:
-                    seen_meals[mr] = True
+                    next_meal_rank = (mr + 1) % K
 
             last_tokens.append(tid)
 
