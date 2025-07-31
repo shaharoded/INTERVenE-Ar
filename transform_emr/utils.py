@@ -14,7 +14,7 @@ from typing import Optional, Union
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import (
-    ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, DEATH_TOKEN, RELEASE_TOKEN, MEAL_TOKENS
+    ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, MEAL_TOKENS
 )
 
 
@@ -45,6 +45,7 @@ class FocalBCELoss(nn.Module):
     def from_counts(cls,
                     counts: Union[torch.Tensor, np.ndarray],
                     *,
+                    token_weights: Optional[Union[torch.Tensor, np.ndarray]] = None,
                     beta: float = 0.999,
                     min_count: int = 5,
                     clip_max: float = 8.0,
@@ -52,6 +53,9 @@ class FocalBCELoss(nn.Module):
                     reduction: str = "mean"):
         alpha = cls._calc_alpha(counts, beta=beta,
                                 min_count=min_count, clip_max=clip_max)
+        if token_weights is not None:
+            token_weights = torch.as_tensor(token_weights).float()
+            alpha *= token_weights
         return cls(alpha_vector=alpha,
                    gamma=gamma, reduction=reduction)
 

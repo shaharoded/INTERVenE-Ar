@@ -370,10 +370,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     criterion = FocalBCELoss.from_counts(
                     counts=model.embedder.tokenizer.token_counts,
+                    token_weights=model.embedder.tokenizer.token_weights,
                     beta=0.999,
                     min_count=5,
-                    clip_max=4.0,
-                    gamma=0.25,
+                    clip_max=8.0,
+                    gamma=1.0,
                     reduction="mean",
                 ).to(device)
 
