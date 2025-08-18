@@ -490,7 +490,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                                         luts["base_id"], luts["start_ids_per_base"],
                                                         luts["end_ids_per_base"], luts["meal_rank"],
                                                         luts["meal_pred_rank"], luts["K_meals"],
-                                                        luts["conflict_mat"], 
+                                                        luts["conflict_mat"], luts["predict_block"],
                                                         window=training_settings['bce_k_window'])
 
                 # Average the penalties to bound in [0, 1] + smooth

@@ -420,6 +420,7 @@ def build_luts(tokenizer):
         "end_ids"           : Long[*]   all end ids   (unordered)
         "K_meals"           : Long[]    scalar
         "forbid_mask_ids"   : Long[*]   tokens we never CBM-mask
+        "predict_block"     : Long[*]   tokens we never predict (PAD/MASK/CTX) - Forbids at all steps.
         }
     """
     V = len(tokenizer.token2id)
@@ -532,11 +533,12 @@ def build_luts(tokenizer):
     forbid = {
         tokenizer.pad_token_id,
         tokenizer.mask_token_id,
-        getattr(tokenizer, "ctx_token_id", None),
-        tokenizer.token2id.get(ADMISSION_TOKEN),
+        getattr(tokenizer, "ctx_token_id", None)
     }
-    predict_block = torch.tensor([tid for tid in forbid if tid is not None],
-                                   dtype=torch.long)
+    block_ids = [tid for tid in block_ids if tid is not None]
+
+    predict_block = torch.zeros(V, dtype=torch.bool, device=device)
+    predict_block[torch.tensor(block_ids, dtype=torch.long, device=device)] = True
 
     return {
         # per-token
@@ -717,6 +719,7 @@ def penalty_interval_structure(
     meal_pred_rank:       torch.LongTensor,
     K_meals:              torch.Tensor,
     conflict_mat:         torch.BoolTensor,
+    predict_block:       torch.BoolTensor,
     window:               int = 5,
 ) -> torch.Tensor:
     """
@@ -747,12 +750,12 @@ def penalty_interval_structure(
     illegal_pred, _ = compute_legality_masks_tf(
         pred_ids, is_start, is_end,
         base_id, start_ids_per_base, end_ids_per_base,
-        meal_rank, meal_pred_rank, K_meals, conflict_mat
+        meal_rank, meal_pred_rank, K_meals, conflict_mat, predict_block
     )
     illegal_gt, _ = compute_legality_masks_tf(
         gt_ids,   is_start, is_end,
         base_id, start_ids_per_base, end_ids_per_base,
-        meal_rank, meal_pred_rank, K_meals, conflict_mat
+        meal_rank, meal_pred_rank, K_meals, conflict_mat, predict_block
     )
 
     # Gather illegal flags per token

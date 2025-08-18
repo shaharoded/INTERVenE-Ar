@@ -3,14 +3,13 @@ import torch.nn.functional as F
 from collections import Counter
 from typing import Dict, Any
 
-from utils import (
+from transform_emr.utils import (
     get_multi_hot_targets,               # multi-hot next-k targets
     compute_legality_masks_tf,           # legality for BCE masking
     apply_masks_to_logits,               # -inf illegal + bonus
     FocalBCELoss,                        # to access alpha weights
+    build_luts,                     # build start/end/meal/conflict Luts & forbid list
 )
-# build_luts is where start/end/meal/conflict Luts & forbid list come from
-from utils import build_luts
 
 @torch.no_grad()
 def summarize_token_weights(tokenizer):
