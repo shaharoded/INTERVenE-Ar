@@ -12,12 +12,13 @@ TEST_CTX_DATA_FILE       = os.path.join(PROJECT_ROOT, 'data', 'test', 'synthetic
 # Define the prediction targets and <eot> tokens to terminate the inference
 OUTCOMES = [
     "KETOACIDOSIS",
-    "KIDNEY_DISORDER",
+    "KIDNEY_COMPLICATION",
     "COMA",
-    "EYE_DISORDER",
+    "RETINOPATHY",
     "HYPOGLYCEMIA",
     "SEVERE HYPOGLYCEMIA",
     "HYPERGLYCEMIA",
+    "HYPEROSMOLALITY",
     "CARDIOVASCULAR_DISORDER",
     "INFECTION",
     "NEUROVASCULAR_COMPLICATION"
