@@ -517,8 +517,8 @@ def build_luts(tokenizer):
     # ---- forbid list for CBM ----
     forbid = {
         tokenizer.pad_token_id,
-        getattr(tokenizer, "ctx_token_id", None),
-        getattr(tokenizer, "null_token_id", None),
+        tokenizer.ctx_token_id,
+        tokenizer.null_token_id,
         tokenizer.token2id.get(ADMISSION_TOKEN),
         *[tokenizer.token2id.get(t) for t in TERMINAL_OUTCOMES],
         *[tokenizer.token2id.get(t) for t in OUTCOMES],
@@ -530,10 +530,10 @@ def build_luts(tokenizer):
                                    dtype=torch.long)
     
     # ---- forbid list for Decoder ----
-    forbid = {
+    block_ids = {
         tokenizer.pad_token_id,
         tokenizer.mask_token_id,
-        getattr(tokenizer, "ctx_token_id", None)
+        tokenizer.ctx_token_id
     }
     block_ids = [tid for tid in block_ids if tid is not None]
 

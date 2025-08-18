@@ -474,7 +474,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = (target_ids != model.embedder.padding_idx).unsqueeze(-1)  # [B,T,1]
                 allowed   = (~illegal_mask) & valid_pos               
-                multi_hot &= ~illegal_mask    # zero‑out illegal targets
+                multi_hot.masked_fill_(illegal_mask, 0.0)    # zero‑out illegal targets
                 
                 # Calculate Focal BCE loss (only valid positions)
                 eps = 0.01 # Label smoothing to avoid overconfidence
