@@ -110,7 +110,7 @@ class MaskedFocalBCE(nn.Module):
     """
     def __init__(self, focal_impl: "FocalBCELoss", tau: float = 0.5,
                  neg_bounds=(0.05, 0.5), label_smoothing: float = 0.0,
-                 hard_neg_k: int | None = None):
+                 hard_neg_k: Optional[int] = None):
         super().__init__()
         # ensure base focal loss returns per-element tensor
         focal_impl.reduction = "none"

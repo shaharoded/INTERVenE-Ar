@@ -1,3 +1,11 @@
+"""
+debug_tools.py
+==============
+
+Debug module aiming at understanding the loss behaviour in the model.
+"""
+
+
 import torch
 import torch.nn.functional as F
 from collections import Counter
@@ -7,9 +15,15 @@ from transform_emr.utils import (
     get_multi_hot_targets,               # multi-hot next-k targets
     compute_legality_masks_tf,           # legality for BCE masking
     apply_masks_to_logits,               # -inf illegal + bonus
-    FocalBCELoss,                        # to access alpha weights
     build_luts,                     # build start/end/meal/conflict Luts & forbid list
 )
+
+from transform_emr.loss import (
+    FocalBCELoss,                        # to access alpha weights
+    MaskedFocalBCE,                      # BCE with focal weighting + alpha
+    MaskedSetCE,                     # Set CE with focal weighting + alpha
+)
+
 
 @torch.no_grad()
 def summarize_token_weights(tokenizer):
