@@ -83,7 +83,7 @@ def inspect_minibatch(model, batch, luts, k_window: int) -> Dict[str, Any]:
         target_ids, luts["is_start"], luts["is_end"], luts["base_id"],
         luts["start_ids_per_base"], luts["end_ids_per_base"],
         luts["meal_rank"], luts["meal_pred_rank"], luts["K_meals"],
-        luts["conflict_mat"]
+        luts["conflict_mat"], luts["predict_block"]
     )
     pred_logits = apply_masks_to_logits(pred_logits, illegal, bonus)
     pred_ids = pred_logits.argmax(-1)                # [B,T]
