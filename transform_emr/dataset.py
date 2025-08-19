@@ -218,7 +218,7 @@ class DataProcessor:
         rows = []
         for row in df.itertuples(index=False):
             duration_sec = (row.EndDateTime - row.StartDateTime).total_seconds()
-            is_state = duration_sec > min_state_duration_sec
+            is_state = (duration_sec > min_state_duration_sec) or concept.endswith(('_STATE', '_TREND', '_PATTERN'))
 
             base_token = f"{row.ConceptName}_{row.Value}" if row.Value not in ("True", "TRUE") else row.ConceptName
             concept = row.ConceptName
