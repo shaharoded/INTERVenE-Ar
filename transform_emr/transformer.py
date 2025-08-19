@@ -376,9 +376,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     criterion = MaskedFocalBCE.from_counts(
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
-        beta=0.999, min_count=5, clip_max=8.0, gamma=1.0,
-        tau=0.5, neg_bounds=(0.05, 0.5), label_smoothing=0.01,
-        hard_neg_k=None,   # or 32 for hard-negative mining
+        beta=0.999, min_count=5, clip_max=8.0,
+        gamma=1.0,         # focal strength
+        tau=0.5,           # pos/neg balance anchor
+        neg_bounds=(0.05, 0.5),   # clamp for stability
+        label_smoothing=0.01,     # optional
+        hard_neg_k=None               # or e.g., 64 for hard-neg mining
     ).to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
@@ -470,11 +473,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     padding_idx=model.embedder.padding_idx,
                     vocab_size=pred_logits.size(-1),
                     k=training_settings["bce_k_window"]
-                )  
+                ).masked_fill_(illegal_mask, 0.0)    # zero‑out illegal targets  
+                
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = (target_ids != model.embedder.padding_idx).unsqueeze(-1)    # [B,T,1] bool
                 allowed   = (~illegal_mask) & valid_pos                                 # [B,T,V] bool               
-                multi_hot.masked_fill_(illegal_mask, 0.0)    # zero‑out illegal targets
 
                 # Calculate BCE loss (only valid positions) 
                 loss_bce, bce_info = criterion(pred_logits, multi_hot, allowed) * training_settings["phase2_bce_weight"] # Applying weight
