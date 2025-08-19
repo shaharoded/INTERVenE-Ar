@@ -914,7 +914,7 @@ def plot_losses(train_losses, val_losses):
     plt.plot(epochs, train_losses, label="Train loss")
     plt.plot(epochs, val_losses, label="Val loss")
     plt.xlabel("Epoch")
-    plt.ylabel("Cross‑entropy loss")
+    plt.ylabel("Cross-entropy loss")
     plt.title("Training vs. validation loss")
     plt.legend()
     plt.grid(True)
