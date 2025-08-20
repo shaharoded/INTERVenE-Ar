@@ -676,6 +676,14 @@ def penalty_interval_structure(
     pred_illegal = illegal_pred.gather(2, pred_ids.unsqueeze(-1)).squeeze(-1)  # [B,T]
     gt_illegal   = illegal_gt.  gather(2, gt_ids.  unsqueeze(-1)).squeeze(-1)  # [B,T]
 
+    # Do not let specials (PAD/CTX/MASK) create forgiveness windows
+    gt_special = predict_block[gt_ids]      # [B,T] True where GT token is a special
+    gt_illegal = gt_illegal & (~gt_special) # drop specials from GT-illegal used for forgiveness
+
+    # Do not count specials on the PRED side as “new” violations either
+    pred_special = predict_block[pred_ids]     # specials in PRED
+    pred_illegal = pred_illegal & (~pred_special)
+
     # 2) Forgiveness window over GT
     gt_win = F.max_pool1d(
         gt_illegal.float().unsqueeze(1),
@@ -736,6 +744,7 @@ def penalty_interval_structure(
     penalty = (count_ts_viol + new_unc_viol) / denom
     return penalty
 
+
 def penalty_meal_order(pred_ids:  torch.LongTensor, meal_rank: torch.LongTensor) -> torch.Tensor:
     """
     Enforces cyclic order among meals: B→L→D→N→B...
@@ -762,7 +771,7 @@ def penalty_meal_order(pred_ids:  torch.LongTensor, meal_rank: torch.LongTensor)
       3. Compute expected next-meal rank = (M[:, :-1] + 1) % K.
       4. Count wrong transitions (curr != expected) and normalize by total transitions.
 
-    Fully batched, GPU-friendly, and differentiable.
+    Fully batched, GPU-friendly, non differentiable (due to argmax -> pred_ids).
     """
     device = pred_ids.device
     ranks = meal_rank[pred_ids]  # [B,T]
@@ -799,6 +808,170 @@ def penalty_meal_order(pred_ids:  torch.LongTensor, meal_rank: torch.LongTensor)
     total = valid.float().sum().clamp_min(1.0)
     return wrong / total
 
+
+@torch.no_grad()
+def _gather_valid_ids(ids_tensor):
+    """Return (ids_valid, mask_valid) where ids_valid has all ids >=0 and mask_valid selects those columns."""
+    mask = ids_tensor >= 0
+    return ids_tensor[mask], mask
+
+
+def masked_softmax(logits, allowed):
+    """Softmax over allowed classes only; zeros on disallowed. No in-place ops."""
+    # Use a large negative, not -inf, to be CUDA-safe and avoid NaNs
+    l = logits.masked_fill(~allowed, -1e9)
+    logZ = torch.logsumexp(l, dim=-1, keepdim=True)     # [B,T,1]
+    p = torch.exp(l - logZ)                             # [B,T,V]
+    # zero out disallowed classes without in-place writes into `p`
+    p = p * allowed.to(p.dtype)
+    return p
+
+
+def soft_interval_penalty(
+    logits: torch.Tensor,           # [B,T,V] AFTER applying your legality/bonus mask to logits
+    allowed: torch.Tensor,          # [B,T,V] bool (legal & non-PAD)
+    start_ids_per_base: torch.Tensor, end_ids_per_base: torch.Tensor,  # [nb] (may contain -1)
+    conflict_mat: torch.Tensor,     # [nb,nb] bool
+    alpha: float = 8.0,             # sharpness for sigmoids
+    w_end_no_open: float = 1.0,
+    w_dup_start: float = 1.0,
+    w_conflict: float = 1.0,
+    w_unclosed: float = 0.5,
+):
+    """
+    Differentiable interval structure penalty.
+    Builds expected 'open mass' from probabilities of *_START/*_END and penalizes:
+      • END with ~no open mass
+      • START when already open (dup)
+      • START when conflicting base open
+      • residual open mass at the end (unclosed)
+    Returns scalar penalty in [0, ~] (normalized).
+    """
+    B, T, V = logits.shape
+    device = logits.device
+
+    P = masked_softmax(logits, allowed)                       # [B,T,V]
+
+    # restrict to bases that have both START and END
+    s_ids_all, s_mask = _gather_valid_ids(start_ids_per_base)
+    e_ids_all, e_mask = _gather_valid_ids(end_ids_per_base)
+    valid_mask = s_mask & e_mask
+    if valid_mask.sum() == 0:
+        return logits.new_zeros(())
+
+    s_ids = start_ids_per_base[valid_mask]                   # [nbv]
+    e_ids = end_ids_per_base[valid_mask]                     # [nbv]
+    nbv   = s_ids.numel()
+
+    p_s = P[:, :, s_ids]                                     # [B,T,nbv]
+    p_e = P[:, :, e_ids]                                     # [B,T,nbv]
+
+    # exclusive prefix for "open before t"
+    cs_s = torch.cumsum(p_s, dim=1)
+    cs_e = torch.cumsum(p_e, dim=1)
+    open_before = F.relu(torch.cat([torch.zeros(B,1,nbv, device=device),
+                                    cs_s[:, :-1, :] - cs_e[:, :-1, :]], dim=1))  # [B,T,nbv]
+
+    # END w/o open: penalize p_e when open_before ~ 0
+    # END w/o open: penalize p_e when open_before ~ 0
+    pen_end_no_open = (p_e * torch.exp(-alpha * open_before)).sum()
+
+    # DUP-START: penalize p_s when already open
+    pen_dup_start = (p_s * (1.0 - torch.exp(-alpha * open_before))).sum()
+
+    # CONFLICT: penalize p_s by conflicting open mass
+    if conflict_mat.numel() and nbv:
+        cm_sub = conflict_mat[valid_mask][:, valid_mask].float()  # [nbv,nbv]
+        open_conf = torch.einsum('btn,nm->btm', open_before, cm_sub)
+        pen_conf = (p_s * (1.0 - torch.exp(-alpha * open_conf))).sum()
+    else:
+        pen_conf = logits.new_zeros(())
+
+    # UNCLOSED at sequence end: residual open mass
+    open_final = F.relu(cs_s[:, -1, :] - cs_e[:, -1, :])     # [B,nbv]
+    pen_unclosed = open_final.sum()
+
+    # Normalize by scale (interval token budget): (#interval tokens + B) like the hard version
+    denom = logits.new_tensor(nbv * B * T + B).clamp_min_(1.0)
+    penalty = (w_end_no_open*pen_end_no_open
+            + w_dup_start*pen_dup_start
+            + w_conflict*pen_conf
+            + w_unclosed*pen_unclosed) / denom
+    return penalty
+
+
+def soft_meal_order_penalty(
+    logits: torch.Tensor,             # [B,T,V] AFTER legality/bonus masking
+    allowed: torch.Tensor,            # [B,T,V] bool
+    meal_rank: torch.Tensor,          # [V]  (-1 non-meal else 0..K-1)
+    decay: float = 0.8,               # recency decay (0<decay<1); closer to 1 = longer memory
+    beta: float = 6.0,                # sharpness for “seen” squashing
+    eps: float = 1e-8,
+):
+    """
+    Differentiable cyclic meal-order penalty with *recency*:
+      • Build soft distribution over the **most-recent** meal rank before t via
+        an exponential-decay causal convolution over rank-level meal probabilities.
+      • Allowed rank at t is then the **successor** of that soft last-seen distribution.
+      • Penalize the probability mass on meal ranks that are NOT in that successor distribution.
+      • First meal (no prior seen) has zero penalty.
+
+    Returns: scalar penalty.
+    """
+    B, T, V = logits.shape
+    device  = logits.device
+    # No meals -> no penalty
+    if not (meal_rank >= 0).any():
+        return logits.new_zeros(())
+
+    # 1) Probabilities over allowed classes
+    l = logits.masked_fill(~allowed, -1e9)          # [B,T,V]
+    P = torch.exp(l - torch.logsumexp(l, dim=-1, keepdim=True))  # [B,T,V]
+    P = P * allowed.to(P.dtype)
+
+    # 2) Collapse token-level meal probs to rank-level probs: P_rank[b,t,r]
+    meal_ids = (meal_rank >= 0).nonzero(as_tuple=False).squeeze(-1)   # [N_meal_tokens]
+    ranks    = meal_rank[meal_ids].to(torch.long)                     # [N] each in 0..K-1
+    K        = int(meal_rank[meal_rank >= 0].max().item()) + 1
+
+    P_meal_tok = P[:, :, meal_ids]                                    # [B,T,N]
+    P_rank = torch.zeros(B, T, K, device=device)
+    # scatter_add tokens into their ranks
+    P_rank.scatter_add_(dim=2, index=ranks.view(1,1,-1).expand(B,T,-1), src=P_meal_tok)  # [B,T,K]
+
+    # 3) Build soft “most-recent rank before t” via exponential-decay causal conv
+    #    y[:, :, t] = sum_{j <= t} P_rank[:, j] * decay^(t-j)
+    kernel = (decay ** torch.arange(T, device=device, dtype=P_rank.dtype)).view(1,1,T)  # [1,1,T]
+    x = P_rank.transpose(1,2)                                       # [B,K,T]  (channels=K)
+
+    # depthwise kernel: [K, 1, T]
+    base = (decay ** torch.arange(T, device=device, dtype=x.dtype)).view(1, 1, T)
+    w = base.repeat(K, 1, 1)
+
+    # causal conv: padding=T-1 then trim right
+    y_full = F.conv1d(x, w, padding=T-1, groups=K)  # [B, K, T+T-1]
+    y = y_full[:, :, :T]                            # [B, K, T]
+
+    # exclusive prefix: last-seen BEFORE t
+    last_seen = torch.zeros_like(y)
+    last_seen[:, :, 1:] = y[:, :, :-1]                              # [B,K,T]
+    last_seen = last_seen.transpose(1,2)                             # [B,T,K]
+
+    # squash to [0,1], emphasize larger mass
+    seen_soft = 1.0 - torch.exp(-beta * last_seen)                   # [B,T,K]
+    any_seen  = (seen_soft.sum(dim=2, keepdim=True) > 0).float()     # [B,T,1]
+
+    # 4) Successor distribution over ranks (shift by +1 mod K), normalized
+    succ = torch.roll(seen_soft, shifts=+1, dims=2)                  # successor of rank r is (r+1)%K
+    succ = succ / (succ.sum(dim=2, keepdim=True) + eps)              # [B,T,K]; undefined -> handled by any_seen
+
+    # 5) Current meal rank mass vs allowed successor ranks
+    #    penalty = sum_r P_rank[b,t,r] * (1 - succ[b,t,r])  when any_seen>0;  else 0
+    wrong = 1.0 - succ                                               # [B,T,K]
+    pen = (P_rank * wrong * any_seen).sum()                          # scalar
+
+    denom = (B * T + 1.0)
+    return pen / denom
 
 
 def apply_masks_to_logits(logits, illegal_mask, bonus_mask, bonus_boost=0.2):
