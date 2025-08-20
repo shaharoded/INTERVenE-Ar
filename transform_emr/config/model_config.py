@@ -31,7 +31,7 @@ TRAINING_SETTINGS = {
     "weight_decay": 1e-2,
     
     "batch_size": 64, # Number of patients processed concurrently
-    "bce_k_window": 4, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
+    "bce_k_window": 12, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
     
     "phase1_bce_weight": 1.0, # BCE loss weight, should be 1.
     "phase1_mlm_weight": 0.2, # MLM loss regulizer weight on the phase1 training task (= phase1_bce_weight / bce_k_window)

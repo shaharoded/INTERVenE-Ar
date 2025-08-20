@@ -377,11 +377,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
-        gamma=1.0,         # focal strength
-        tau=0.5,           # pos/neg balance anchor
+        gamma=2.0,         # focal strength
+        tau=0.8,           # pos/neg balance anchor
         neg_bounds=(0.05, 0.5),   # clamp for stability
         label_smoothing=0.01,     # optional
-        hard_neg_k=None               # or e.g., 64 for hard-neg mining
+        hard_neg_k=64               # or e.g., 64 for hard-neg mining
     ).to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
@@ -508,15 +508,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 mask = (target_ids != model.embedder.padding_idx).float()  # [B, T]
 
-                # Base MSE loss
+                # Base MSE loss (no scheduler on MSE)
                 abs_t_loss = F.mse_loss(pred_delta, true_delta, reduction='none')  # [B, T]
                 abs_t_loss = (abs_t_loss * mask).sum() / mask.sum().clamp(min=1)
-                lambda_t = linear_schedule(epoch, 
-                        training_settings['warmup_epochs'], 
-                        training_settings["phase2_dt_weight"])
-                abs_t_loss = lambda_t * abs_t_loss
+                abs_t_loss = abs_t_loss * training_settings["phase2_dt_weight"]
 
-                # Temporal Monotonicity Penalty ===
+                # Temporal Monotonicity Penalty (with scheduler) ===
                 # Penalize predicted time going backwards: max(0, prev - curr)
                 delta_diff = pred_delta[:, 1:] - pred_delta[:, :-1]  # [B, T-1]
                 monotonic_penalty = F.relu(-delta_diff)              # only penalize decreases

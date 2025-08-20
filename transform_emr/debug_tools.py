@@ -1,6 +1,7 @@
 """
 debug_tools.py
 ==============
+
 Debug helpers for inspecting loss behaviour with MaskedFocalBCE/SetCE.
 """
 
@@ -136,7 +137,7 @@ def inspect_minibatch(model, batch, luts, k_window: int) -> Dict[str, Any]:
 
     stats = {
         "fraction_pad_steps": float((target_ids == pad).float().mean().cpu()),
-        "mean_allowed_vocab": float(allowed_per_step.float().mean().cpu()),
+        "mean_allowed_vocab": float(allowed_per_step[nonpad].float().mean().cpu()),
         "allowed_vocab_p50": p50,
         "allowed_vocab_p90": p90,
         "mean_positives_per_step": float(pos_per_step.float().mean().cpu()),
@@ -149,9 +150,9 @@ def inspect_minibatch(model, batch, luts, k_window: int) -> Dict[str, Any]:
     # ---- masked focal BCE (our actual objective now) ----
     crit = MaskedFocalBCE.from_counts(
         counts=tok.token_counts, token_weights=tok.token_weights,
-        beta=0.999, min_count=5, clip_max=8.0, gamma=1.0,
-        tau=0.5, neg_bounds=(0.05, 0.5), label_smoothing=0.01,
-        hard_neg_k=None
+        beta=0.999, min_count=5, clip_max=8.0, gamma=2.0,
+        tau=0.8, neg_bounds=(0.05, 0.5), label_smoothing=0.01,
+        hard_neg_k=64
     ).to(device)
 
     loss_bce, info = crit(pred_logits, multi_hot, allowed)  # scalar + diagnostics
