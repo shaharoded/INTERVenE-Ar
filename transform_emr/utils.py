@@ -830,13 +830,15 @@ def masked_softmax(logits, allowed):
 def soft_interval_penalty(
     logits: torch.Tensor,           # [B,T,V] AFTER applying your legality/bonus mask to logits
     allowed: torch.Tensor,          # [B,T,V] bool (legal & non-PAD)
-    start_ids_per_base: torch.Tensor, end_ids_per_base: torch.Tensor,  # [nb] (may contain -1)
+    start_ids_per_base: torch.Tensor, 
+    end_ids_per_base: torch.Tensor,  # [nb] (may contain -1)
     conflict_mat: torch.Tensor,     # [nb,nb] bool
     alpha: float = 8.0,             # sharpness for sigmoids
     w_end_no_open: float = 1.0,
     w_dup_start: float = 1.0,
     w_conflict: float = 1.0,
     w_unclosed: float = 0.5,
+    return_details: bool = False
 ):
     """
     Differentiable interval structure penalty.
@@ -845,58 +847,105 @@ def soft_interval_penalty(
       • START when already open (dup)
       • START when conflicting base open
       • residual open mass at the end (unclosed)
-    Returns scalar penalty in [0, ~] (normalized).
+    Returns:
+        penalty: scalar in [0,1]
+        details: dict of raw & normalized components (if return_details=True)
     """
+    eps = 1e-8
     B, T, V = logits.shape
     device = logits.device
 
     P = masked_softmax(logits, allowed)                       # [B,T,V]
 
-    # restrict to bases that have both START and END
+    # Restrict to bases that have both START and END
     s_ids_all, s_mask = _gather_valid_ids(start_ids_per_base)
     e_ids_all, e_mask = _gather_valid_ids(end_ids_per_base)
     valid_mask = s_mask & e_mask
     if valid_mask.sum() == 0:
-        return logits.new_zeros(())
+        return (logits.new_zeros(()), {}) if return_details else logits.new_zeros(())
 
-    s_ids = start_ids_per_base[valid_mask]                   # [nbv]
-    e_ids = end_ids_per_base[valid_mask]                     # [nbv]
+    s_ids = start_ids_per_base[valid_mask]  # [nbv]
+    e_ids = end_ids_per_base[valid_mask]    # [nbv]
     nbv   = s_ids.numel()
 
-    p_s = P[:, :, s_ids]                                     # [B,T,nbv]
-    p_e = P[:, :, e_ids]                                     # [B,T,nbv]
+    # START/END probabilities per base
+    p_s = P[:, :, s_ids]  # [B,T,nbv]
+    p_e = P[:, :, e_ids]  # [B,T,nbv]
 
-    # exclusive prefix for "open before t"
+    # Exclusive prefix "open-before-t" mass
     cs_s = torch.cumsum(p_s, dim=1)
     cs_e = torch.cumsum(p_e, dim=1)
-    open_before = F.relu(torch.cat([torch.zeros(B,1,nbv, device=device),
-                                    cs_s[:, :-1, :] - cs_e[:, :-1, :]], dim=1))  # [B,T,nbv]
+    open_before = F.relu(torch.cat(
+        [torch.zeros(B,1,nbv, device=device, dtype=p_s.dtype),
+         cs_s[:, :-1, :] - cs_e[:, :-1, :]],
+        dim=1
+    ))  # [B,T,nbv]
 
-    # END w/o open: penalize p_e when open_before ~ 0
-    # END w/o open: penalize p_e when open_before ~ 0
-    pen_end_no_open = (p_e * torch.exp(-alpha * open_before)).sum()
+    # === Raw components (un-normalized) ===
+    # END with no open
+    pen_end_no_open = (p_e * torch.exp(-alpha * open_before)).sum()        # ≤ B*T*nbv
 
-    # DUP-START: penalize p_s when already open
-    pen_dup_start = (p_s * (1.0 - torch.exp(-alpha * open_before))).sum()
+    # DUP START while already open
+    pen_dup_start   = (p_s * (1.0 - torch.exp(-alpha * open_before))).sum()# ≤ B*T*nbv
 
-    # CONFLICT: penalize p_s by conflicting open mass
+    # CONFLICT START while conflicting base open
     if conflict_mat.numel() and nbv:
-        cm_sub = conflict_mat[valid_mask][:, valid_mask].float()  # [nbv,nbv]
-        open_conf = torch.einsum('btn,nm->btm', open_before, cm_sub)
-        pen_conf = (p_s * (1.0 - torch.exp(-alpha * open_conf))).sum()
+        cm_sub    = conflict_mat[valid_mask][:, valid_mask].float()        # [nbv,nbv]
+        open_conf = torch.einsum('btn,nm->btm', open_before, cm_sub)        # [B,T,nbv]
+        pen_conf  = (p_s * (1.0 - torch.exp(-alpha * open_conf))).sum()    # ≤ B*T*nbv
     else:
-        pen_conf = logits.new_zeros(())
+        pen_conf  = logits.new_zeros(())
 
-    # UNCLOSED at sequence end: residual open mass
-    open_final = F.relu(cs_s[:, -1, :] - cs_e[:, -1, :])     # [B,nbv]
-    pen_unclosed = open_final.sum()
+    # UNCLOSED mass at sequence end
+    open_final   = F.relu(cs_s[:, -1, :] - cs_e[:, -1, :])                  # [B,nbv]
+    pen_unclosed = open_final.sum()                                         # ≤ B*nbv
 
-    # Normalize by scale (interval token budget): (#interval tokens + B) like the hard version
-    denom = logits.new_tensor(nbv * B * T + B).clamp_min_(1.0)
-    penalty = (w_end_no_open*pen_end_no_open
-            + w_dup_start*pen_dup_start
-            + w_conflict*pen_conf
-            + w_unclosed*pen_unclosed) / denom
+    # === Strict [0,1] normalization per component ===
+    denom_bt = (B * T * nbv) + eps
+    denom_b  = (B *     nbv) + eps
+
+    norm_end_no_open = pen_end_no_open / denom_bt
+    norm_dup_start   = pen_dup_start   / denom_bt
+    norm_conf        = pen_conf        / denom_bt
+    norm_unclosed    = pen_unclosed    / denom_b
+
+    # Weighted average in [0,1]
+    wsum = (w_end_no_open + w_dup_start + w_conflict + w_unclosed) + eps
+    penalty = (
+        w_end_no_open * norm_end_no_open +
+        w_dup_start   * norm_dup_start   +
+        w_conflict    * norm_conf        +
+        w_unclosed    * norm_unclosed
+    ) / wsum
+
+    if return_details:
+        details = {
+            "raw": {
+                "end_no_open": pen_end_no_open.detach(),
+                "dup_start":   pen_dup_start.detach(),
+                "conflict":    pen_conf.detach(),
+                "unclosed":    pen_unclosed.detach(),
+            },
+            "norm": {
+                "end_no_open": norm_end_no_open.detach().item(),
+                "dup_start":   norm_dup_start.detach().item(),
+                "conflict":    norm_conf.detach().item(),
+                "unclosed":    norm_unclosed.detach().item(),
+            },
+            "meta": {
+                "B": B, "T": T, "nbv": int(nbv), "alpha": float(alpha),
+                "ws": (float(w_end_no_open), float(w_dup_start), float(w_conflict), float(w_unclosed))
+            },
+            # light sanity stats for quick prints
+            "stats": {
+                "p_s_sum": float(p_s.sum().detach()),
+                "p_e_sum": float(p_e.sum().detach()),
+                "open_before_mean": float(open_before.mean().detach()),
+                "open_final_mean": float(open_final.mean().detach())
+            }
+        }
+        return penalty, details
+
     return penalty
 
 

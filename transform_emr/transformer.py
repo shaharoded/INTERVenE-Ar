@@ -485,21 +485,29 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # === Loss: Structural penalties on output ===
                 # Load and normalize each penalty (∈ [0, 1]) -> Active grad on penalty functions
-                p_meal = penalty_meal_order(pred_ids, luts["meal_rank"])
-                p_struct = penalty_interval_structure(pred_ids, target_ids, 
-                                                        luts["is_start"], luts["is_end"], 
-                                                        luts["base_id"], luts["start_ids_per_base"],
-                                                        luts["end_ids_per_base"], luts["meal_rank"],
-                                                        luts["meal_pred_rank"], luts["K_meals"],
-                                                        luts["conflict_mat"], luts["predict_block"],
-                                                        window=training_settings['bce_k_window'])
+                p_struct = soft_interval_penalty(
+                    pred_logits,             # keep grads
+                    allowed,
+                    luts["start_ids_per_base"],
+                    luts["end_ids_per_base"],
+                    luts["conflict_mat"],
+                    alpha=10.0               # sharpness; 8–12 worked in tests
+                )
+                p_meal = soft_meal_order_penalty(
+                    pred_logits,             # keep grads
+                    allowed,
+                    luts["meal_rank"],
+                    decay=0.9,               # recency memory (0.8–0.95 reasonable)
+                    beta=8.0                 # “seen” squashing sharpness
+                )
 
-                # Average the penalties to bound in [0, 1] + smooth
-                generative_penalty = torch.log1p((p_meal + p_struct) / 2.0)
-                lambda_pen = linear_schedule(epoch, 
-                                       training_settings['warmup_epochs'], 
-                                       training_settings["phase2_penalty_weight"])
-                generative_penalty = lambda_pen * generative_penalty # Apply penalty weight
+                # Average the penalties to bound in [0, 1]
+                lambda_pen = linear_schedule(
+                    epoch,
+                    training_settings['warmup_epochs'],
+                    training_settings["phase2_penalty_weight"]
+                )
+                generative_penalty = lambda_pen * (0.5 * (p_struct + p_meal))
 
                 # === Loss: Δt + monotonicity ===
                 # Predict abs_ts[:, 1:] using model abs_t_head
