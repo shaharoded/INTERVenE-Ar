@@ -23,12 +23,12 @@ MODEL_CONFIG = {
 TRAINING_SETTINGS = {
     "phase1_n_epochs": 100,
     "phase2_n_epochs": 100,
-    "warmup_epochs": 5,
-    "patience": 5,
+    "warmup_epochs": 3,
+    "patience": 10,
     
     "phase1_learning_rate": 3e-4,
-    "phase2_learning_rate": 1e-4,
-    "weight_decay": 1e-2,
+    "phase2_learning_rate": 5e-4,
+    "weight_decay": 1e-3,
     
     "batch_size": 64, # Number of patients processed concurrently
     "bce_k_window": 12, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
@@ -38,7 +38,8 @@ TRAINING_SETTINGS = {
     "phase1_dt_weight": 0.1, # Weight for time regression loss component during phase 1
     
     "phase2_bce_weight": 1.0, # BCE loss weight, should be 1.
-    "phase2_penalty_weight": 0.05, # Weight for special penalties given on next token loss function (phase 2).
-    "phase2_dt_weight": 1.0, # Weight loss on the abs_t prediction, which is combined with regular loss. Currently as calculated (phase 2).
-    "phase2_dt_monotonic_penalty": 0.1, # Weight for penalties given on time MSE if predicted time is not monotonically increasing (phase 2).
+    # Balance each penalty to be 20% - 30% of the BCE loss
+    "phase2_penalty_weight": 0.1, # Weight for special penalties given on next token loss function (phase 2).
+    "phase2_dt_weight": 3.0, # Weight loss on the abs_t prediction, which is combined with regular loss. Currently as calculated (phase 2).
+    "phase2_dt_monotonic_penalty": 0.3, # Weight for penalties given on time MSE if predicted time is not monotonically increasing (phase 2).
 }

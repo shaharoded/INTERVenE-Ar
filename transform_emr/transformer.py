@@ -377,11 +377,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
-        gamma=2.0,         # focal strength
-        tau=0.8,           # pos/neg balance anchor
+        gamma=1.5,         # focal strength
+        tau=0.75,           # pos/neg balance anchor
         neg_bounds=(0.05, 0.5),   # clamp for stability
         label_smoothing=0.01,     # optional
-        hard_neg_k=64               # or e.g., 64 for hard-neg mining
+        hard_neg_k=128               # or e.g., 64 for hard-neg mining
     ).to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
