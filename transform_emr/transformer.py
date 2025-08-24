@@ -19,7 +19,7 @@ from tqdm import tqdm
 from transform_emr.embedder import EMREmbedding
 from transform_emr.config.model_config import *
 from transform_emr.utils import *
-from transform_emr.loss import MaskedFocalBCE
+from transform_emr.loss import MaskedFocalBCE, MaskedSetCE
 
 
 # ───────── helpers ─────────────────────────────────────────────────────────── #
@@ -384,7 +384,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
     
     # Build criterion once
-    criterion = MaskedFocalBCE.from_counts(
+    BCEcriterion = MaskedFocalBCE.from_counts(
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
@@ -393,6 +393,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         neg_bounds=(0.05, 0.2),   # clamp for stability
         label_smoothing=0.0,     # optional
         hard_neg_k=32               # or e.g., 64 for hard-neg mining
+    ).to(device)
+
+    CEcriterion = MaskedSetCE.from_counts(
+        label_smoothing=0.0,     # optional
     ).to(device)
 
     ckpt_path = Path(checkpoint_path).resolve()
@@ -489,7 +493,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Get predicted token IDs
                 pred_ids = pred_logits.argmax(dim=-1) # [B, T] — single token prediction per timestep, full block
 
-                # === Loss: BCE with logits ===
+                # === Loss: BCE with logits + CE nudge ===
                 # Multi-hot targets
                 multi_hot = get_multi_hot_targets(
                     position_ids=target_ids,
@@ -503,8 +507,17 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool               
 
                 # Calculate BCE loss (only valid positions) 
-                loss_bce, _ = criterion(pred_logits, multi_hot, allowed)
+                loss_bce, _ = BCEcriterion(pred_logits, multi_hot, allowed)
                 loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
+                
+                loss_ce, _ = CEcriterion(pred_logits, multi_hot, allowed)
+                lambda_ce = linear_schedule(
+                    epoch,
+                    training_settings['warmup_epochs'],
+                    training_settings["phase2_ce_weight"]
+                )
+
+                loss_bce = loss_bce + loss_ce * lambda_ce  # Combining the 2 terms
 
                 # === Loss: Structural penalties on output ===
                 # Load and normalize each penalty (∈ [0, 1]) -> Active grad on penalty functions

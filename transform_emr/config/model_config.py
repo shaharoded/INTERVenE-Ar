@@ -33,11 +33,14 @@ TRAINING_SETTINGS = {
     "batch_size": 64, # Number of patients processed concurrently
     "bce_k_window": 12, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
     
+    # Phase-1 auxiliary settings
     "phase1_bce_weight": 1.0, # BCE loss weight, should be 1.
     "phase1_mlm_weight": 0.2, # MLM loss regulizer weight on the phase1 training task (= phase1_bce_weight / bce_k_window)
     "phase1_dt_weight": 0.1, # Weight for time regression loss component during phase 1
     
+    # Phase-2 auxiliary settings
     "phase2_bce_weight": 1.0, # BCE loss weight, should be 1.
+    "phase2_ce_weight": 0.05, # Cross-entropy loss weight, used as a nudge to the BCE.
     # Balance each penalty to be 20% - 30% of the BCE loss
     "phase2_penalty_weight": 0.15, # Weight for special penalties given on next token loss function (phase 2).
     "phase2_dt_weight": 5.0, # Weight loss on the abs_t prediction, which is combined with regular loss. Currently as calculated (phase 2).
