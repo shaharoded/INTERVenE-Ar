@@ -570,18 +570,19 @@ def transformer_training_report(
         next_total += nonpad.sum().item()
 
         # ---- time diagnostics
-        true_delta = batch["abs_ts"]
-        pred_delta = abs_t_pred[:, 1:]
-        tmask = nonpad
+        true_delta = batch["abs_ts"]                      # [B, T], already in [0,1]
+        pred_delta = abs_t_pred.squeeze(-1)               # [B, T] (drop trailing dim if present)
+        tmask = (target_ids != tk.pad_token_id)          # [B, T] bool
+
         dt_abs_err += (pred_delta[tmask] - true_delta[tmask]).abs().cpu().tolist()
         dt_true_all.append(true_delta[tmask].detach().cpu())
         dt_pred_all.append(pred_delta[tmask].detach().cpu())
 
-        if tmask.sum() > 1:
-            pdiff = pred_delta[:, 1:] - pred_delta[:, :-1]
-            pmask = tmask[:, 1:] & tmask[:, :-1]
-            dt_viol_cnt += (pdiff[pmask] < 0).sum().item()
-            dt_viol_den += pmask.sum().item()
+        # monotonic violations (should be ~0 with the monotonic head)
+        pdiff = pred_delta[:, 1:] - pred_delta[:, :-1]    # [B, T-1]
+        pmask = tmask[:, 1:] & tmask[:, :-1]
+        dt_viol_cnt += (pdiff[pmask] < 0).sum().item()
+        dt_viol_den += pmask.sum().item()
 
         # ---- penalties (diagnostic magnitudes)
         _pen = soft_interval_penalty(
