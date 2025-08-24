@@ -585,7 +585,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        print(f"""[Training Transformer]: Epoch {epoch:02d}
+        print(f"""[Phase-2]: Epoch {epoch:02d}
         --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, Pen={tr_pen:.4f}, Δt={tr_dt:.4f})
         --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Δt={vl_dt:.4f})
         --> Val-F1  RELEASE:{val_f1['REL']:.4f}  DEATH:{val_f1['DTH']:.4f}  COMPLICATION:{val_f1['CMP']:.4f}""")
@@ -602,7 +602,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         elif epoch >= training_settings["warmup_epochs"]:
             bad_epochs += 1
             if bad_epochs >= training_settings["patience"]:
-                print("[GPT]: Early stopping triggered.")
+                print("[Phase-2]: Early stopping triggered.")
                 break
         else:
             # If warmup isn't complete - do nothing.
