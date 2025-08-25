@@ -98,69 +98,74 @@ class OutcomePRTracker:
     Tracks precision/recall at a few thresholds and max-F1 per outcome
     using masked probabilities from teacher-forced batches.
 
-        outcomes: ["RELEASE", "DEATH", <each COMPLICATION token>]
-        Scores are computed per example as max_t P(outcome at t).
-        Labels are whether the outcome appears at any step.
+    outcomes scored: ["RELEASE", "DEATH", <each COMPLICATION token>]
+    Scores are computed per example as max_t P(outcome at t).
+    Labels are whether the outcome appears at any step.
     """
     def __init__(self, tokenizer, thresholds=(0.05, 0.10, 0.20, 0.30, 0.50), device="cpu"):
-        self.names = []
-        self.ids = []
+        self.names, self.ids = [], []
         outcomes = TERMINAL_OUTCOMES + OUTCOMES
         for name in outcomes:
             if name in tokenizer.token2id:
                 self.names.append(name)
                 self.ids.append(tokenizer.token2id[name])
-        self.ids = torch.tensor(self.ids, device=device, dtype=torch.long)   # [K]
-        self.thr = torch.tensor(list(thresholds), device=device)             # [M]
+
+        self.ids = torch.tensor(self.ids, device=device, dtype=torch.long)         # [K]
+        self.thr = torch.tensor(list(thresholds), device=device, dtype=torch.float32)  # [M]
 
         K, M = len(self.ids), len(self.thr)
-        self.tp = torch.zeros(K, M, device=device)
-        self.fp = torch.zeros(K, M, device=device)
-        self.fn = torch.zeros(K, M, device=device)
+        self.tp = torch.zeros(K, M, device=device, dtype=torch.float32)
+        self.fp = torch.zeros(K, M, device=device, dtype=torch.float32)
+        self.fn = torch.zeros(K, M, device=device, dtype=torch.float32)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def update(self, logits, allowed, target_ids, nonpad):
         """
-        P_masked: [B,T,V] (masked softmax over allowed)
-        target_ids: [B,T]
-        nonpad: [B,T] bool
+        logits:   [B,T,V] raw logits for teacher-forced steps
+        allowed:  [B,T,V] bool mask of legal classes
+        target_ids: [B,T] target token ids
+        nonpad:   [B,T]   bool, valid steps
         """
-        P_masked = masked_softmax(logits, allowed)  # [B,T,V]
-        B, T, _ = P_masked.shape
-        K, M = self.ids.numel(), self.thr.numel()
+        allowed = allowed.bool()
+        nonpad  = nonpad.bool()
 
-        # labels: example has the outcome anywhere
-        labels = []
-        for cid in self.ids.tolist():
-            labels.append(((target_ids == cid) & nonpad).any(dim=1))  # [B]
-        labels = torch.stack(labels, dim=1)  # [B,K] bool
+        # masked probabilities over allowed classes
+        P = masked_softmax(logits, allowed)                        # [B,T,V]
+        P = P * nonpad.unsqueeze(-1).to(P.dtype)                   # zero out PAD steps (fast + broadcast-safe)
 
-        # scores: max_t P(class) over valid steps
-        P_valid = P_masked.clone()
-        P_valid[~nonpad.unsqueeze(-1)] = 0.0
-        scores = []
-        for cid in self.ids.tolist():
-            scores.append(P_valid[:, :, cid].amax(dim=1))  # [B]
-        scores = torch.stack(scores, dim=1)  # [B,K] in [0,1]
+        # labels[b,k] = example b has class k anywhere in valid steps
+        ids = self.ids.view(1, 1, -1)                              # [1,1,K]
+        labels = ((target_ids.unsqueeze(-1) == ids) &              # [B,T,K]
+                  nonpad.unsqueeze(-1)).any(dim=1)                 # [B,K] bool
 
-        # accumulate counts per threshold
-        for j in range(M):
-            pred = (scores >= self.thr[j])              # [B,K]
-            self.tp[:, j] += (pred & labels).sum(0)
-            self.fp[:, j] += (pred & ~labels).sum(0)
-            self.fn[:, j] += ((~pred) & labels).sum(0)
+        # scores[b,k] = max_t P(class k at t) over valid steps
+        scores = P.index_select(dim=2, index=self.ids).amax(dim=1) # [B,K]
+
+        # accumulate counts for all thresholds at once
+        pred = scores.unsqueeze(-1) >= self.thr.view(1, 1, -1)     # [B,K,M]
+        lab  = labels.unsqueeze(-1)                                 # [B,K,1]
+
+        self.tp += (pred &  lab).sum(dim=0).to(self.tp.dtype)       # [K,M]
+        self.fp += (pred & ~lab).sum(dim=0).to(self.fp.dtype)
+        self.fn += ((~pred) & lab).sum(dim=0).to(self.fn.dtype)
 
     def compute(self):
-        precision = self.tp / (self.tp + self.fp).clamp_min(1)
-        recall    = self.tp / (self.tp + self.fn).clamp_min(1)
-        f1 = (2 * precision * recall) / (precision + recall).clamp_min(1e-8)
+        precision = self.tp / (self.tp + self.fp).clamp_min(1e-8)
+        recall    = self.tp / (self.tp + self.fn).clamp_min(1e-8)
+        f1        = (2 * precision * recall) / (precision + recall).clamp_min(1e-8)
         max_f1, idx = f1.max(dim=1)
-        # return a compact dict easy to log
+
         return {
             "thresholds": self.thr.tolist(),
-            "per_class_maxF1": {n: float(m) for n, m in zip(self.names, max_f1.tolist())},
-            "per_class_P_at_maxF1": {n: float(precision[i, idx[i]].item()) for i, n in enumerate(self.names)},
-            "per_class_R_at_maxF1": {n: float(recall[i, idx[i]].item()) for i, n in enumerate(self.names)},
+            "per_class_maxF1": {n: float(v) for n, v in zip(self.names, max_f1.tolist())},
+            "per_class_P_at_maxF1": {
+                n: float(precision[i, idx[i]])
+                for i, n in enumerate(self.names)
+            },
+            "per_class_R_at_maxF1": {
+                n: float(recall[i, idx[i]])
+                for i, n in enumerate(self.names)
+            },
         }
 
     def reset(self):
