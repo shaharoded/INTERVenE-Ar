@@ -15,84 +15,6 @@ from transform_emr.config.dataset_config import (
 )
 
 
-class F1Aggregator:
-    """
-    Epoch-level micro-F1 aggregator accross batches.
-
-        0 = RELEASE
-        1 = DEATH
-        2.. = individual complication tokens
-
-    • TP_c = min(pred_count_c , true_count_c)
-    • FP_c = max(pred_count_c - true_count_c , 0)
-    • FN_c = max(true_count_c - pred_count_c , 0)
-    """
-    def __init__(self, tokenizer, device="cpu"):
-        self.tok = tokenizer
-        self.dev = device
-
-        # -- id look‑ups -----------------------------------------------------
-        self.rel_id = tokenizer.token2id.get("RELEASE")
-        self.dth_id = tokenizer.token2id.get("DEATH")
-
-        self.cmp_tokens = [t for t in OUTCOMES
-                           if t not in ("RELEASE", "DEATH") and t in tokenizer.token2id]
-
-        self.cmp_ids = torch.tensor([tokenizer.token2id[t] for t in self.cmp_tokens],
-                                    device=device)           # [C]
-
-        n_slots = 2 + len(self.cmp_ids)                      # 2 terminals + C complications
-        self.tp = torch.zeros(n_slots, device=device)
-        self.fp = torch.zeros(n_slots, device=device)
-        self.fn = torch.zeros(n_slots, device=device)
-
-    # ------------------------------------------------------------------
-    @torch.no_grad()
-    def _counts(self, ids):
-        """ids: tensor [...]; returns tensor [2+C] counts per class."""
-        flat = ids.view(-1)
-
-        n_rel = (flat == self.rel_id).sum() if self.rel_id is not None else 0
-        n_dth = (flat == self.dth_id).sum() if self.dth_id is not None else 0
-
-        # vectorised counts per complication token
-        n_cmp = (flat.unsqueeze(1) == self.cmp_ids).sum(dim=0).float()  # [C]
-
-        return torch.cat([n_rel.unsqueeze(0),
-                          n_dth.unsqueeze(0),
-                          n_cmp]).to(torch.float32)                     # [2+C]
-
-    # ------------------------------------------------------------------
-    def update(self, pred_ids, tgt_ids):
-        p = self._counts(pred_ids)
-        t = self._counts(tgt_ids)
-
-        self.tp += torch.min(p, t)
-        self.fp += torch.clamp(p - t, min=0)
-        self.fn += torch.clamp(t - p, min=0)
-
-    # ------------------------------------------------------------------
-    def compute(self):
-        # indices 0 and 1 are REL / DTH
-        scores = {}
-        for idx, lbl in enumerate(("REL", "DTH")):
-            denom = 2 * self.tp[idx] + self.fp[idx] + self.fn[idx]
-            scores[lbl] = None if denom == 0 else (2 * self.tp[idx] / denom).item()
-
-        # aggregate micro counts over all complication tokens (idx ≥2)
-        tp_cmp = self.tp[2:].sum()
-        fp_cmp = self.fp[2:].sum()
-        fn_cmp = self.fn[2:].sum()
-        denom  = 2 * tp_cmp + fp_cmp + fn_cmp
-        scores["CMP"] = None if denom == 0 else (2 * tp_cmp / denom).item()
-
-        return scores
-
-    # ------------------------------------------------------------------
-    def reset(self):
-        self.tp.zero_(); self.fp.zero_(); self.fn.zero_()
-
-
 class OutcomePRTracker:
     """
     Tracks precision/recall at a few thresholds and max-F1 per outcome
@@ -214,7 +136,7 @@ def get_multi_hot_targets(position_ids: torch.Tensor,
     csum_k = torch.cat([core, tail], dim=1)  # [B, T, V]
 
     # future counts in (t+1 .. t+k] = csum_k – csum
-    future = (csum_k - csum).clamp_min_(0.0)
+    future = (csum_k - csum).clamp_min(0.0)  # [B, T, V]
 
     # never supervise PAD
     if 0 <= padding_idx < vocab_size:
@@ -896,14 +818,27 @@ def _gather_valid_ids(ids_tensor):
 
 
 def masked_softmax(logits, allowed):
-    """Softmax over allowed classes only; zeros on disallowed. No in-place ops."""
-    # Use a large negative, not -inf, to be CUDA-safe and avoid NaNs
-    l = logits.masked_fill(~allowed, -1e9)
-    logZ = torch.logsumexp(l, dim=-1, keepdim=True)     # [B,T,1]
-    p = torch.exp(l - logZ)                             # [B,T,V]
-    # zero out disallowed classes without in-place writes into `p`
-    p = p * allowed.to(p.dtype)
-    return p
+    """
+    Softmax over allowed classes only; zeros on disallowed.
+    Safe when a row is fully masked (no legal classes): returns zeros and stops grad.
+    """
+    allowed = allowed.to(torch.bool)
+
+    # numeric stability: subtract row max
+    shifted = logits - logits.max(dim=-1, keepdim=True).values
+    # push disallowed far down but finite
+    shifted = shifted.masked_fill(~allowed, -1e9)
+
+    # normal softmax on the shifted scores
+    lse = torch.logsumexp(shifted, dim=-1, keepdim=True)     # [B,T,1]
+    probs = torch.exp(shifted - lse) * allowed               # [B,T,V], zero on disallowed
+
+    # handle rows where *all* entries are disallowed
+    any_valid = allowed.any(dim=-1, keepdim=True)            # [B,T,1]
+    probs = torch.where(any_valid, probs, torch.zeros_like(probs))
+    # stop gradients on fully-masked rows (no learning signal there)
+    probs = probs * any_valid.float()
+    return probs
 
 
 def soft_interval_penalty(
