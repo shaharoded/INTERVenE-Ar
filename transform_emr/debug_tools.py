@@ -461,7 +461,7 @@ def transformer_training_report(
     hard_neg_k = int(getattr(criterion, "hard_neg_k", 0) or 0)
 
     def softmax_masked(logits, mask):
-        l = logits.masked_fill(~mask, float('-inf'))
+        l = logits.masked_fill(~mask, -1e9)
         logZ = torch.logsumexp(l, dim=-1, keepdim=True)
         P = torch.exp(l - logZ)
         P[~mask] = 0.0
