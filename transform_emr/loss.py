@@ -63,7 +63,7 @@ class FocalBCELoss(nn.Module):
         super().__init__()
         alpha = alpha_vector.float().clone()
         if clip_max is not None:
-            alpha.clamp_(max=clip_max)
+            alpha = alpha.clamp(max=clip_max)
         self.register_buffer("alpha", alpha)
         self.gamma = gamma
         self.reduction = reduction
@@ -146,7 +146,7 @@ class MaskedFocalBCE(nn.Module):
         # Optional hard-negative mining (keep top-K hardest negatives per step)
         if self.hard_neg_k is not None and self.hard_neg_k > 0:
             with torch.no_grad():
-                neg_logits = logits.masked_fill(~neg_mask, float("-inf"))
+                neg_logits = logits.masked_fill(~neg_mask, -1e9)
                 k = min(self.hard_neg_k, neg_logits.size(-1))
                 topk_idx = neg_logits.topk(k=k, dim=-1).indices
                 hard_mask = torch.zeros_like(neg_mask)
@@ -177,8 +177,8 @@ class MaskedFocalBCE(nn.Module):
 
 class MaskedSetCE(nn.Module):
     """
-    Soft 'set cross-entropy' over the allowed classes. Encourages total probability
-    mass on the target set S_t at each step t. 
+    Soft 'set cross-entropy' over the allowed classes where at least 1 target is allowed. 
+    Encourages total probability mass on the target set S_t at each step t. 
     CE is an auxiliary “mass-shaper” that helps concentrate probability inside the true future set.
     Same interface as MaskedFocalBCE.
     """
@@ -187,27 +187,33 @@ class MaskedSetCE(nn.Module):
         self.eps = float(label_smoothing)
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor, allowed: torch.Tensor):
-        # Optional mild smoothing on the indicator set
+        allowed = allowed.bool()                   # [B,T,V]
+        tgt = (targets > 0).float()                # [B,T,V]
+
+        # optional smoothing inside the allowed simplex
         if self.eps > 0:
-            targets = (targets > 0).float()  # binary set
-        allowed = allowed.bool()
+            denom = allowed.float().sum(-1, keepdim=True).clamp_min(1.0)
+            smooth = allowed.float() / denom
+            tgt = (1.0 - self.eps) * tgt + self.eps * smooth
 
-        # only evaluate steps that actually have any positives
-        in_set  = (targets > 0) & allowed                    # [B,T,V]
-        has_pos = in_set.any(dim=-1)                          # [B,T]
-        has_dom = allowed.any(dim=-1)                         # [B,T]
-        use     = has_pos & has_dom                           # compute only where domain & positives exist
+        # set membership within allowed classes
+        in_set = (tgt > 0) & allowed               # [B,T,V]
+        pos_steps = in_set.any(dim=-1)             # only steps that have ≥1 legal target
 
-        # Masked softmax ⇒ probabilities only over allowed classes
-        logits_masked = logits.masked_fill(~allowed, -1e9)    # avoid -inf to keep logsumexp finite
-        logZ = torch.logsumexp(logits_masked, dim=-1, keepdim=True)  # [B,T,1]
-        P = torch.exp(logits_masked - logZ) * allowed.float()        # [B,T,V], sums to 1 on allowed
+        if not pos_steps.any():
+            # return a clean scalar with grad
+            return logits.sum() * 0.0, {"denom": 0.0}
 
-        set_mass = (P * in_set.float()).sum(dim=-1)           # [B,T]
-        set_ce   = -torch.log(set_mass.clamp_min(1e-8))       # [B,T]
+        # Use a large negative instead of -inf to keep logsumexp finite
+        masked_allowed = logits.masked_fill(~allowed, -1e9)
+        masked_in_set  = logits.masked_fill(~in_set,  -1e9)
 
-        # average only over valid steps
-        denom = use.float().sum().clamp_min(1.0)
-        loss  = (set_ce * use.float()).sum() / denom
-        info = {"denom": float(denom.detach().cpu())}
-        return loss, info
+        logZ   = torch.logsumexp(masked_allowed, dim=-1)          # [B,T], finite
+        logSet = torch.logsumexp(masked_in_set,  dim=-1)          # [B,T], finite on pos_steps
+
+        set_ce = (logZ - logSet)                                  # ≥ 0
+        set_ce = set_ce.masked_fill(~pos_steps, 0.0)
+
+        denom = pos_steps.float().sum().clamp_min(1.0)
+        loss  = set_ce.sum() / denom
+        return loss, {"denom": float(denom.item())}
