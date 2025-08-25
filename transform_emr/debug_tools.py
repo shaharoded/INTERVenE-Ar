@@ -425,11 +425,11 @@ def transformer_training_report(
         beta=training_settings.get("beta", 0.999),
         min_count=training_settings.get("min_count", 5),
         clip_max=training_settings.get("clip_max", 8.0),
-        gamma=training_settings.get("gamma", 1.2),
+        gamma=training_settings.get("gamma", 1.0),
         tau=training_settings.get("tau", 0.85),
-        neg_bounds=training_settings.get("neg_bounds", (0.05, 0.2)),
+        neg_bounds=training_settings.get("neg_bounds", (0.02, 0.2)),
         label_smoothing=training_settings.get("label_smoothing", 0.0),
-        hard_neg_k=training_settings.get("hard_neg_k", 32),
+        hard_neg_k=training_settings.get("hard_neg_k", 0),
     ).to(device)
     gamma = float(getattr(getattr(criterion, "focal", criterion), "gamma", 2.0))  # <-- pull γ from focal
 

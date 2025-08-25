@@ -91,6 +91,80 @@ class F1Aggregator:
     # ------------------------------------------------------------------
     def reset(self):
         self.tp.zero_(); self.fp.zero_(); self.fn.zero_()
+
+
+class OutcomePRTracker:
+    """
+    Tracks precision/recall at a few thresholds and max-F1 per outcome
+    using masked probabilities from teacher-forced batches.
+
+        outcomes: ["RELEASE", "DEATH", <each COMPLICATION token>]
+        Scores are computed per example as max_t P(outcome at t).
+        Labels are whether the outcome appears at any step.
+    """
+    def __init__(self, tokenizer, thresholds=(0.05, 0.10, 0.20, 0.30, 0.50), device="cpu"):
+        self.names = []
+        self.ids = []
+        outcomes = TERMINAL_OUTCOMES + OUTCOMES
+        for name in outcomes:
+            if name in tokenizer.token2id:
+                self.names.append(name)
+                self.ids.append(tokenizer.token2id[name])
+        self.ids = torch.tensor(self.ids, device=device, dtype=torch.long)   # [K]
+        self.thr = torch.tensor(list(thresholds), device=device)             # [M]
+
+        K, M = len(self.ids), len(self.thr)
+        self.tp = torch.zeros(K, M, device=device)
+        self.fp = torch.zeros(K, M, device=device)
+        self.fn = torch.zeros(K, M, device=device)
+
+    @torch.no_grad()
+    def update(self, logits, allowed, target_ids, nonpad):
+        """
+        P_masked: [B,T,V] (masked softmax over allowed)
+        target_ids: [B,T]
+        nonpad: [B,T] bool
+        """
+        P_masked = masked_softmax(logits, allowed)  # [B,T,V]
+        B, T, _ = P_masked.shape
+        K, M = self.ids.numel(), self.thr.numel()
+
+        # labels: example has the outcome anywhere
+        labels = []
+        for cid in self.ids.tolist():
+            labels.append(((target_ids == cid) & nonpad).any(dim=1))  # [B]
+        labels = torch.stack(labels, dim=1)  # [B,K] bool
+
+        # scores: max_t P(class) over valid steps
+        P_valid = P_masked.clone()
+        P_valid[~nonpad.unsqueeze(-1)] = 0.0
+        scores = []
+        for cid in self.ids.tolist():
+            scores.append(P_valid[:, :, cid].amax(dim=1))  # [B]
+        scores = torch.stack(scores, dim=1)  # [B,K] in [0,1]
+
+        # accumulate counts per threshold
+        for j in range(M):
+            pred = (scores >= self.thr[j])              # [B,K]
+            self.tp[:, j] += (pred & labels).sum(0)
+            self.fp[:, j] += (pred & ~labels).sum(0)
+            self.fn[:, j] += ((~pred) & labels).sum(0)
+
+    def compute(self):
+        precision = self.tp / (self.tp + self.fp).clamp_min(1)
+        recall    = self.tp / (self.tp + self.fn).clamp_min(1)
+        f1 = (2 * precision * recall) / (precision + recall).clamp_min(1e-8)
+        max_f1, idx = f1.max(dim=1)
+        # return a compact dict easy to log
+        return {
+            "thresholds": self.thr.tolist(),
+            "per_class_maxF1": {n: float(m) for n, m in zip(self.names, max_f1.tolist())},
+            "per_class_P_at_maxF1": {n: float(precision[i, idx[i]].item()) for i, n in enumerate(self.names)},
+            "per_class_R_at_maxF1": {n: float(recall[i, idx[i]].item()) for i, n in enumerate(self.names)},
+        }
+
+    def reset(self):
+        self.tp.zero_(); self.fp.zero_(); self.fn.zero_()
     
 
 def get_multi_hot_targets(position_ids: torch.Tensor,

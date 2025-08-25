@@ -388,11 +388,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
-        gamma=1.2,         # focal strength
+        gamma=1.0,         # focal strength
         tau=0.85,           # pos/neg balance anchor
-        neg_bounds=(0.05, 0.2),   # clamp for stability
+        neg_bounds=(0.02, 0.2),   # clamp for stability
         label_smoothing=0.0,     # optional
-        hard_neg_k=32               # or e.g., 64 for hard-neg mining
+        hard_neg_k=0               # or e.g., 64 for hard-neg mining
     ).to(device)
 
     CEcriterion = MaskedSetCE(
@@ -422,13 +422,18 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         print("[GPT]: Starting transformer training loop...")
 
     train_losses, val_losses = [], []
+    pr_tracker = OutcomePRTracker(
+        tokenizer=model.embedder.tokenizer,
+        thresholds=(0.05, 0.10, 0.20, 0.30, 0.50),
+        device=device
+    ) # For epoch evaluation
+
 
     def run_epoch(loader, epoch, train_flag=False):
         if train_flag:
             model.train()
         else:
             model.eval()
-            metric = F1Aggregator(tokenizer=model.embedder.tokenizer, device=device) # For epoch evaluation
 
         total_loss = total_bce = total_penalty = total_dt = 0.0
         with torch.set_grad_enabled(train_flag):
@@ -489,9 +494,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 pred_logits = apply_masks_to_logits(
                     pred_logits, illegal_mask, bonus_mask
                 )
-
-                # Get predicted token IDs
-                pred_ids = pred_logits.argmax(dim=-1) # [B, T] — single token prediction per timestep, full block
 
                 # === Loss: BCE with logits + CE nudge ===
                 # Multi-hot targets
@@ -571,8 +573,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     scheduler.step()
                 else:
                     # Update validation classification metric
-                    metric.update(pred_ids, target_ids)
-
+                    pr_tracker.update(pred_logits, allowed, target_ids, nonpad)
 
                 # Update loss
                 total_loss += loss.item()
@@ -580,7 +581,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 total_penalty += generative_penalty.item()
                 total_dt += abs_t_loss.item()
         
-        val_f1 = None if train_flag else metric.compute()
+        if train_flag:
+            val_eval = None
+        else:
+            val_eval = pr_tracker.compute()   # dict with per-class max-F1 and P/R at that point
+            pr_tracker.reset()
+
         n_batches = len(loader)
 
         return (
@@ -588,12 +594,18 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
             total_bce / n_batches,
             total_penalty / n_batches,
             total_dt / n_batches,
-            val_f1
+            val_eval
         )
     
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
         tr_loss, tr_bce, tr_pen, tr_dt, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_pen, vl_dt, val_f1 = run_epoch(val_dl, epoch=epoch, train_flag=False)
+        vl_loss, vl_bce, vl_pen, vl_dt, val_eval = run_epoch(val_dl, epoch=epoch, train_flag=False)
+
+        # convenience values for printing
+        rel_f1 = val_eval["per_class_maxF1"].get("RELEASE", 0.0)
+        dth_f1 = val_eval["per_class_maxF1"].get("DEATH", 0.0)
+        cmp_names = [n for n in val_eval["per_class_maxF1"] if n not in ("RELEASE", "DEATH")]
+        cmp_f1 = (sum(val_eval["per_class_maxF1"][n] for n in cmp_names) / max(len(cmp_names), 1)) if cmp_names else 0.0
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
@@ -601,7 +613,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         print(f"""[Phase-2]: Epoch {epoch:02d}
         --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, Pen={tr_pen:.4f}, Δt={tr_dt:.4f})
         --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Δt={vl_dt:.4f})
-        --> Val-F1  RELEASE:{val_f1['REL']:.4f}  DEATH:{val_f1['DTH']:.4f}  COMPLICATION:{val_f1['CMP']:.4f}""")
+        --> Val-F1  RELEASE:{rel_f1:.4f}  DEATH:{dth_f1:.4f}  COMPLICATION:{cmp_f1:.4f}""")
 
 
         # Save latest

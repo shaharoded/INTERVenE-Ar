@@ -178,7 +178,9 @@ class MaskedFocalBCE(nn.Module):
 class MaskedSetCE(nn.Module):
     """
     Soft 'set cross-entropy' over the allowed classes. Encourages total probability
-    mass on the target set S_t at each step t. Same interface as MaskedFocalBCE.
+    mass on the target set S_t at each step t. 
+    CE is an auxiliary “mass-shaper” that helps concentrate probability inside the true future set.
+    Same interface as MaskedFocalBCE.
     """
     def __init__(self, label_smoothing: float = 0.0):
         super().__init__()
