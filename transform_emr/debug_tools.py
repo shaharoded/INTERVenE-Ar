@@ -32,7 +32,7 @@ def _embedder_seq(model, batch):
         value_ids=batch["value_ids"],
         position_ids=batch["position_ids"],
         abs_ts=batch["abs_ts"],
-        patient_contexts=batch["context_vec"],
+        context_vec=batch["context_vec"],
         return_mask=False,
     )
     return emb  # [B, T+1, D]
@@ -570,16 +570,26 @@ def transformer_training_report(
         next_total += nonpad.sum().item()
 
         # ---- time diagnostics
-        true_delta = batch["abs_ts"]                      # [B, T], already in [0,1]
-        pred_delta = abs_t_pred.squeeze(-1)               # [B, T] (drop trailing dim if present)
-        tmask = (target_ids != tk.pad_token_id)          # [B, T] bool
+        true_delta = batch["abs_ts"].clamp(0.0, 1.0)          # [B, T]
+        pred_full  = abs_t_pred                               # [B, T+1]  (or [B, T+1, 1])
 
-        dt_abs_err += (pred_delta[tmask] - true_delta[tmask]).abs().cpu().tolist()
+        # squeeze last dim if the head returns [..., 1]
+        if pred_full.dim() == 3 and pred_full.size(-1) == 1:
+            pred_full = pred_full.squeeze(-1)                 # -> [B, T+1]
+
+        # align to T by dropping CTX if present
+        pred_T = pred_full[:, 1:] if pred_full.size(1) == true_delta.size(1) + 1 else pred_full  # [B, T]
+
+        # reuse nonpad from above (same as tmask)
+        tmask = nonpad                                        # [B, T] bool
+        pred_T = torch.nan_to_num(pred_T, 0.0, 1.0, 0.0).clamp(0.0, 1.0)
+
+        dt_abs_err += (pred_T[tmask] - true_delta[tmask]).abs().cpu().tolist()
         dt_true_all.append(true_delta[tmask].detach().cpu())
-        dt_pred_all.append(pred_delta[tmask].detach().cpu())
+        dt_pred_all.append(pred_T[tmask].detach().cpu())
 
-        # monotonic violations (should be ~0 with the monotonic head)
-        pdiff = pred_delta[:, 1:] - pred_delta[:, :-1]    # [B, T-1]
+        # monotonic violations (on aligned [B,T])
+        pdiff = pred_T[:, 1:] - pred_T[:, :-1]                # [B, T-1]
         pmask = tmask[:, 1:] & tmask[:, :-1]
         dt_viol_cnt += (pdiff[pmask] < 0).sum().item()
         dt_viol_den += pmask.sum().item()
