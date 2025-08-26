@@ -172,15 +172,8 @@ class GPT(nn.Module):
             if n.endswith("c_proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg["n_layer"]))
 
-        print(f"[GPT]: Total params: {self.get_num_params()/1e6:.2f} M")
-        
-        if cfg.get("compile", False):
-            if hasattr(torch, "compile"):
-                print("[GPT]: Compiling model with torch.compile()")
-                self = torch.compile(self)
-            else:
-                print("[GPT]: torch.compile() is not available in this PyTorch version. Skipping.")
-        
+        print(f"[GPT]: Total params: {self.get_num_params()/1e6:.2f} M")
+
 
     # -------------------------------------------------------- helpers ------- #
     def _init_weights(self, module):
@@ -521,7 +514,13 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = nonpad.unsqueeze(-1)            # [B,T,1] bool
-                allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool               
+                allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool
+                # Ensure at least one legal class at every non-PAD step
+                no_legal = (allowed.sum(dim=-1) == 0)  # [B,T]
+                if no_legal.any():
+                    allowed = allowed.clone()
+                    # allow PAD token in those rare steps so denominators are nonzero
+                    allowed[no_legal, model.embedder.padding_idx] = True               
 
                 # Calculate BCE loss (only valid positions) 
                 loss_bce, _ = BCEcriterion(pred_logits, multi_hot, allowed)

@@ -120,6 +120,13 @@ def phase_one(embedder, train_dl, val_dl, resume=True):
     )
 
 def phase_two(model, train_dl, val_dl, resume=True):
+    # Compile model (must be after construction)
+    if MODEL_CONFIG.get("compile", False):
+        if hasattr(torch, "compile"):
+            print("[GPT]: Compiling model with torch.compile()")
+            model = torch.compile(model)
+        else:
+            print("[GPT]: torch.compile() is not available in this PyTorch version. Skipping.")
     return train_transformer(
                         model=model, 
                         train_dl=train_dl, 
