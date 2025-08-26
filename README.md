@@ -38,6 +38,7 @@ event-prediction-in-diabetes-care/
 ├── LICENCE
 ├── CITATION.cff
 ├── setup.py
+├── pyproject.toml
 └── README.md
 ```
 
