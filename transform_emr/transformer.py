@@ -293,7 +293,7 @@ class GPT(nn.Module):
         delta_pos = delta_pos * (position_ids != self.embedder.padding_idx).to(delta_pos.dtype)[:, :delta_pos.size(1)]
         
         # Absolute time via cumulative sum (monotone-by-design)
-        csum = torch.cumsum(delta_pos, dim=1)                    # [B, T]
+        csum = torch.cumsum(delta_pos, dim=1).clamp_max(10.0)           # [B, T]
 
         # Squash to [0,1] smoothly without forcing the last step to 1
         abs_t_pred = csum / (1.0 + csum)
@@ -514,13 +514,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = nonpad.unsqueeze(-1)            # [B,T,1] bool
-                allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool
-                # Ensure at least one legal class at every non-PAD step
-                no_legal = (allowed.sum(dim=-1) == 0)  # [B,T]
-                if no_legal.any():
-                    allowed = allowed.clone()
-                    # allow PAD token in those rare steps so denominators are nonzero
-                    allowed[no_legal, model.embedder.padding_idx] = True               
+                allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool           
 
                 # Calculate BCE loss (only valid positions) 
                 loss_bce, _ = BCEcriterion(pred_logits, multi_hot, allowed)
@@ -565,18 +559,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # === Loss: Δt (time) ===
                 # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T])
-                # targets and mask
-                true_delta = batch["abs_ts"].detach().clamp(0.0, 1.0)                    # [B,T]
-                nonpad = (target_ids != model.embedder.padding_idx)              # [B,T] bool
-                pred_delta = abs_t_pred[:, 1:]                                   # [B,T] to match targets
+                true_delta = batch["abs_ts"].detach().clamp(0.0, 1.0)   # [B,T]
+                pred_delta = abs_t_pred[:, 1:]                          # [B,T]  drop CTX
 
-                # numerically safe deltas
-                pred_delta = torch.nan_to_num(pred_delta, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-
-                # single masked MSE
-                sq = (pred_delta - true_delta).pow(2)
-                den = nonpad.float().sum().clamp_min(1.0)
-                abs_t_loss = (sq * nonpad).sum() / den
+                nonpad = (target_ids != model.embedder.padding_idx)     # [B,T] bool
+                sqerr  = (pred_delta - true_delta).pow(2)               # [B,T]
+                abs_t_loss = sqerr[nonpad].sum() / nonpad.sum().clamp_min(1)
                 abs_t_loss = abs_t_loss * training_settings["phase2_dt_weight"]
 
                 # === Loss: Total Loss ===

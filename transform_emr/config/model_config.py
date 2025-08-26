@@ -16,8 +16,7 @@ MODEL_CONFIG = {
       "n_head": 8,
       "n_layer": 8,
       "dropout": 0.1,
-      "bias": True,
-      "compile": True # Allows JIT compile for the model - Better memory and speed.
+      "bias": True
     }
 
 TRAINING_SETTINGS = {
