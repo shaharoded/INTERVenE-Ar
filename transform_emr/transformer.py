@@ -507,7 +507,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # Apply masks BEFORE BCE so gradients learn legality only
                 pred_logits = apply_masks_to_logits(
-                    pred_logits, illegal_mask, bonus_mask
+                    pred_logits.clone(), illegal_mask, bonus_mask
                 )
 
                 # === Loss: BCE with logits + CE nudge ===
@@ -517,8 +517,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     padding_idx=model.embedder.padding_idx,
                     vocab_size=pred_logits.size(-1),
                     k=training_settings["bce_k_window"]
-                )
-                multi_hot = multi_hot.masked_fill(illegal_mask, 0.0) # zero‑out illegal targets, no in-place torch operation  
+                ).masked_fill(illegal_mask, 0.0) # zero‑out illegal targets, no in-place torch operation  
                 
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = nonpad.unsqueeze(-1)            # [B,T,1] bool
@@ -568,12 +567,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # === Loss: Δt (time) ===
                 # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T])
                 # targets and mask
-                true_delta = batch["abs_ts"].clamp_(0.0, 1.0)                    # [B,T]
+                true_delta = batch["abs_ts"].detach().clamp(0.0, 1.0)                    # [B,T]
                 nonpad = (target_ids != model.embedder.padding_idx)              # [B,T] bool
                 pred_delta = abs_t_pred[:, 1:]                                   # [B,T] to match targets
 
                 # numerically safe deltas
-                pred_delta = torch.nan_to_num(pred_delta, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+                pred_delta = torch.nan_to_num(pred_delta, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
                 # single masked MSE
                 sq = (pred_delta - true_delta).pow(2)
