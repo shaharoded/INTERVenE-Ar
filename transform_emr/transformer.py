@@ -321,10 +321,16 @@ class GPT(nn.Module):
         # Absolute time prediction (monotonic)
         time_feats = x[:, :-1, :] # features for t predict abs time at t+1  -> [B, T, D]
         delta_raw = self.abs_t_head(time_feats).squeeze(-1)     # [B,T]
+        
+        # Enforce non-negative deltas
         delta_pos = F.softplus(delta_raw) - math.log(2.0)
+        delta_pos = delta_pos.clamp_min(0.0)
+        
+        # Zero PAD positions
         delta_pos = delta_pos * (position_ids[:, :delta_pos.size(1)] != self.embedder.padding_idx).float()
 
-        csum = torch.cumsum(delta_pos, dim=1)    # no hard clamp
+        # Monotone accumulation and stable mapping to (0,1)
+        csum = torch.cumsum(delta_pos, dim=1)
         abs_t_pred = -torch.expm1(-csum)         # (0,1), smooth, stable, acts like: 1 - torch.exp(-csum)
 
         # prepend CTX time = 0  -> [B, T+1]
