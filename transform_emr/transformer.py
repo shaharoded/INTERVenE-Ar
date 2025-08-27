@@ -323,8 +323,7 @@ class GPT(nn.Module):
         delta_raw = self.abs_t_head(time_feats).squeeze(-1)     # [B,T]
         
         # Enforce non-negative deltas
-        delta_pos = F.softplus(delta_raw) - math.log(2.0)
-        delta_pos = delta_pos.clamp_min(0.0)
+        delta_pos = F.softplus(delta_raw)
         
         # Zero PAD positions
         delta_pos = delta_pos * (position_ids[:, :delta_pos.size(1)] != self.embedder.padding_idx).float()
