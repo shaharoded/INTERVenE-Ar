@@ -33,6 +33,7 @@ class LayerNorm(nn.Module):
         return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
+# ───────── components ─────────────────────────────────────────────────────────── #
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention (no rotary/ALiBi; same math as GPT-2)."""
 
@@ -61,23 +62,41 @@ class CausalSelfAttention(nn.Module):
         attn_weights = F.softmax(scores, dim=-1)
         return torch.matmul(attn_weights, v)
     
-    def forward(self, x):
+    def forward(self, x, key_pad_mask=None):
         B, T, C = x.shape
-        qkv = self.qkv(x).view(B, T, self.n_head, 3 * (C // self.n_head))
-        q, k, v = qkv.chunk(3, dim=-1)   # (B, T, h, d)
+        qkv = self.qkv(x)                      # [B, T, 3C]
+        q, k, v = qkv.split(C, dim=-1)         # each [B, T, C]
 
-        # PyTorch 2.1 optimized attention OR fallback
+        # -- reshape to (B, h, T, d) so SDPA attends along time --
+        hd = C // self.n_head
+        q = q.view(B, T, self.n_head, hd).permute(0, 2, 1, 3).contiguous()
+        k = k.view(B, T, self.n_head, hd).permute(0, 2, 1, 3).contiguous()
+        v = v.view(B, T, self.n_head, hd).permute(0, 2, 1, 3).contiguous()
+
+        # boolean key mask: True==keep, False==pad → convert to "mask these keys"
+        attn_mask = None
+        if key_pad_mask is not None:
+            # key_pad_mask: [B, T] (includes CTX=True at col 0)
+            attn_mask = (~key_pad_mask).unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T], True means "mask"
+
         if hasattr(F, "scaled_dot_product_attention"):
             attn = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=None,
+                attn_mask=attn_mask,
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
                 is_causal=True
-            )
+            )  # -> [B, h, T, d]
         else:
-            attn = self._scaled_dot_product_attention(q, k, v)
+            # fallback keeps shapes consistent with (B,h,T,d)
+            d_k = q.size(-1)
+            scores = (q @ k.transpose(-2, -1)) / math.sqrt(d_k)     # [B,h,T,T]
+            if attn_mask is not None:
+                scores = scores.masked_fill(attn_mask, float("-inf"))
+            p = F.softmax(scores, dim=-1)
+            attn = p @ v                                           # [B,h,T,d]
 
-        y = self.proj(attn.reshape(B, T, C))
+        y = attn.transpose(1, 2).contiguous().view(B, T, C)         # -> [B, T, C]
+        y = self.proj(y)
         return self.resid_dropout(y)
 
 
@@ -101,9 +120,9 @@ class Block(nn.Module):
         self.ln2 = LayerNorm(cfg["embed_dim"], bias=cfg["bias"])
         self.mlp = MLP(cfg)
 
-    def forward(self, x):
+    def forward(self, x, key_pad_mask=None):
         res_scale = 1 / math.sqrt(2 * self.cfg["n_layer"])
-        x = x + res_scale * self.att(self.ln1(x))
+        x = x + res_scale * self.att(self.ln1(x), key_pad_mask=key_pad_mask)
         x = x + res_scale * self.mlp(self.ln2(x))
         return x
 
@@ -267,18 +286,34 @@ class GPT(nn.Module):
               - abs_t_pred[:, 0] == 0.0 is the [CTX] slot
               - training uses abs_t_pred[:, 1:] to align with targets of length T
         """
-        def _forward(block, x):
+        def _forward(block, x, mask):
             """Allows gradient checkpointing on blocks -> Memory efficient"""
-            return block(x)
-        
-        x = self.drop(self.embedder(raw_concept_ids, concept_ids, value_ids, position_ids,
-            abs_ts, context_vec, return_mask=False))  # (B, T+1, D)
+            return block(x, key_pad_mask=mask)
+
+        seq, emb_mask = self.embedder(raw_concept_ids, concept_ids, value_ids, position_ids,
+            abs_ts, context_vec, return_mask=True)
+        x = self.drop(seq)  # (B, T+1, D)
+
+        B, Tp1, D = x.shape
+        assert emb_mask.shape == (B, Tp1), "embedder mask must be [B, T+1]"
+        assert emb_mask[:, 0].all(), "[CTX] slot must be True in embedder mask"
+
+        # make a T+1 mask from the batch's position_ids (T) by prepending CTX=True
+        pad_id = self.embedder.padding_idx
+        pad_mask_ctx = torch.cat(
+            [torch.ones(B, 1, dtype=torch.bool, device=x.device),
+            (position_ids != pad_id)], dim=1
+        )  # [B, T+1]
+
+        # they must match
+        assert torch.equal(emb_mask, pad_mask_ctx), \
+            "Embedder mask and (CTX+position_ids)-derived mask disagree — off-by-one or CTX wiring issue"
         
         for blk in self.blocks:
             if self.training and self.use_checkpoint:
-                x = checkpoint.checkpoint(_forward, blk, x, use_reentrant=False)
+                x = checkpoint.checkpoint(_forward, blk, x, pad_mask_ctx, use_reentrant=False)
             else:
-                x = blk(x)
+                x = blk(x, key_pad_mask=pad_mask_ctx)
         
         x = self.ln_f(x)                     # [B, T+1, D]
         logits = self.lm_head(x)             # [B, T+1, V]
@@ -553,12 +588,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # === Loss: Δt (time) ===
                 # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T])
-                true_delta = batch["abs_ts"].detach().clamp(0.0, 1.0)   # [B,T]
-                pred_delta = abs_t_pred[:, 1:]                          # [B,T]  drop CTX
-
+                true_abs = batch["abs_ts"].detach().clamp(0.0, 1.0)   # [B,T]
+                pred_abs = abs_t_pred[:, 1:]                          # [B,T]  drop CTX
                 nonpad = (target_ids != model.embedder.padding_idx)     # [B,T] bool
-                sqerr  = (pred_delta - true_delta).pow(2)               # [B,T]
-                abs_t_loss = sqerr[nonpad].sum() / nonpad.sum().clamp_min(1)
+
+                abs_t_loss = F.mse_loss(pred_abs[nonpad], true_abs[nonpad], reduction="mean")
                 lambda_time = linear_schedule(
                     epoch,
                     training_settings['warmup_epochs'],
