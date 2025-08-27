@@ -280,23 +280,17 @@ class GPT(nn.Module):
             else:
                 x = blk(x)
         
-        x = self.ln_f(x)
-        logits = self.lm_head(x)            # (B, T+1, V)
+        x = self.ln_f(x)                     # [B, T+1, D]
+        logits = self.lm_head(x)             # [B, T+1, V]
 
         # Absolute time prediction (monotonic)
-        delta_raw = self.abs_t_head(x[:, 1:, :]).squeeze(-1)     # [B, T]
-        # Non-negative deltas with exact-zero option and good gradient at 0
-        # softplus(0) = ln(2); so softplus(z) - ln(2) == 0 when z==0
-        delta_pos = F.softplus(delta_raw) - math.log(2.0)        # [B, T]  ≥ 0
+        time_feats = x[:, :-1, :] # features for t predict abs time at t+1  -> [B, T, D]
+        delta_raw = self.abs_t_head(time_feats).squeeze(-1)     # [B,T]
+        delta_pos = F.softplus(delta_raw) - math.log(2.0)
+        delta_pos = delta_pos * (position_ids[:, :delta_pos.size(1)] != self.embedder.padding_idx).float()
 
-        # Drop PAD deltas *before* cum-sum
-        delta_pos = delta_pos * (position_ids != self.embedder.padding_idx).to(delta_pos.dtype)[:, :delta_pos.size(1)]
-        
-        # Absolute time via cumulative sum (monotone-by-design)
-        csum = torch.cumsum(delta_pos, dim=1).clamp_max(10.0)           # [B, T]
-
-        # Squash to [0,1] smoothly without forcing the last step to 1
-        abs_t_pred = csum / (1.0 + csum)
+        csum = torch.cumsum(delta_pos, dim=1)    # no hard clamp
+        abs_t_pred = -torch.expm1(-csum)         # (0,1), smooth, stable, acts like: 1 - torch.exp(-csum)
 
         # prepend CTX time = 0  -> [B, T+1]
         abs_t_pred = torch.cat([torch.zeros_like(abs_t_pred[:, :1]), abs_t_pred], dim=1)
@@ -565,7 +559,12 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 nonpad = (target_ids != model.embedder.padding_idx)     # [B,T] bool
                 sqerr  = (pred_delta - true_delta).pow(2)               # [B,T]
                 abs_t_loss = sqerr[nonpad].sum() / nonpad.sum().clamp_min(1)
-                abs_t_loss = abs_t_loss * training_settings["phase2_dt_weight"]
+                lambda_time = linear_schedule(
+                    epoch,
+                    training_settings['warmup_epochs'],
+                    training_settings["phase2_dt_weight"]
+                )
+                abs_t_loss = abs_t_loss * lambda_time
 
                 # === Loss: Total Loss ===
                 loss = loss_bce + generative_penalty + abs_t_loss
