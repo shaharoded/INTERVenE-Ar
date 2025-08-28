@@ -38,6 +38,66 @@ def _embedder_seq(model, batch):
     return emb  # [B, T+1, D]
 
 
+def _guess_families(tokenizer, max_groups: int = 8):
+    """
+    Select up to `max_groups` RawConcept families by corpus prevalence,
+    where a family = all PositionTokens that share the same RawConcept.
+
+    We compute family mass by summing token_counts over PositionTokens that
+    belong to that RawConcept (no heuristics).
+    """
+    # Convenience handles from tokenizer
+    id2tok    = tokenizer.id2token              # PositionToken string per vid
+    counts    = tokenizer.token_counts          # occurrences per PositionToken vid (tensor)
+    rawcons   = list(tokenizer.rawconcept2id)   # RawConcept vocabulary (strings)
+
+    # Special tokens to ignore
+    specials = {
+        tokenizer.pad_token_id,
+        getattr(tokenizer, "mask_token_id", -1),
+        getattr(tokenizer, "null_token_id", -1),
+        getattr(tokenizer, "ctx_token_id", -1),
+    }
+    special_tokens = {id2tok[vid] for vid in specials if vid in id2tok}
+
+    # Helper: does PositionToken 'tok' belong to RawConcept 'rc'?
+    # (PositionToken strings are built from ConceptName/Value with optional _START/_END.)
+    def _belongs(tok: str, rc: str) -> bool:
+        if tok in special_tokens:
+            return False
+        # strip trailing START/END tag (if present)
+        if tok.endswith("_START"):
+            core = tok[:-6]
+        elif tok.endswith("_END"):
+            core = tok[:-4]
+        else:
+            core = tok
+        # RawConcept is exactly the ConceptName without trailing _STATE/_TREND
+        # PositionToken always begins with ConceptName; thus rc must be a prefix of core
+        # and aligned at token boundary (rc + "_" or exact match).
+        return core == rc or core.startswith(rc + "_")
+
+    # Aggregate counts per RawConcept
+    family_mass = []
+    for rc in rawcons:
+        # Skip specials if they ever appear as raw concepts
+        if rc in ("[PAD]", "[MASK]", "[NULL]", "[CTX]"):
+            continue
+        tot = 0
+        # Loop over all PositionTokens; sum counts if they belong to rc
+        # (counts is a tensor aligned with id2tok indices)
+        for vid, tok in id2tok.items():
+            if _belongs(tok, rc):
+                tot += int(counts[vid].item())
+        if tot > 0:
+            family_mass.append((rc, tot))
+
+    # Sort by prevalence and take the top groups
+    family_mass.sort(key=lambda x: -x[1])
+    families = [rc for rc, _ in family_mass[:max_groups]]
+    return families
+
+
 # ======================================================================
 # 1) VOCAB CLEANUP / CONFUSION REPORT
 # ======================================================================
@@ -198,6 +258,112 @@ def vocab_cleanup_report(
     }
 
 
+@torch.enable_grad()
+def token_gradient_utility_report(
+    model, data_loader, k_window=12, max_batches=3, device=None
+):
+    """
+    Aggregates ||grad||^2 on position_embed.weight[v] under your teacher-forced BCE
+    (with the same masking) to score each token's training utility.
+    Returns a list of dict rows sorted by 'grad_per_occ'.
+    """
+    model.train()  # we need autograd, but no optimizer step
+    if device is None:
+        device = next(model.parameters()).device
+    tk = model.embedder.tokenizer
+    V  = len(tk.token2id)
+
+    # Accumulators
+    grad_sq = torch.zeros(V, device=device)
+    occ     = torch.zeros(V, device=device)
+
+    # Build the same LUTs & criterion you use in training
+    from transform_emr.utils import (build_luts, get_multi_hot_targets,
+                                     compute_legality_masks_tf, apply_masks_to_logits)
+    from transform_emr.loss import MaskedFocalBCE
+
+    luts = build_luts(tk)
+    for k, v in list(luts.items()):
+        if torch.is_tensor(v): luts[k] = v.to(device)
+
+    crit = MaskedFocalBCE.from_counts(
+        counts=tk.token_counts, token_weights=tk.token_weights,
+        beta=0.999, min_count=5, clip_max=8.0,
+        gamma=1.2, tau=0.85, neg_bounds=(0.02, 0.20),
+        label_smoothing=0.0, hard_neg_k=0
+    ).to(device)
+
+    # Make sure previous grads are clear
+    for p in model.parameters(): 
+        if p.grad is not None: p.grad = None
+
+    batches = 0
+    for batch in data_loader:
+        batches += 1
+        if batches > max_batches: break
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        logits, _ = model(**{
+            "raw_concept_ids": batch["raw_concept_ids"],
+            "concept_ids":     batch["concept_ids"],
+            "value_ids":       batch["value_ids"],
+            "position_ids":    batch["position_ids"],
+            "abs_ts":          batch["abs_ts"],
+            "context_vec":     batch["context_vec"],
+        })
+
+        pred_logits = logits[:, 1:, :]                      # [B,T,V]
+        target_ids  = batch["targets"]                      # [B,T]
+        illegal, bonus = compute_legality_masks_tf(
+            target_ids, luts["is_start"], luts["is_end"], luts["base_id"],
+            luts["start_ids_per_base"], luts["end_ids_per_base"],
+            luts["meal_rank"], luts["meal_pred_rank"], luts["K_meals"],
+            luts["conflict_mat"], luts["predict_block"]
+        )
+        pred_logits = apply_masks_to_logits(pred_logits, illegal, bonus)
+        nonpad = (target_ids != tk.pad_token_id)
+        allowed = (~illegal) & nonpad.unsqueeze(-1)
+
+        multi_hot = get_multi_hot_targets(
+            position_ids=target_ids, padding_idx=tk.pad_token_id,
+            vocab_size=pred_logits.size(-1), k=k_window
+        ).masked_fill(illegal, 0.0)
+
+        # teacher-forced loss
+        loss, _ = crit(pred_logits, multi_hot, allowed)
+        loss.backward()
+
+        # accumulate squared grad on position embeddings
+        W = model.embedder.position_embed.weight  # [V,D]
+        if W.grad is not None:
+            grad_sq += (W.grad.detach() ** 2).sum(dim=1)
+        # occurrences in batch (targets side)
+        ids = target_ids[nonpad]
+        if ids.numel(): 
+            occ.index_add_(0, ids, torch.ones_like(ids, dtype=occ.dtype))
+        # clear grads for next mini-batch
+        for p in model.parameters():
+            if p.grad is not None: p.grad.zero_()
+
+    # scores
+    grad_sq = grad_sq.cpu()
+    occ = occ.cpu().clamp(min=1)
+    score = (grad_sq / occ).numpy()   # grad per occurrence
+
+    rows = []
+    id2tok = tk.id2token
+    for vid in range(V):
+        rows.append({"token": id2tok[vid], "vid": vid,
+                     "occ": int(occ[vid].item()),
+                     "grad_sq": float(grad_sq[vid].item()),
+                     "grad_per_occ": float(score[vid])})
+    rows.sort(key=lambda r: -r["grad_per_occ"])
+    print("\n[Token utility] top by grad_per_occ")
+    for r in rows[:40]:
+        print(f"{r['token']:<45} occ={r['occ']:<6} grad/occ={r['grad_per_occ']:.4e}")
+    return rows
+
+
 # ======================================================================
 # 2) EMBEDDER QUALITY: PROBE + CLUSTERING
 # ======================================================================
@@ -207,7 +373,7 @@ def embedder_representation_report(
     data_loader,
     horizon: int = 12,
     max_batches_probe: int = 4,
-    families: Optional[List[str]] = None,
+    n_families: int = 8,
     device: Optional[torch.device] = None,
 ) -> Dict[str, float]:
     """
@@ -226,7 +392,8 @@ def embedder_representation_report(
     if device is None:
         device = next(model.parameters()).device
     tk = model.embedder.tokenizer
-    id2tok = tk.id2token
+    families = _guess_families(tk, max_groups=n_families)
+    print(f"[embedder] evaluating families (RawConcepts): {', '.join(families)}")
 
     # ----- A) short-horizon probe on embedder output -----
     # build a small dataset of (x_t, y_t)
@@ -339,6 +506,23 @@ def embedder_representation_report(
             print(f"  {tok:>40} -> {neigh}")
 
     return {"probe_roc_auc": roc_auc, "probe_pr_auc": pr_auc, **report}
+
+
+def embed_norm_vs_freq_plot(model):
+    import matplotlib.pyplot as plt
+    tk = model.embedder.tokenizer
+    W  = model.embedder.position_embed.weight.detach().cpu()
+    norms = W.norm(dim=1).numpy()
+    freq  = np.array([tk.token_counts.get(tk.id2token[i], 0) for i in range(len(tk.token2id))])
+    plt.figure()
+    plt.scatter(np.log1p(freq), norms, s=6, alpha=0.5)
+    plt.xlabel("log(1+freq)"); plt.ylabel("||embedding||2")
+    plt.title("Position-embedding norm vs frequency")
+    # label a few outliers
+    idx = np.argsort(norms)[-20:]
+    for i in idx:
+        plt.text(np.log1p(freq[i]), norms[i], tk.id2token[i], fontsize=6, alpha=0.7)
+    plt.show()
 
 
 # ======================================================================
@@ -701,3 +885,90 @@ def transformer_training_report(
         "pen_end_no_open": pen_end_no_open, "pen_dup_start": pen_dup,
         "pen_conflict": pen_cnf, "pen_unclosed": pen_unclosed,
     }
+
+
+
+if __name__ == "__main__":
+    """
+    Diagnostics suite on a validation slice.
+
+    You’ll get:
+      1) Transformer training report — BCE breakdown, set-mass (mean/p90), top-k,
+         illegal temptation, Δt metrics
+      2) Embedder representation report — linear probe + cosine neighbors per RawConcept family
+      3) Vocab cleanup report — frequent-noisy & rare-unlearned candidates
+      4) (Optional) Token gradient-utility & norm-vs-frequency (if present)
+    """
+    import torch
+    from transform_emr.config.model_config import TRAINING_SETTINGS, EMBEDDER_CHECKPOINT, TRANSFORMER_CHECKPOINT
+    from transform_emr.dataset import EMRTokenizer, EMRDataset, get_dataloader, collate_emr
+    from transform_emr.embedder import EMREmbedding
+    from transform_emr.transformer import GPT
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # -- Load tokenizer / models --
+    print("\n[0] Loading tokenizer / embedder / GPT …")
+    tok = EMRTokenizer.load()
+    embedder, *_ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=tok, map_location=device)
+    gpt, *_ = GPT.load(TRANSFORMER_CHECKPOINT, embedder=embedder, map_location=device)
+    gpt.to(device).eval()
+    print("    ✓ Loaded")
+
+    # -- Build validation DataLoader (reuse your training split code) --
+    # NOTE: Replace the next block with your actual val loader construction:
+    # ds_val = EMRDataset(processed_df_val, context_df_val, tok)
+    # val_dl = get_dataloader(ds_val, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False)
+    raise SystemExit("Fill in your validation dataloader construction and rerun.")
+
+    # 1) Transformer report
+    print("\n[1] Transformer training report — look for BCE breakdown, set-mass (mean/p90), top-k,"
+          " illegal mass (pre-mask), and Δt quality (MAE, R², violations).")
+    transformer_training_report(
+        model=gpt,
+        data_loader=val_dl,
+        training_settings={
+            **TRAINING_SETTINGS,
+            "gamma": 1.2, "tau": 0.85, "neg_bounds": (0.02, 0.20), "hard_neg_k": 0,
+        },
+        max_batches=3,
+        device=device,
+    )
+
+    # 2) Embedder report (families = RawConcepts)
+    print("\n[2] Embedder representation report — PR-AUC ≥ ~0.70 @ horizon suggests healthy learning;"
+          " neighbors should cluster within each RawConcept family.")
+    print(f"    Families (RawConcepts): {', '.join(fams)}")
+    embedder_representation_report(
+        model=gpt,
+        data_loader=val_dl,
+        horizon=TRAINING_SETTINGS["bce_k_window"],
+        max_batches_probe=2,
+        n_families=8,
+        device=device,
+    )
+
+    # 3) Vocab cleanup
+    print("\n[3] Vocab cleanup report — focus on 'frequent_noisy' (merge/bucket/move-to-context)"
+          " and 'rare_unlearned' (drop/merge).")
+    vocab_cleanup_report(
+        model=gpt,
+        data_loader=val_dl,
+        k_window=TRAINING_SETTINGS["bce_k_window"],
+        max_batches=3,
+        topn=40,
+        device=device,
+        freq_thresh=500, conf_thresh=0.15, ent_thresh=0.70,
+    )
+
+    # 4) (Optional) If you added these helpers, uncomment to run:
+    print("\n[4] Token gradient-utility — high grad/occ ⇒ impactful; very low grad/occ with high frequency ⇒ likely noise.")
+    token_gradient_utility_report(
+        model=gpt, data_loader=val_dl,
+        k_window=TRAINING_SETTINGS["bce_k_window"], max_batches=3, device=device,
+        training_settings={"gamma": 1.2, "tau": 0.85, "neg_bounds": (0.02, 0.20), "hard_neg_k": 0},
+        topn=40,
+    )
+    embed_norm_vs_freq_plot(gpt)  # quick outlier scatter (if present)
+
+
