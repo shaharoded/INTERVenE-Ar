@@ -255,15 +255,27 @@ class GPT(nn.Module):
         Returns:
             torch.optim.lr_scheduler.OneCycleLR: Configured learning rate scheduler.
         """
+        # derive warmup fraction from warmup_epochs
+        total_epochs = training_settings["phase2_n_epochs"]
+        warmup_epochs = training_settings["warmup_epochs"]
+        pct = max(1e-6, min(0.9, warmup_epochs / float(total_epochs)))  # e.g., 5/100 = 0.05
+
+        # match max_lr list to your 3 param groups: decay, no_decay, embedder(0.1x)
+        base_lr = training_settings["phase2_learning_rate"]
+        max_lrs = [base_lr, base_lr, base_lr * 0.1]
+
         return torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=training_settings["phase2_learning_rate"],
-            total_steps=training_settings["phase2_n_epochs"] * len(train_dl),
-            pct_start=0.2,
+            max_lr=max_lrs,                         # list per group
+            epochs=total_epochs,                    # prefer epochs+steps_per_epoch to total_steps
+            steps_per_epoch=len(train_dl),
+            pct_start=pct,                          # warm-up exactly = warmup_epochs
             anneal_strategy="cos",
-            div_factor  = 10,       # ← start‑LR = LR / 10
-            final_div_factor = 10,  # floor‑LR = 1e‑5 as well (cos tail reaches this)
+            cycle_momentum=False,                   # important for AdamW
+            div_factor=10,                          # init LR = max_lr/10
+            final_div_factor=20,                    # floor‑LR = 1e‑5 as well (cos tail reaches this)
         )
+    
 
     # ---------------------------------------------------- forward & loss ---- #
     def forward(self, raw_concept_ids, concept_ids, value_ids, position_ids,
@@ -528,7 +540,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     logits_pre_mask=pred_logits,
                     illegal_mask=illegal_mask,
                     nonpad_mask=nonpad,
-                    margin=0.02,           # good starting point (see notes)
+                    margin=0.03,
                     power=1.0
                 )
 
@@ -585,10 +597,11 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Average the penalties to bound in [0, 1]
                 lambda_pen = linear_schedule(
                     epoch,
-                    training_settings['warmup_epochs'],
+                    training_settings['warmup_epochs'] + 2, # Longer ramp-up, heuristic.
                     training_settings["phase2_penalty_weight"]
                 )
-                generative_penalty = (p_illegal + p_struct + p_meal) / 3.0
+                # A little more agressive on teaching against illegal steps, heuristic.
+                generative_penalty = (2 * p_illegal + p_struct + p_meal) / 4.0
                 generative_penalty = lambda_pen * generative_penalty
 
                 # === Loss: Δt (time) ===

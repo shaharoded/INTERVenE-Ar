@@ -1041,7 +1041,7 @@ def soft_illegal_mass_penalty(
     logits_pre_mask: torch.Tensor,    # [B,T,V] BEFORE apply_masks_to_logits
     illegal_mask: torch.Tensor,       # [B,T,V] booleans from compute_legality_masks_tf
     nonpad_mask: torch.Tensor,        # [B,T]   booleans (targets != PAD)
-    margin: float = 0.02,             # small safety margin; set 0 to disable
+    margin: float = 0.03,             # small safety margin; set 0 to disable
     power: float = 1.0                # >1 accentuates heavy offenders
 ) -> torch.Tensor:
     """
