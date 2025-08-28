@@ -273,7 +273,7 @@ class GPT(nn.Module):
             anneal_strategy="cos",
             cycle_momentum=False,                   # important for AdamW
             div_factor=10,                          # init LR = max_lr/10
-            final_div_factor=20,                    # floor‑LR = 1e‑5 as well (cos tail reaches this)
+            final_div_factor=10,                    # floor‑LR = 1e‑5 as well (cos tail reaches this)
         )
     
 
@@ -442,9 +442,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
-        gamma=1.2,         # focal strength
+        gamma=1.3,         # focal strength
         tau=0.85,           # pos/neg balance anchor
-        neg_bounds=(0.02, 0.2),   # clamp for stability
+        neg_bounds=(0.05, 0.3),   # clamp for stability
         label_smoothing=0.0,     # optional
         hard_neg_k=0            # or e.g., 64 for hard-neg mining
     ).to(device)
@@ -540,7 +540,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     logits_pre_mask=pred_logits,
                     illegal_mask=illegal_mask,
                     nonpad_mask=nonpad,
-                    margin=0.03,
+                    margin=0.035,
                     power=1.0
                 )
 
@@ -597,7 +597,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Average the penalties to bound in [0, 1]
                 lambda_pen = linear_schedule(
                     epoch,
-                    training_settings['warmup_epochs'] + 2, # Longer ramp-up, heuristic.
+                    training_settings['warmup_epochs'],
                     training_settings["phase2_penalty_weight"]
                 )
                 # A little more agressive on teaching against illegal steps, heuristic.

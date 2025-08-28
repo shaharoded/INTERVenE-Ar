@@ -32,7 +32,7 @@ def _embedder_seq(model, batch):
         value_ids=batch["value_ids"],
         position_ids=batch["position_ids"],
         abs_ts=batch["abs_ts"],
-        context_vec=batch["context_vec"],
+        patient_contexts=batch["context_vec"],
         return_mask=False,
     )
     return emb  # [B, T+1, D]
@@ -96,6 +96,48 @@ def _guess_families(tokenizer, max_groups: int = 8):
     family_mass.sort(key=lambda x: -x[1])
     families = [rc for rc, _ in family_mass[:max_groups]]
     return families
+
+
+def _counts_as_tensor(tk, V: int, device: torch.device) -> torch.Tensor:
+    """
+    Return token_counts as a float tensor of length V on device,
+    handling dict/np/list/tensor variants.
+    """
+    obj = getattr(tk, "token_counts", None)
+    if obj is None:
+        return torch.zeros(V, device=device)
+    if isinstance(obj, dict):
+        out = torch.zeros(V, device=device, dtype=torch.float32)
+        id2tok = getattr(tk, "id2token", None)
+        for i in range(V):
+            tok = id2tok[i] if id2tok is not None else str(i)
+            out[i] = float(obj.get(tok, 0))
+        return out
+    if torch.is_tensor(obj):
+        c = obj.to(device).float().flatten()
+        return c[:V] if c.numel() >= V else torch.cat([c, torch.zeros(V - c.numel(), device=device)], 0)
+    if isinstance(obj, (list, tuple, np.ndarray)):
+        c = torch.as_tensor(obj, device=device, dtype=torch.float32).flatten()
+        return c[:V] if c.numel() >= V else torch.cat([c, torch.zeros(V - c.numel(), device=device)], 0)
+    return torch.zeros(V, device=device)
+
+def _count_for_token(tk, vid: int) -> int:
+    """
+    Return integer count for a single token id `vid`, regardless of
+    tokenizer.token_counts' type (dict/tensor/np/list).
+    """
+    obj = getattr(tk, "token_counts", None)
+    if obj is None:
+        return 0
+    if isinstance(obj, dict):
+        tok = tk.id2token[vid]
+        return int(obj.get(tok, 0))
+    if torch.is_tensor(obj):
+        return int(obj.flatten()[vid].item())
+    if isinstance(obj, (list, tuple, np.ndarray)):
+        arr = np.array(obj).reshape(-1)
+        return int(arr[vid]) if vid < arr.size else 0
+    return 0
 
 
 # ======================================================================
@@ -224,7 +266,7 @@ def vocab_cleanup_report(
         rows.append({
             "token": tok,
             "vid": vid,
-            "freq": tk.token_counts.get(tok, 0),
+            "freq": _count_for_token(tk, vid),
             "occ": int(occ_cpu[vid]),
             "avg_conf": float(conf_cpu[vid]),
             "top1": float(top1_cpu[vid]),
@@ -470,12 +512,23 @@ def embedder_representation_report(
     En = F.normalize(E, dim=1)
     tokens = tk.id2token
 
-    # default families if none provided
-    if not families:
-        families = ["MEAL_", "GLUCOSE_", "ANTIBIOTIC", "BLOOD_PRESSURE", "SODIUM_"]
+    # family membership by RawConcept
+    special_ids = {
+        getattr(tk, "pad_token_id", -1),
+        getattr(tk, "mask_token_id", -1),
+        getattr(tk, "ctx_token_id", -1),
+        getattr(tk, "null_token_id", -1),
+    }
+    def _belongs_to_rawconcept(tok: str, rc: str) -> bool:
+        if tok in {tk.id2token[i] for i in special_ids if i in tk.id2token}:
+            return False
+        if tok.endswith("_START"): core = tok[:-6]
+        elif tok.endswith("_END"): core = tok[:-4]
+        else: core = tok
+        return (core == rc) or core.startswith(rc + "_")
 
-    def family_ids(prefix: str) -> List[int]:
-        return [i for i, t in tokens.items() if t.startswith(prefix)]
+    def family_ids(rawconcept: str) -> List[int]:
+        return [i for i, t in tokens.items() if _belongs_to_rawconcept(t, rawconcept)]
 
     def mean_cos(idsA: List[int], idsB: List[int]) -> float:
         if not idsA or not idsB: return float("nan")
@@ -513,7 +566,7 @@ def embed_norm_vs_freq_plot(model):
     tk = model.embedder.tokenizer
     W  = model.embedder.position_embed.weight.detach().cpu()
     norms = W.norm(dim=1).numpy()
-    freq  = np.array([tk.token_counts.get(tk.id2token[i], 0) for i in range(len(tk.token2id))])
+    freq  = np.array([_count_for_token(tk, i) for i in range(len(tk.token2id))])
     plt.figure()
     plt.scatter(np.log1p(freq), norms, s=6, alpha=0.5)
     plt.xlabel("log(1+freq)"); plt.ylabel("||embedding||2")
@@ -609,9 +662,9 @@ def transformer_training_report(
         beta=training_settings.get("beta", 0.999),
         min_count=training_settings.get("min_count", 5),
         clip_max=training_settings.get("clip_max", 8.0),
-        gamma=training_settings.get("gamma", 1.2),
+        gamma=training_settings.get("gamma", 1.3),
         tau=training_settings.get("tau", 0.85),
-        neg_bounds=training_settings.get("neg_bounds", (0.02, 0.2)),
+        neg_bounds=training_settings.get("neg_bounds", (0.05, 0.3)),
         label_smoothing=training_settings.get("label_smoothing", 0.0),
         hard_neg_k=training_settings.get("hard_neg_k", 0),
     ).to(device)
@@ -938,7 +991,6 @@ if __name__ == "__main__":
     # 2) Embedder report (families = RawConcepts)
     print("\n[2] Embedder representation report — PR-AUC ≥ ~0.70 @ horizon suggests healthy learning;"
           " neighbors should cluster within each RawConcept family.")
-    print(f"    Families (RawConcepts): {', '.join(fams)}")
     embedder_representation_report(
         model=gpt,
         data_loader=val_dl,
@@ -957,17 +1009,14 @@ if __name__ == "__main__":
         k_window=TRAINING_SETTINGS["bce_k_window"],
         max_batches=3,
         topn=40,
-        device=device,
-        freq_thresh=500, conf_thresh=0.15, ent_thresh=0.70,
+        device=device
     )
 
     # 4) (Optional) If you added these helpers, uncomment to run:
     print("\n[4] Token gradient-utility — high grad/occ ⇒ impactful; very low grad/occ with high frequency ⇒ likely noise.")
     token_gradient_utility_report(
         model=gpt, data_loader=val_dl,
-        k_window=TRAINING_SETTINGS["bce_k_window"], max_batches=3, device=device,
-        training_settings={"gamma": 1.2, "tau": 0.85, "neg_bounds": (0.02, 0.20), "hard_neg_k": 0},
-        topn=40,
+        k_window=TRAINING_SETTINGS["bce_k_window"], max_batches=3, device=device
     )
     embed_norm_vs_freq_plot(gpt)  # quick outlier scatter (if present)
 
