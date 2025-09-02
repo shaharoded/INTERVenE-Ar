@@ -478,6 +478,11 @@ def embedder_representation_report(
     X = torch.stack(X, dim=0)           # [N, D]
     Y = torch.tensor(Y, device=device, dtype=torch.float32)  # [N]
 
+    # --- prevalence baseline for PR-AUC interpretation ---
+    prevalence = float(Y.mean().item())
+    print(f"[Probe@h={horizon}] prevalence={prevalence:.4f} "
+        f"(PR-AUC baseline = {prevalence:.4f})")
+
     # tiny logistic probe
     W = torch.zeros(X.size(1), 1, device=device, requires_grad=True)
     b = torch.zeros(1, device=device, requires_grad=True)
@@ -541,13 +546,18 @@ def embedder_representation_report(
                if i not in (tk.pad_token_id, tk.mask_token_id, tk.ctx_token_id, tk.null_token_id)]
     inter = mean_cos(all_ids, all_ids)
 
+    rows = []
     for fam in families:
         ids = family_ids(fam)
         if not ids:
             continue
         intra = mean_cos(ids, ids)
+
         report[f"{fam}intra_cos"] = intra
         report[f"{fam}inter_cos"] = inter
+        if intra is None or inter is None: 
+            continue
+        rows.append((fam, intra, inter, intra - inter))
         # nearest neighbors for first few ids
         base = En[ids[: min(5, len(ids))]]
         sims = (base @ En.t())
@@ -557,6 +567,12 @@ def embedder_representation_report(
             tok = tokens[ids[i]]
             neigh = [tokens[j] for j in row[1:6]]
             print(f"  {tok:>40} -> {neigh}")
+    if rows:
+        rows.sort(key=lambda r: r[3])  # most worrying (intra<inter) first
+        print("\n[Family cohesion Δ = intra - inter]  (lower is worse)")
+        print("raw_concept".ljust(32), "intra".rjust(8), "inter".rjust(8), "Δ".rjust(8))
+        for fam, intra, inter, d in rows:
+            print(f"{fam.ljust(32)} {intra:8.3f} {inter:8.3f} {d:8.3f}")
 
     return {"probe_roc_auc": roc_auc, "probe_pr_auc": pr_auc, **report}
 
