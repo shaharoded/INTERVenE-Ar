@@ -444,7 +444,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         beta=0.999, min_count=5, clip_max=8.0,
         gamma=1.3,         # focal strength
         tau=0.85,           # pos/neg balance anchor
-        neg_bounds=(0.05, 0.3),   # clamp for stability
+        neg_bounds=(0.03, 0.3),   # clamp for stability
         label_smoothing=0.0,     # optional
         hard_neg_k=0            # or e.g., 64 for hard-neg mining
     ).to(device)
@@ -540,7 +540,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     logits_pre_mask=pred_logits,
                     illegal_mask=illegal_mask,
                     nonpad_mask=nonpad,
-                    margin=0.035,
+                    margin=0.04,
                     power=1.0
                 )
 

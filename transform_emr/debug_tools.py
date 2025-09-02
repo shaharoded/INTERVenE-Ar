@@ -331,7 +331,7 @@ def token_gradient_utility_report(
     crit = MaskedFocalBCE.from_counts(
         counts=tk.token_counts, token_weights=tk.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
-        gamma=1.2, tau=0.85, neg_bounds=(0.02, 0.20),
+        gamma=1.3, tau=0.85, neg_bounds=(0.03, 0.30),
         label_smoothing=0.0, hard_neg_k=0
     ).to(device)
 
@@ -664,7 +664,7 @@ def transformer_training_report(
         clip_max=training_settings.get("clip_max", 8.0),
         gamma=training_settings.get("gamma", 1.3),
         tau=training_settings.get("tau", 0.85),
-        neg_bounds=training_settings.get("neg_bounds", (0.05, 0.3)),
+        neg_bounds=training_settings.get("neg_bounds", (0.03, 0.3)),
         label_smoothing=training_settings.get("label_smoothing", 0.0),
         hard_neg_k=training_settings.get("hard_neg_k", 0),
     ).to(device)
@@ -945,7 +945,7 @@ if __name__ == "__main__":
     """
     Diagnostics suite on a validation slice.
 
-    You’ll get:
+    You'll get:
       1) Transformer training report — BCE breakdown, set-mass (mean/p90), top-k,
          illegal temptation, Δt metrics
       2) Embedder representation report — linear probe + cosine neighbors per RawConcept family
