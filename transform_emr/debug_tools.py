@@ -608,28 +608,41 @@ def transformer_training_report(
 ) -> Dict[str, float]:
     """
     What this reports (all batch-averaged, teacher-forced, no grad):
-      LOSS-DIRECT DIAGNOSTICS
+
+    LOSS-DIRECT DIAGNOSTICS
         • bce_masked / bce_pos / bce_neg / pos_rate
         • focus_pos = mean((1 - σ(logit_pos))^γ)    # if ~0 ⇒ γ too strong; if ~1 ⇒ γ too weak
         • focus_neg = mean(σ(logit_neg)^γ)
         • hard_neg_selected_frac  (approx)          # ≈ how many negs selected per step (if hard_neg_k)
         • hard_neg_loss_share     (approx, focal)   # share of neg loss coming from top-k hard negatives
 
-      MODEL ACCURACY (teacher-forced slice)
+    MODEL ACCURACY (teacher-forced slice)
         • p_set_mean_nonpad / p_set_p90_nonpad      # probability mass on the K-future “true set”
         • top1_next / top5_next / top10_next        # masked top-n coverage for the immediate next token
         • p_set_head / p_set_mid / p_set_tail       # set-mass by token-frequency bucket
         • eff_k_mean / eff_k_p90                    # effective #positives per non-PAD step
 
-      TIME AND PENALTIES
+    TIME AND PENALTIES
         • dt_mae / dt_r2 / dt_spearman / dt_viol_rate
         • illegal_mass_pre_mask / illegal_argmax_rate_pre_mask
         • pen_interval / pen_meal
         • pen_end_no_open / pen_dup_start / pen_conflict / pen_unclosed  (interval sub-components)
 
+    CONTEXT INFLUENCE (always-on ablation)
+        Printed:
+        • [CTX] ΔBCE zero-normal           # BCE(CTX=zero) - BCE(normal); >0 ⇒ context helps
+        • [CTX] ΔBCE shuffle-normal        # BCE(CTX=shuffled) - BCE(normal); > ΔBCE zero ⇒ patient-specific use
+        • [CTX] meanKL_zero / meanKL_shuffle
+            - Mean KL divergence per step between masked distributions with ablated context vs normal;
+            ≳ 0.02-0.05 nats/step indicates meaningful logits shift due to context.
+        Returned (keys in the result dict):
+        • ctx_bce_normal / ctx_bce_zero / ctx_bce_shuffle
+        • ctx_kl_zero / ctx_kl_shuffle
+
     Notes:
-      • Uses the **same masking** and **MaskedFocalBCE** config you train with (gamma, hard_neg_k, etc.).
-      • “Hard-neg” numbers are approximate (computed outside the criterion) but good enough to judge settings.
+    • Uses the same masking and MaskedFocalBCE config you train with (gamma, hard_neg_k, etc.).
+    • “Hard-neg” numbers are approximate (computed outside the criterion) but good enough to judge settings.
+    • Context probe adds 2 extra forward passes per batch (zeroed and shuffled context). Keep `max_batches` small if needed.
     """
     model.eval()
     if device is None:
@@ -697,6 +710,19 @@ def transformer_training_report(
     top1 = top5 = top10 = 0
     next_total = 0
 
+    foc_pos_vals, foc_neg_vals = [], []
+    hard_sel_cnt = 0
+    hard_neg_loss = 0.0
+    total_neg_loss = 0.0
+
+    # --- Context probe accumulators ---
+    ctx_tot_norm = 0.0
+    ctx_tot_zero = 0.0
+    ctx_tot_shuf = 0.0
+    ctx_kl_zero  = 0.0
+    ctx_kl_shuf  = 0.0
+    ctx_batches  = 0
+    
     counts = _counts_as_tensor(tk, V, device)
     q25, q75 = torch.quantile(counts.float(), torch.tensor([0.25, 0.75], device=counts.device))
     pset_head, pset_mid, pset_tail = [], [], []
@@ -767,6 +793,55 @@ def transformer_training_report(
         bce_neg    += ln
         Np         += float(info["Np"])
         Nn         += float(info["Nn"])
+
+        # -----------------------
+        # Context ablation
+        # -----------------------
+        # Reference masked distribution under normal context (uses pred_logits already built)
+        Pref = softmax_masked(pred_logits, allowed).detach()
+
+        # ZERO context
+        logits_all_zero, _ = model(
+            raw_concept_ids=batch["raw_concept_ids"],
+            concept_ids=batch["concept_ids"],
+            value_ids=batch["value_ids"],
+            position_ids=batch["position_ids"],
+            abs_ts=batch["abs_ts"],
+            context_vec=torch.zeros_like(batch["context_vec"]),
+        )
+        logits_zero = apply_masks_to_logits(logits_all_zero[:, 1:, :], illegal_mask, bonus_mask)
+        loss_zero, _ = criterion(logits_zero, multi_hot, allowed)
+
+        # SHUFFLED context
+        B = batch["context_vec"].size(0)
+        perm = torch.randperm(B, device=device)
+        logits_all_shuf, _ = model(
+            raw_concept_ids=batch["raw_concept_ids"],
+            concept_ids=batch["concept_ids"],
+            value_ids=batch["value_ids"],
+            position_ids=batch["position_ids"],
+            abs_ts=batch["abs_ts"],
+            context_vec=batch["context_vec"][perm],
+        )
+        logits_shuf = apply_masks_to_logits(logits_all_shuf[:, 1:, :], illegal_mask, bonus_mask)
+        loss_shuf, _ = criterion(logits_shuf, multi_hot, allowed)
+
+        # KL(P || Pref) for zero/shuffle (masked softmax)
+        P0  = softmax_masked(logits_zero, allowed)
+        Psh = softmax_masked(logits_shuf, allowed)
+
+        eps = 1e-12
+        def mean_kl(P, Q):
+            P = P.clamp_min(eps); Q = Q.clamp_min(eps)
+            kl = (P * (P.log() - Q.log())).sum(dim=-1)  # [B,T]
+            return float(kl[nonpad].mean().item()) if nonpad.any() else 0.0
+
+        ctx_tot_norm += float(loss)        # baseline masked BCE with normal context
+        ctx_tot_zero += float(loss_zero)
+        ctx_tot_shuf += float(loss_shuf)
+        ctx_kl_zero  += mean_kl(P0,  Pref)
+        ctx_kl_shuf  += mean_kl(Psh, Pref)
+        ctx_batches  += 1
 
         # ---- Focal focusing factors
         S = torch.sigmoid(pred_logits)
@@ -900,6 +975,17 @@ def transformer_training_report(
     top5_acc  = top5  / max(next_total, 1)
     top10_acc = top10 / max(next_total, 1)
 
+    # --- Context probe aggregates ---
+    if ctx_batches > 0:
+        ctx_bce_normal = ctx_tot_norm / ctx_batches
+        ctx_bce_zero   = ctx_tot_zero / ctx_batches
+        ctx_bce_shuf   = ctx_tot_shuf / ctx_batches
+        ctx_kl_zero_m  = ctx_kl_zero  / ctx_batches
+        ctx_kl_shuf_m  = ctx_kl_shuf  / ctx_batches
+    else:
+        ctx_bce_normal = ctx_bce_zero = ctx_bce_shuf = 0.0
+        ctx_kl_zero_m  = ctx_kl_shuf_m = 0.0
+
     if dt_true_all:
         y_true = torch.cat(dt_true_all).numpy()
         y_pred = torch.cat(dt_pred_all).numpy()
@@ -936,6 +1022,12 @@ def transformer_training_report(
     print("[Δt] MAE={:.3f}  R2={:.3f}  Spearman={:.3f}  viol_rate={:.3f}".format(mae, r2, rho, viol_rate))
     print("[Soft penalties] interval={:.4f} (end_no_open={:.3f}, dup={:.3f}, cnf={:.3f}, unclosed={:.3f})  meal={:.4f}"
           .format(pen_interval, pen_end_no_open, pen_dup, pen_cnf, pen_unclosed, pen_meal))
+    
+    print("[CTX] ΔBCE zero-normal={:.4f}  ΔBCE shuffle-normal={:.4f}  "
+        "meanKL_zero={:.4f}  meanKL_shuffle={:.4f}"
+        .format(ctx_bce_zero - ctx_bce_normal,
+                ctx_bce_shuf - ctx_bce_normal,
+                ctx_kl_zero_m, ctx_kl_shuf_m))
 
     return {
         "bce_masked": bce_masked, "bce_pos": bce_pos, "bce_neg": bce_neg, "pos_rate": float(pos_rate),
@@ -953,6 +1045,11 @@ def transformer_training_report(
         "pen_interval": pen_interval, "pen_meal": pen_meal,
         "pen_end_no_open": pen_end_no_open, "pen_dup_start": pen_dup,
         "pen_conflict": pen_cnf, "pen_unclosed": pen_unclosed,
+        "ctx_bce_normal": ctx_bce_normal,
+        "ctx_bce_zero":   ctx_bce_zero,
+        "ctx_bce_shuffle":ctx_bce_shuf,
+        "ctx_kl_zero":    ctx_kl_zero_m,
+        "ctx_kl_shuffle": ctx_kl_shuf_m,
     }
 
 

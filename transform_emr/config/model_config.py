@@ -34,7 +34,7 @@ TRAINING_SETTINGS = {
     
     # Phase-1 auxiliary settings
     "phase1_bce_weight": 1.0, # BCE loss weight, should be 1.
-    "phase1_mlm_weight": 0.2, # MLM loss regulizer weight on the phase1 training task (= phase1_bce_weight / bce_k_window)
+    "phase1_mlm_weight": 0.05, # MLM loss regulizer weight on the phase1 training task (used as a nudge to the BCE.)
     "phase1_dt_weight": 0.1, # Weight for time regression loss component during phase 1
     
     # Phase-2 auxiliary settings
