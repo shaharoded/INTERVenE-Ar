@@ -7,3 +7,4 @@ __pycache__/
 checkpoints/
 images/
 transform_emr_temp/
+transform_emr/config/*.pkl

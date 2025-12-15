@@ -12,9 +12,9 @@ event-prediction-in-diabetes-care/
 ├── transform_emr/                     # Core Python package
 │   ├── config/                        # Configuration modules
 │   │   ├── __init__.py
+│   │   ├── tak-repo.pkl               # TAKRepository object from Mediator (see related project)
 │   │   ├── dataset_config.py
 │   │   └── model_config.py
-│   │
 │   ├── __init__.py                    
 │   ├── dataset.py                     # Dataset, DataPreprocess and Tokenizer
 │   ├── embedder.py                    # Embedding model (EMREmbedding) + training
@@ -25,14 +25,11 @@ event-prediction-in-diabetes-care/
 │   ├── loss.py                        # Utility module for special loss (auxillary) criterias
 │   ├── utils.py                       # Utility functions for the package (plots + penalties)
 │   └── debug_tools.py                 # Debug loop for epochs (logits)
-│
 ├── data/                              # External data folder (for synthetic or real EMR)
 │   ├── generate_synthetic_data.ipynb  # A notebook that generates synthetic data similar in structure to original (for tests)
 │   ├── train/
 │   └── test/
-│
 ├── unittests/                         # Unit and integration tests (dataset / model / utils)
-│
 ├── .gitignore
 ├── requirements.txt
 ├── LICENCE

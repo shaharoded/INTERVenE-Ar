@@ -4,9 +4,10 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from joblib import dump
+import pickle
 import numpy as np
 from collections import Counter
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import *
@@ -28,7 +29,20 @@ class DataProcessor:
     checkpoint_path (str): Path to save the scaler / tokenizer at for later usage.
 
     """
-    def __init__(self, df, context_df, max_input_days=None, scaler=None, checkpoint_path=CHECKPOINT_PATH):
+    def __init__(self, df, context_df, 
+                 tak_repo_path='transform_emr/config/tak_repo.pkl', 
+                 max_input_days=None, 
+                 scaler=None, 
+                 checkpoint_path=CHECKPOINT_PATH):
+        with open(tak_repo_path, "rb") as f:
+            self.repo = pickle.load(f)
+
+        if self.repo is None:
+            raise ValueError("TAKRepository failed to load (None).")
+
+        if not hasattr(self.repo, "get"):
+            raise ValueError("TAKRepository must expose a .get(name) method.")
+        
         # Handle compatability issue in complete flow
         if "StartTime" in df.columns and "EndTime" in df.columns:
             df.rename(columns={"StartTime": "StartDateTime", "EndTime": "EndDateTime"}, inplace=True)
@@ -50,8 +64,9 @@ class DataProcessor:
         self._fix_back_to_back_intervals()
         self._truncate_after_terminal_event()
         self._normalize_time()
-        self._expand_tokens()
+        self._expand_tokens() # Expands intervals into START/END tokens
         self._insert_null_tokens(gap_hrs=3)
+        self._add_parent_raw_concepts()
         if self.max_input_days:
             self._cut_after_k_days()
         
@@ -208,7 +223,104 @@ class DataProcessor:
         self.df = df
 
 
-    def _expand_tokens(self, min_state_duration_sec=1):
+    def _add_parent_raw_concepts(self):
+        """
+        Adds a 'ParentRawConcepts' column to self.df, which contains a list of
+        top-level raw concepts for each ConceptName based on the TAKRepository.
+        """
+        def __deps_from_derived_from(tak_obj):
+            """
+            Get the list of TAK names that the given TAK object is derived from.
+            """
+            if not hasattr(tak_obj, "derived_from"):
+                raise ValueError(f"TAK '{tak_obj.name}' has no 'derived_from' attribute.")
+
+            df = tak_obj.derived_from
+
+            if df is None:
+                return []
+
+            if isinstance(df, str):
+                return [df]
+
+            if isinstance(df, list):
+                out = []
+                for item in df:
+                    if isinstance(item, dict) and "name" in item:
+                        out.append(item["name"])
+                    elif isinstance(item, str):
+                        out.append(item)
+                    else:
+                        raise ValueError(
+                            f"Invalid derived_from entry in TAK '{tak_obj.name}': {item}"
+                        )
+                return out
+
+            raise ValueError(
+                f"Invalid derived_from type for TAK '{tak_obj.name}': {type(df)}"
+            )
+
+        def __resolve_top_raw(name: str, seen=None) -> str:
+            """
+            Recursively resolves the top-level raw concept for a given TAK name.
+            Raises an error if a cycle is detected or if the TAK is not found.
+            """
+            if seen is None:
+                seen = set()
+
+            if name in seen:
+                raise ValueError(f"Cycle detected while resolving raw parent for '{name}'.")
+
+            seen.add(name)
+
+            tak = self.repo.get(name)
+            if tak is None:
+                raise ValueError(f"Concept '{name}' not found in TAKRepository.")
+
+            if getattr(tak, "family", None) == "raw-concept":
+                return tak.name
+
+            deps = __deps_from_derived_from(tak)
+            if not deps:
+                raise ValueError(
+                    f"TAK '{name}' is not raw-concept and has empty derived_from."
+                )
+
+            if len(deps) > 1:
+                # This should only happen for patterns, but still supported
+                raise ValueError(
+                    f"Non-pattern TAK '{name}' has multiple derived_from parents: {deps}"
+                )
+
+            return __resolve_top_raw(deps[0], seen)
+        
+
+        def _parents_for_concept(concept_name: str):
+            if concept_name in ("[NULL]", "[CTX]", "[MASK]", "[PAD]"):
+                return ["[NULL]"]
+            tak = self.repo.get(concept_name)
+            if tak is None:
+                raise ValueError(f"Concept '{concept_name}' not found in TAKRepository.")
+
+            deps = __deps_from_derived_from(tak)
+            if not deps:
+                # raw concepts must have empty derived_from
+                if getattr(tak, "family", None) != "raw-concept":
+                    raise ValueError(
+                        f"TAK '{concept_name}' has no derived_from but is not raw-concept."
+                    )
+                return [tak.name]
+
+            parents = set()
+            for dep in deps:
+                parents.add(__resolve_top_raw(dep))
+
+            return sorted(parents)
+        
+        self.df['ParentRawConcepts'] = self.df['Concept'].apply(_parents_for_concept)
+
+    
+    def _expand_tokens(self, min_interval_duration_sec=1):
         """
         Expands events into tokens with timepoints.
 
@@ -226,15 +338,11 @@ class DataProcessor:
             concept = row.ConceptName
             value = base_token
 
-            is_state = (duration_sec > min_state_duration_sec) or concept.endswith(('_STATE', '_TREND', '_PATTERN'))
-            if concept.endswith(('_STATE', '_TREND')):
-                raw_concept = concept.rsplit('_', 1)[0]
-            else:
-                raw_concept = concept
-            
+            # Create interval tokenization if duration > threshold
+            is_interval = (duration_sec > min_interval_duration_sec)
             pos_tokens = []
 
-            if is_state:
+            if is_interval:
                 pos_tokens = ["START", "END"]
                 time_points = [row.RelStartTime, row.RelEndTime]
             else:
@@ -245,7 +353,6 @@ class DataProcessor:
                 full_token = f"{base_token}_{pos}" if pos else base_token
                 rows.append({
                     'PatientID': row.PatientID,
-                    'RawConcept': raw_concept,
                     'Concept': concept,
                     'ValueToken': value,
                     'PositionToken': full_token,
@@ -377,7 +484,27 @@ class EMRTokenizer:
 
     @classmethod
     def from_processed_df(cls, df, special_tokens=["[PAD]", "[MASK]", "[NULL]", "[CTX]"]):
-        raw_concepts = sorted(df['RawConcept'].unique())
+        """
+        Takes in a processed dataframe from DataProcessor.run() and builds the 
+        tokenizer vocabularies and weights.
+        Args:
+            df (pd.DataFrame): Processed dataframe with columns ['ParentRawConcepts', 'Concept', 'ValueToken', 'PositionToken'].
+            special_tokens (List[str]): List of special tokens to include in the vocab.
+        Returns:
+            EMRTokenizer: Initialized tokenizer object.
+        """
+        # --- raw concepts are taken from ParentRawConcepts (list[str]) ---
+        if "ParentRawConcepts" not in df.columns:
+            raise ValueError("ParentRawConcepts column missing. Dataset not preprocessed.")
+
+        raw_set = set()
+        for lst in df["ParentRawConcepts"]:
+            if not isinstance(lst, list):
+                raise ValueError(f"ParentRawConcepts must be list[str], got {type(lst)}")
+            for x in lst:
+                raw_set.add(x)
+
+        raw_concepts = sorted(raw_set)
         concepts = sorted(df['Concept'].unique())
         values = sorted(df['ValueToken'].unique())
         positions = sorted(df['PositionToken'].unique())
@@ -426,7 +553,6 @@ class EMRTokenizer:
 
         return cls(token2id, rawconcept2id, concept2id, value2id,special_tokens, token_weights, 
                    important_token_ids, counts_vec)
-    
 
     def save(self, path=os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
         torch.save({
@@ -466,7 +592,7 @@ class EMRTokenizer:
 
 
 class EMRDataset(Dataset):
-    def __init__(self, processed_df, context_df, tokenizer):
+    def __init__(self, processed_df: pd.DataFrame, context_df: pd.DataFrame, tokenizer: EMRTokenizer):
         """
         processed_df: processed DataFrame after running DataProcessor.run() on the original temporal df.
         context_df: Also processed by DataProcessor.run().
@@ -496,13 +622,24 @@ class EMRDataset(Dataset):
             return mapped.astype(int)
 
         # --- Map with validation ---
-        self.tokens_df['RawConceptID'] = safe_map('RawConcept', self.tokenizer.rawconcept2id, 'RawConcept')
         self.tokens_df['ConceptID']    = safe_map('Concept', self.tokenizer.concept2id, 'Concept')
         self.tokens_df['ValueID']      = safe_map('ValueToken', self.tokenizer.value2id, 'ValueToken')
         self.tokens_df['PositionID']   = safe_map('PositionToken', self.tokenizer.token2id, 'PositionToken')
 
+        self.tokens_df["ParentRawConceptIDs"] = self.tokens_df["ParentRawConcepts"].apply(
+            self.__encode_parent_list
+        )
+
         self.patient_ids = self.tokens_df['PatientID'].unique()
         self.patient_groups = {pid: self.tokens_df[self.tokens_df['PatientID'] == pid] for pid in self.patient_ids}
+
+    def __encode_parent_list(self, parents: List[str]) -> List[int]:
+        ids = []
+        for p in parents:
+            if p not in self.tokenizer.rawconcept2id:
+                raise ValueError(f"Raw parent concept '{p}' missing from tokenizer vocabulary.")
+            ids.append(self.tokenizer.rawconcept2id[p])
+        return ids
 
 
     def __len__(self):
@@ -518,41 +655,88 @@ class EMRDataset(Dataset):
         """
         pid = self.patient_ids[idx]
         df = self.patient_groups[pid]
-        
+
+        # ---------------------------
+        # Build padded parent_raw_ids: [T, P]
+        # ---------------------------
+        if "ParentRawConceptIDs" not in df.columns:
+            raise ValueError(
+                f"[Dataset Error] Missing ParentRawConceptIDs for patient {pid}. "
+                f"Make sure EMRDataset built ParentRawConcepts/IDs before grouping."
+            )
+
+        parent_lists = df["ParentRawConceptIDs"].tolist()
+
+        if len(parent_lists) == 0:
+            # extremely rare, but keep it safe
+            max_p = 1
+        else:
+            # validate type and compute max parents for this patient
+            for i, lst in enumerate(parent_lists[:10]):  # sample validation
+                if not isinstance(lst, list):
+                    raise ValueError(
+                        f"[Dataset Error] ParentRawConceptIDs must be list[int]. "
+                        f"Got {type(lst)} at row {i} for patient {pid}."
+                    )
+            max_p = max(len(x) for x in parent_lists) if parent_lists else 1
+            if max_p == 0:
+                raise ValueError(
+                    f"[Dataset Error] Patient {pid} has empty ParentRawConceptIDs lists."
+                )
+
+        parent_raw_ids = torch.full(
+            (len(parent_lists), max_p),
+            self.tokenizer.pad_token_id,
+            dtype=torch.long
+        )
+
+        for i, lst in enumerate(parent_lists):
+            if len(lst) == 0:
+                raise ValueError(
+                    f"[Dataset Error] Empty ParentRawConceptIDs for patient {pid} at token index {i}."
+                )
+            parent_raw_ids[i, :len(lst)] = torch.tensor(lst, dtype=torch.long)
+
         if allow_debug:
-            # Check each ID column
+            # Check each ID column (no RawConceptID anymore)
             for col_name, vocab_dict in [
-                ("RawConceptID", self.tokenizer.rawconcept2id),
-                ("ConceptID", self.tokenizer.concept2id), 
+                ("ConceptID", self.tokenizer.concept2id),
                 ("ValueID", self.tokenizer.value2id),
-                ("PositionID", self.tokenizer.token2id)
+                ("PositionID", self.tokenizer.token2id),
             ]:
                 ids = df[col_name].values
                 max_valid = len(vocab_dict) - 1
-                
+
                 if (ids > max_valid).any():
                     bad_ids = ids[ids > max_valid]
                     print(f"ERROR: Patient {pid} has out-of-bounds {col_name}: {bad_ids}")
                     print(f"  Valid range for {col_name}: [0, {max_valid}]")
                     print(f"  Actual range: [{ids.min()}, {ids.max()}]")
-                    
-                    # Show some examples of the problematic tokens
+
                     bad_positions = np.where(ids > max_valid)[0]
-                    for pos in bad_positions[:3]:  # Show first 3
+                    for pos in bad_positions[:3]:
                         print(f"  Position {pos}: {col_name}={ids[pos]}")
                         if col_name == "PositionID":
-                            # Show the original token that caused this
-                            original_token = df.iloc[pos]["PositionToken"] 
+                            original_token = df.iloc[pos]["PositionToken"]
                             print(f"    Original token: '{original_token}'")
-                    
+
                     raise ValueError(f"Found out-of-bounds {col_name} for patient {pid}")
 
+            # Validate parent_raw_ids bounds too
+            max_raw_valid = len(self.tokenizer.rawconcept2id) - 1
+            if (parent_raw_ids > max_raw_valid).any():
+                bad = parent_raw_ids[parent_raw_ids > max_raw_valid].unique()
+                raise ValueError(
+                    f"Found out-of-bounds parent_raw_ids for patient {pid}: {bad.tolist()} "
+                    f"(valid range [0, {max_raw_valid}])"
+                )
+
         return {
-            "raw_concept_ids": torch.tensor(df["RawConceptID"].values, dtype=torch.long),
+            "parent_raw_ids": parent_raw_ids,  # [T, P]
             "concept_ids": torch.tensor(df["ConceptID"].values, dtype=torch.long),
             "value_ids": torch.tensor(df["ValueID"].values, dtype=torch.long),
             "position_ids": torch.tensor(df["PositionID"].values, dtype=torch.long),
-            "abs_ts": torch.tensor(df["TimePoint"].values, dtype=torch.float32) / 336.0, # Normalize to range [0,1]
+            "abs_ts": torch.tensor(df["TimePoint"].values, dtype=torch.float32) / 336.0,  # [0,1]
             "context_vec": torch.tensor(self.context_df.loc[pid].values, dtype=torch.float32),
             "targets": torch.tensor(df["PositionID"].values, dtype=torch.long),
         }
@@ -563,43 +747,49 @@ def collate_emr(batch, pad_token_id=0):
     Collates a batch of patient EMR sequences into padded tensors.
 
     Each sequence contains:
-        - Raw Concept ID
-        - Concept ID
-        - Value ID
-        - Position ID (used for prediction)
-        - Absolute time (Δt since admission)
-        - Patient context vector (no padding)
-
+        - Parents Concept ID (2D: [T, P])
+        - Concept ID (1D: [T])
+        - Value ID (1D: [T])
+        - Position ID (1D: [T]) (used for prediction)
+        - Absolute time (Δt since admission) (1D: [T])
+        - Patient context vector (no padding) (1D: [C])
     Returns:
         Dictionary of padded tensors: [B, T_max] + context_vec [B, C]
     
     NOTE: Padding token id ([PAD]) is always 0. Time Padding should be 0.0.
     """
     batch_size = len(batch)
-    max_len = max(len(x['position_ids']) for x in batch)
+    max_len = max(x["position_ids"].shape[0] for x in batch)
+    max_p   = max(x["parent_raw_ids"].shape[1] for x in batch)
+    
+    def pad_2d(seq2d, pad_val=pad_token_id, dtype=torch.long):
+        out = torch.full((batch_size, max_len, max_p), pad_val, dtype=dtype)
+        for i, s in enumerate(seq2d):
+            t, p = s.shape
+            out[i, :t, :p] = s
+        return out
 
-    def pad_tensor(seq, pad_val=pad_token_id, dtype=torch.long):
+    def pad_1d(seq1d, pad_val=pad_token_id, dtype=torch.long):
         out = torch.full((batch_size, max_len), pad_val, dtype=dtype)
-        for i, s in enumerate(seq):
+        for i, s in enumerate(seq1d):
             out[i, :len(s)] = s
         return out
 
-    raw_concept_ids  = pad_tensor([x['raw_concept_ids'] for x in batch], pad_val=pad_token_id)
-    concept_ids      = pad_tensor([x['concept_ids'] for x in batch], pad_val=pad_token_id)
-    value_ids        = pad_tensor([x['value_ids'] for x in batch], pad_val=pad_token_id)
-    position_ids     = pad_tensor([x['position_ids'] for x in batch], pad_val=pad_token_id)
-    abs_ts           = pad_tensor([x['abs_ts'] for x in batch], pad_val=0.0, dtype=torch.float32)
-
-    context_vecs = torch.stack([x['context_vec'] for x in batch])
+    parent_raw_ids = pad_2d([x["parent_raw_ids"] for x in batch], pad_val=pad_token_id)
+    concept_ids    = pad_1d([x["concept_ids"] for x in batch], pad_val=pad_token_id)
+    value_ids      = pad_1d([x["value_ids"] for x in batch], pad_val=pad_token_id)
+    position_ids   = pad_1d([x["position_ids"] for x in batch], pad_val=pad_token_id)
+    abs_ts         = pad_1d([x["abs_ts"] for x in batch], pad_val=0.0, dtype=torch.float32)
+    context_vecs   = torch.stack([x["context_vec"] for x in batch])
 
     return {
-        'raw_concept_ids': raw_concept_ids,
-        'concept_ids': concept_ids,
-        'value_ids': value_ids,
-        'position_ids': position_ids,  # targets
-        'abs_ts': abs_ts,
-        'context_vec': context_vecs,
-        'targets': position_ids.clone()
+        "parent_raw_ids": parent_raw_ids,
+        "concept_ids": concept_ids,
+        "value_ids": value_ids,
+        "position_ids": position_ids,
+        "abs_ts": abs_ts,
+        "context_vec": context_vecs,
+        "targets": position_ids.clone(),
     }
 
 
