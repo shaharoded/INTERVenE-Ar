@@ -278,11 +278,11 @@ class GPT(nn.Module):
     
 
     # ---------------------------------------------------- forward & loss ---- #
-    def forward(self, raw_concept_ids, concept_ids, value_ids, position_ids,
+    def forward(self, parent_raw_ids, concept_ids, value_ids, position_ids,
             abs_ts, context_vec=None):
         """
         All tensors come straight from `collate_emr`:
-            raw_concept_ids (torch.Tensor)   - padded raw_concept ids, (B, T)
+            parent_raw_ids (torch.Tensor)    - padded raw_concept ids, (B, T, D)
             concept_ids (torch.Tensor)       - padded concepts ids, (B, T)
             value_ids (torch.Tensor)         - padded concept_value ids, (B, T)
             position_ids (torch.Tensor)      - padded token ids, (B, T)
@@ -302,7 +302,7 @@ class GPT(nn.Module):
             """Allows gradient checkpointing on blocks -> Memory efficient"""
             return block(x, key_pad_mask=mask)
 
-        seq, emb_mask = self.embedder(raw_concept_ids, concept_ids, value_ids, position_ids,
+        seq, emb_mask = self.embedder(parent_raw_ids, concept_ids, value_ids, position_ids,
             abs_ts, context_vec, return_mask=True)
         x = self.drop(seq)  # (B, T+1, D)
 
@@ -506,7 +506,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # === Original logits from Model ===
                 logits, abs_t_pred = model(
-                    raw_concept_ids=batch["raw_concept_ids"],
+                    parent_raw_ids=batch["parent_raw_ids"],
                     concept_ids=batch["concept_ids"],
                     value_ids=batch["value_ids"],
                     position_ids=batch["position_ids"],

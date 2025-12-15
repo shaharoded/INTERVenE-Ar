@@ -459,7 +459,8 @@ class EMRTokenizer:
         null_token_id (int): ID for NULL token.
     """
     def __init__(self, token2id, rawconcept2id, concept2id, value2id, special_tokens, 
-                 token_weights, important_token_ids, token_counts):
+                 token_weights, important_token_ids, token_counts,
+                 tokenid2parent_raw_ids, parent_pad_len):
         self.token2id = token2id
         self.id2token = {i: tok for tok, i in token2id.items()}
         self.rawconcept2id = rawconcept2id
@@ -469,6 +470,8 @@ class EMRTokenizer:
         self.token_weights = token_weights
         self.important_token_ids = important_token_ids
         self.token_counts = token_counts
+        self.tokenid2parent_raw_ids = tokenid2parent_raw_ids
+        self.parent_pad_len = parent_pad_len
         
         # Validate presence of mandatory special tokens
         required_specials = ["[PAD]", "[MASK]", "[NULL]", "[CTX]"]
@@ -550,9 +553,53 @@ class EMRTokenizer:
         counts_vec   = torch.zeros(len(token2id), dtype=torch.long)
         for tok, cnt in count_series.items():
             counts_vec[token2id[tok]] = cnt
+        
+        # ---- Build tokenid2parent_raw_ids LUT for inference ----
+        # Expect df has PositionToken + ParentRawConcepts
+        pos_to_parents = {}
+
+        for pos_tok, grp in df.groupby("PositionToken"):
+            # enforce determinism: all rows for same PositionToken must agree
+            unique_lists = grp["ParentRawConcepts"].apply(lambda x: tuple(x)).unique()
+            if len(unique_lists) != 1:
+                raise ValueError(
+                    f"[Tokenizer Error] Inconsistent ParentRawConcepts for PositionToken='{pos_tok}'. "
+                    f"Got {len(unique_lists)} variants (example={unique_lists[:3]})."
+                )
+            pos_to_parents[pos_tok] = list(unique_lists[0])
+
+        # compute global Pmax
+        Pmax = max((len(v) for v in pos_to_parents.values()), default=1)
+        if Pmax <= 0:
+            raise ValueError("[Tokenizer Error] Computed Pmax <= 0 for parent raw concepts.")
+
+        # fill LUT with PAD id from token2id
+        pad_id = token2id["[PAD]"]
+        lut = torch.full((len(token2id), Pmax), pad_id, dtype=torch.long)
+
+        # helper for encoding parent names -> ids
+        def encode_parent_names(parent_names):
+            ids = []
+            for name in parent_names:
+                if name not in rawconcept2id:
+                    raise ValueError(f"[Tokenizer Error] Raw parent '{name}' missing from rawconcept2id.")
+                ids.append(rawconcept2id[name])
+            if len(ids) == 0:
+                raise ValueError("[Tokenizer Error] Empty parent list encountered.")
+            return ids
+
+        # populate LUT by token id
+        for tok, tid in token2id.items():
+            if tok not in pos_to_parents:
+                raise ValueError(
+                    f"[Tokenizer Error] Missing ParentRawConcepts for token '{tok}'. "
+                    f"Processed df must include all PositionToken values."
+                )
+            ids = encode_parent_names(pos_to_parents[tok])
+            lut[tid, :len(ids)] = torch.tensor(ids, dtype=torch.long)
 
         return cls(token2id, rawconcept2id, concept2id, value2id,special_tokens, token_weights, 
-                   important_token_ids, counts_vec)
+                   important_token_ids, counts_vec, lut, Pmax)
 
     def save(self, path=os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
         torch.save({
@@ -564,6 +611,8 @@ class EMRTokenizer:
             'token_weights': self.token_weights,
             'important_token_ids': self.important_token_ids,
             'token_counts': self.token_counts,
+            'tokenid2parent_raw_ids': self.tokenid2parent_raw_ids,
+            'parent_pad_len': self.parent_pad_len,
             'fingerprint': self.fingerprint()
         }, path)
 
@@ -581,7 +630,9 @@ class EMRTokenizer:
             special_tokens=obj['special_tokens'],
             token_weights=obj['token_weights'].to(device),
             important_token_ids=obj['important_token_ids'].to(device),
-            token_counts=obj['token_counts'].to(device)
+            token_counts=obj['token_counts'].to(device),
+            tokenid2parent_raw_ids=obj['tokenid2parent_raw_ids'].to(device),
+            parent_pad_len=obj['parent_pad_len'],
         )
         tokenizer._loaded_fingerprint = obj.get('fingerprint')
         return tokenizer

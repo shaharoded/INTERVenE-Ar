@@ -150,7 +150,7 @@ def build_mlm(ids, tokenizer, p=0.15):
     Embedder MLM Mask Helper.
     Logic: Mask (later predict) tokens important to position that won't hurt the general timeline.
             Mask everything informative but admission, CTX or terminal tokens.
-    ids:  (B,T) tensor - raw_concept_ids / concept_ids / value_ids / position_ids
+    ids:  (B,T) tensor - concept_ids / value_ids / position_ids
     returns masked_ids (same shape)
     Masking strategy (BERT-style):
         80% → replace with [MASK]
@@ -249,17 +249,17 @@ def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.25):
     # random 80/10/10 (like BERT)?
     # Keep it simple: replace all with [MASK]
     pos_ids = pos_ids.clone()
-    raw_ids = batch["raw_concept_ids"].clone()
+    raw_ids = batch["parent_raw_ids"].clone()
     con_ids = batch["concept_ids"].clone()
     val_ids = batch["value_ids"].clone()
 
     pos_ids[to_mask] = mask_tok
-    raw_ids[to_mask] = mask_tok
+    raw_ids[to_mask, :] = mask_tok
     con_ids[to_mask] = mask_tok
     val_ids[to_mask] = mask_tok
 
     batch["position_ids"]    = pos_ids
-    batch["raw_concept_ids"] = raw_ids
+    batch["parent_raw_ids"]  = raw_ids
     batch["concept_ids"]     = con_ids
     batch["value_ids"]       = val_ids
     return batch

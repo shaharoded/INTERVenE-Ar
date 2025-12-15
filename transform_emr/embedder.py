@@ -167,13 +167,13 @@ class EMREmbedding(nn.Module):
         return self.time_head(t_abs)           # [B, T, 1]
 
 
-    def forward(self, raw_concept_ids, concept_ids, value_ids, position_ids,
+    def forward(self, parent_raw_ids, concept_ids, value_ids, position_ids,
                  abs_ts, patient_contexts, return_mask=False):
         """
         Build time-aware event embeddings for a full sequence.
 
         Args:
-            raw_concept_ids (LongTensor): [B, T]
+            parent_raw_ids (LongTensor):  [B, T, P] (P=max_parents)
             concept_ids (LongTensor):     [B, T]
             value_ids (LongTensor):       [B, T]
             position_ids (LongTensor):    [B, T]
@@ -186,7 +186,17 @@ class EMREmbedding(nn.Module):
             attention_mask (optional): [B, T+1] (True for real tokens)
         """
         # --- Token lookups ---
-        r_emb = self.raw_concept_embed(raw_concept_ids)     # [B, T, D]
+        
+        # parent_raw_ids: [B, T, P]
+        p_emb = self.raw_concept_embed(parent_raw_ids)   # [B, T, P, D]
+
+        # mask PAD parents (PAD id == tokenizer.pad_token_id)
+        mask = (parent_raw_ids != self.padding_idx).unsqueeze(-1)  # [B, T, P, 1]
+        p_emb = p_emb * mask
+
+        den = mask.sum(dim=2).clamp_min(1.0)            # [B, T, 1]
+        r_emb = p_emb.sum(dim=2) / den                  # [B, T, D]
+        
         c_emb = self.concept_embed(concept_ids)     # [B, T, D]
         v_emb = self.value_embed(value_ids)
         p_emb = self.position_embed(position_ids)
@@ -225,7 +235,7 @@ class EMREmbedding(nn.Module):
             logits: [B, T, vocab_size] — scores for next-token prediction
         """
         seq = self.forward(
-        raw_concept_ids=batch["raw_concept_ids"],
+        parent_raw_ids=batch["parent_raw_ids"],
         concept_ids=batch["concept_ids"],
         value_ids=batch["value_ids"],
         position_ids=batch["position_ids"],
@@ -246,7 +256,7 @@ class EMREmbedding(nn.Module):
             mlm_logits [B, T, vocab_size]
         """
         seq = self.forward(
-        raw_concept_ids=batch["raw_concept_ids"],
+        parent_raw_ids=batch["parent_raw_ids"],
         concept_ids=batch["concept_ids"],
         value_ids=batch["value_ids"],
         position_ids=masked_pos_ids,  # masked positions used here

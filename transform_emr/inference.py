@@ -79,11 +79,9 @@ def infer_event_stream(model,
 
     def decode_token_components(token_str):
         parts = token_str.split("_")
-        raw = parts[0]
-        concept = "_".join(parts[:2]) if len(parts) > 1 else parts[0]
+        concept = "_".join(parts[:-2]) if parts[-2] in ("STATE", "TREND", "CONTEXT", "EVENT", "PATTERN") else "_".join(parts)
         value = "_".join(parts[:-1]) if parts[-1] in ("START", "END") else "_".join(parts)
         return (
-            tok.rawconcept2id.get(raw, tok.mask_token_id),
             tok.concept2id.get(concept, tok.mask_token_id),
             tok.value2id.get(value, tok.mask_token_id)
         )
@@ -147,12 +145,12 @@ def infer_event_stream(model,
         ctx_vec = torch.tensor(dataset.context_df.loc[pid].values, dtype=torch.float32).unsqueeze(0).to(device)
 
         # Prepare input (same as before)
-        raw_ids     = torch.tensor([df["RawConceptID"].tolist()], dtype=torch.long, device=device)
-        concept_ids = torch.tensor([df["ConceptID"].tolist()],     dtype=torch.long, device=device)
-        value_ids   = torch.tensor([df["ValueID"].tolist()],       dtype=torch.long, device=device)
-        pos_ids     = torch.tensor([df["PositionID"].tolist()],    dtype=torch.long, device=device)
+        parent_raw_ids = torch.tensor([df["ParentRawConceptIDs"].tolist()], dtype=torch.long, device=device)
+        concept_ids    = torch.tensor([df["ConceptID"].tolist()],     dtype=torch.long, device=device)
+        value_ids      = torch.tensor([df["ValueID"].tolist()],       dtype=torch.long, device=device)
+        pos_ids        = torch.tensor([df["PositionID"].tolist()],    dtype=torch.long, device=device)
         # Re-normalize hours → [0,1] using the same 336h window (which were de-normalized for the df output)
-        abs_ts      = torch.tensor([df["TimePoint"].tolist()],     dtype=torch.float32, device=device) / 336.0
+        abs_ts         = torch.tensor([df["TimePoint"].tolist()],     dtype=torch.float32, device=device) / 336.0
 
         # Log inputs
         rows.append({"PatientID": pid, "Step": 0, "Token": "[CTX]", "TimePoint": 0.0,
@@ -203,7 +201,7 @@ def infer_event_stream(model,
         steps = 0
         while steps < max_len:
             logits, abs_t_pred = model(
-                raw_concept_ids=raw_ids,
+                parent_raw_ids=parent_raw_ids,
                 concept_ids=concept_ids,
                 value_ids=value_ids,
                 position_ids=pos_ids,
@@ -236,6 +234,7 @@ def infer_event_stream(model,
             tok_str = id2token.get(next_token_id, f"<UNK_{next_token_id}>")
             is_terminal = next_token_id in terminal_ids
             is_outcome  = next_token_id in outcome_ids
+            next_parent_vec = tok.tokenid2parent_raw_ids[next_token_id].view(1, 1, -1)  # [1,1,P]
 
             # time prediction (normalized)
             pred_abs_norm = abs_t_pred[0, -1].item()
@@ -244,7 +243,7 @@ def infer_event_stream(model,
 
             rows.append({
                 "PatientID": pid,
-                "Step": raw_ids.shape[1] + 1,
+                "Step": pos_ids.shape[1] + 1,
                 "TimePoint": pred_abs,
                 "Token": tok_str,
                 "IsInput": 0,
@@ -253,12 +252,12 @@ def infer_event_stream(model,
             })
 
             # update tensors
-            r_id, c_id, v_id = decode_token_components(tok_str)
-            raw_ids     = torch.cat([raw_ids,     torch.tensor([[r_id]], device=device)], dim=1)
-            concept_ids = torch.cat([concept_ids, torch.tensor([[c_id]], device=device)], dim=1)
-            value_ids   = torch.cat([value_ids,   torch.tensor([[v_id]], device=device)], dim=1)
-            pos_ids     = torch.cat([pos_ids,     torch.tensor([[next_token_id]], device=device)], dim=1)
-            abs_ts      = torch.cat([abs_ts,      torch.tensor([[pred_abs_norm]], device=device)], dim=1)
+            c_id, v_id = decode_token_components(tok_str)
+            parent_raw_ids = torch.cat([parent_raw_ids, next_parent_vec.to(device)], dim=1)  # [1,T+1,P]
+            concept_ids    = torch.cat([concept_ids, torch.tensor([[c_id]], device=device)], dim=1)
+            value_ids      = torch.cat([value_ids,   torch.tensor([[v_id]], device=device)], dim=1)
+            pos_ids        = torch.cat([pos_ids,     torch.tensor([[next_token_id]], device=device)], dim=1)
+            abs_ts         = torch.cat([abs_ts,      torch.tensor([[pred_abs_norm]], device=device)], dim=1)
 
             # update state
             tid = next_token_id
@@ -286,7 +285,7 @@ def infer_event_stream(model,
             best = term_list[int(torch.argmax(term_logits))]
             rows.append({
                 "PatientID": pid,
-                "Step": raw_ids.shape[1] + 1,
+                "Step": pos_ids.shape[1] + 1,
                 "Token": id2token[best],
                 "TimePoint": pred_abs,
                 "IsInput": 0,
@@ -329,14 +328,14 @@ if __name__ == "__main__":
 
     # Run preprocessing for excel file
     print("Building testing dataset...")
-    processor = DataProcessor(df_subset.copy(), ctx_subset.copy(), scaler=scaler)
+    processor = DataProcessor(df_subset.copy(), ctx_subset.copy(), scaler=scaler, tak_repo_path=TAK_REPO_PATH)
     df_test, ctx_df_test = processor.run()
     dataset_test = EMRDataset(df_test, ctx_df_test, tokenizer=tokenizer)
     
     # Run preprocessing for generation
     print("Building input dataset...")
     k_days=5
-    processor = DataProcessor(df_subset.copy(), ctx_subset.copy(), scaler=scaler, max_input_days=k_days)
+    processor = DataProcessor(df_subset.copy(), ctx_subset.copy(), scaler=scaler, tak_repo_path=TAK_REPO_PATH, max_input_days=k_days)
     df_subset, ctx_subset = processor.run()
     dataset = EMRDataset(df_subset, ctx_subset, tokenizer=tokenizer)
 
