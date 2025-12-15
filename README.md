@@ -69,7 +69,7 @@ temporal_df = pd.read_csv(TRAIN_TEMPORAL_DATA_FILE, low_memory=False)
 ctx_df = pd.read_csv(TRAIN_CTX_DATA_FILE)
 
 print(f"[Pre-processing]: Building tokenizer...")
-processor = DataProcessor(temporal_df, ctx_df, scaler=None)
+processor = DataProcessor(temporal_df, ctx_df, tak_repo_path=TAK_REPO_PATH, scaler=None)
 temporal_df, ctx_df = processor.run()
 
 tokenizer = EMRTokenizer.from_processed_df(temporal_df)
@@ -108,7 +108,7 @@ but you'll need to adjust the imports. Use `train.py` structure for that.
     scaler = joblib.load(Path(CHECKPOINT_PATH) / "scaler.pkl")
 
     # Run preprocessing
-    processor = DataProcessor(df, ctx_df, scaler=scaler, max_input_days=5)
+    processor = DataProcessor(df, ctx_df, scaler=scaler, tak_repo_path=TAK_REPO_PATH, max_input_days=5)
     df, ctx_df = processor.run()
 
     patient_ids = df["PatientID"].unique()
@@ -232,6 +232,7 @@ Per-patient Event Tokenization (with normalized absolute timestamps)
 📌 **Why it matters:**  
 Medical data varies in density and structure across patients. This dynamic preprocessing handles irregularity while preserving medically-relevant sequencing via `START/END` logic and relative timing.
 
+>> This modules assumes the existance of prepared tak_repo.pkl file, outputed from the Mediator as a hierarchy mapper of the different concepts.
 ---
 
 ### 2. **`embedder.py`** – EMR Representation Learning
