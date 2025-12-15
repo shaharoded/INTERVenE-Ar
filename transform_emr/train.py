@@ -16,7 +16,7 @@ from transform_emr.embedder import EMREmbedding, train_embedder
 from transform_emr.transformer import GPT, train_transformer
 from transform_emr.utils import *
 from transform_emr.config.model_config import *
-from transform_emr.config.dataset_config import TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE
+from transform_emr.config.dataset_config import TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE, TAK_REPO_PATH
 
 def summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer):
     """
@@ -77,12 +77,12 @@ def prepare_data(sample=False):
         print(f"[Pre-processing]: Loading tokenizer from checkpoint...")
         tokenizer = EMRTokenizer.load()
 
-        processor = DataProcessor(temporal_df, ctx_df, scaler=None)
+        processor = DataProcessor(temporal_df, ctx_df, scaler=None, tak_repo_path=TAK_REPO_PATH)
         temporal_df, ctx_df = processor.run()
 
     else:
         print(f"[Pre-processing]: Building tokenizer...")
-        processor = DataProcessor(temporal_df, ctx_df, scaler=None)
+        processor = DataProcessor(temporal_df, ctx_df, scaler=None, tak_repo_path=TAK_REPO_PATH)
         temporal_df, ctx_df = processor.run()
         tokenizer = EMRTokenizer.from_processed_df(temporal_df)
         tokenizer.save()

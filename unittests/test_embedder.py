@@ -17,6 +17,11 @@ def mini_tokenizer():
     important_ids = torch.tensor([], dtype=torch.long)
     token_counts = torch.tensor([], dtype=torch.long)
 
+    # Dummy parent raw mapping
+    vocab_size = len(token2id)
+    tokenid2parent_raw_ids = torch.zeros((vocab_size, 1), dtype=torch.long)
+    parent_pad_len = 1
+
     tk = EMRTokenizer(
         token2id=token2id,
         rawconcept2id=rawconcept2id,
@@ -25,7 +30,9 @@ def mini_tokenizer():
         special_tokens=special_tokens,
         token_weights=token_weights,
         important_token_ids=important_ids,
-        token_counts = token_counts
+        token_counts = token_counts,
+        tokenid2parent_raw_ids=tokenid2parent_raw_ids,
+        parent_pad_len=parent_pad_len
     )
     # set special token attributes
     tk.pad_token_id  = token2id['[PAD]']
@@ -59,7 +66,7 @@ def test_embedder_forward_and_mask_predict(mini_tokenizer):
     )
     B, T = 2, 5
     dummy = {
-        'raw_concept_ids': torch.zeros(B, T, dtype=torch.long),
+        'parent_raw_ids':  torch.zeros(B, T, 1, dtype=torch.long),
         'concept_ids':     torch.zeros(B, T, dtype=torch.long),
         'value_ids':       torch.zeros(B, T, dtype=torch.long),
         'position_ids':    torch.zeros(B, T, dtype=torch.long),
@@ -91,7 +98,7 @@ def test_forward_with_decoder_logits(mini_tokenizer):
     )
     B, T = 2, 4
     dummy = {
-        'raw_concept_ids': torch.zeros(B, T, dtype=torch.long),
+        'parent_raw_ids':  torch.zeros(B, T, 1, dtype=torch.long),
         'concept_ids':     torch.zeros(B, T, dtype=torch.long),
         'value_ids':       torch.zeros(B, T, dtype=torch.long),
         'position_ids':    torch.zeros(B, T, dtype=torch.long),
@@ -99,7 +106,7 @@ def test_forward_with_decoder_logits(mini_tokenizer):
         'patient_contexts': torch.zeros(B, ctx_dim)
     }
     batch = {
-     "raw_concept_ids": dummy['raw_concept_ids'],
+     "parent_raw_ids":  dummy['parent_raw_ids'],
      "concept_ids":     dummy['concept_ids'],
      "value_ids":       dummy['value_ids'],
      "position_ids":    dummy['position_ids'],

@@ -18,6 +18,11 @@ def mini_tokenizer():
     important_ids = torch.tensor([], dtype=torch.long)
     token_counts = torch.tensor([], dtype=torch.long)
 
+    # Dummy parent raw mapping
+    vocab_size = len(token2id)
+    tokenid2parent_raw_ids = torch.zeros((vocab_size, 1), dtype=torch.long)
+    parent_pad_len = 1
+
     tk = EMRTokenizer(
         token2id=token2id,
         rawconcept2id=rawconcept2id,
@@ -26,7 +31,9 @@ def mini_tokenizer():
         special_tokens=special_tokens,
         token_weights=token_weights,
         important_token_ids=important_ids,
-        token_counts = token_counts
+        token_counts = token_counts,
+        tokenid2parent_raw_ids=tokenid2parent_raw_ids,
+        parent_pad_len=parent_pad_len
     )
     # assign special token attributes
     tk.pad_token_id = token2id['[PAD]']
@@ -93,7 +100,7 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
     B, T = 2, 5
     V = len(mini_tokenizer.token2id)
     # Dummy inputs
-    raw = torch.zeros(B, T, dtype=torch.long)
+    parent_raw = torch.zeros(B, T, 1, dtype=torch.long) # 3D tensor
     concept = torch.zeros(B, T, dtype=torch.long)
     value = torch.zeros(B, T, dtype=torch.long)
     pos = torch.zeros(B, T, dtype=torch.long)
@@ -102,7 +109,7 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
 
     with torch.no_grad():
         logits, abs_t = model(
-            raw_concept_ids=raw,
+            parent_raw_ids=parent_raw,
             concept_ids=concept,
             value_ids=value,
             position_ids=pos,
@@ -122,7 +129,7 @@ def test_transformer_forward_gpu(mini_transformer, mini_tokenizer):
     model.eval()
     B, T = 2, 5
     V = len(mini_tokenizer.token2id)
-    raw = torch.zeros(B, T, dtype=torch.long, device='cuda')
+    parent_raw = torch.zeros(B, T, 1, dtype=torch.long, device='cuda') # 3D tensor
     concept = torch.zeros(B, T, dtype=torch.long, device='cuda')
     value = torch.zeros(B, T, dtype=torch.long, device='cuda')
     pos = torch.zeros(B, T, dtype=torch.long, device='cuda')
@@ -131,7 +138,7 @@ def test_transformer_forward_gpu(mini_transformer, mini_tokenizer):
 
     with torch.no_grad():
         logits, abs_t = model(
-            raw_concept_ids=raw,
+            parent_raw_ids=parent_raw,
             concept_ids=concept,
             value_ids=value,
             position_ids=pos,

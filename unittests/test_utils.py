@@ -80,6 +80,10 @@ def mini_tokenizer():
     important_token_ids = torch.tensor([], dtype=torch.long)
     token_counts = torch.tensor([], dtype=torch.long)
 
+    # Dummy parent raw mapping for testing
+    vocab_size = len(token2id)
+    tokenid2parent_raw_ids = torch.zeros((vocab_size, 1), dtype=torch.long)
+    parent_pad_len = 1
 
     tk = EMRTokenizer(
         token2id=token2id,
@@ -89,7 +93,9 @@ def mini_tokenizer():
         special_tokens=special_tokens,
         token_weights=token_weights,
         important_token_ids=important_token_ids,
-        token_counts = token_counts
+        token_counts = token_counts,
+        tokenid2parent_raw_ids=tokenid2parent_raw_ids,
+        parent_pad_len=parent_pad_len
     )
     # assign special attributes
     tk.pad_token_id  = token2id['[PAD]']
@@ -231,7 +237,12 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
     # Case 1: no eligible tokens => sequence unchanged
     if eligible is None:
         in_seq = torch.tensor([list(forbid_ids)[:4]], dtype=torch.long)
-        batch = {k: in_seq.clone() for k in ["position_ids","raw_concept_ids","concept_ids","value_ids"]}
+        batch = {
+            "position_ids": in_seq.clone(),
+            "parent_raw_ids": torch.zeros(in_seq.shape[0], in_seq.shape[1], 1, dtype=torch.long),
+            "concept_ids": in_seq.clone(),
+            "value_ids": in_seq.clone()
+        }
         out = apply_cbm(
             batch.copy(), epoch=5, warmup_epochs=5,
             tokenizer=tk,
@@ -248,7 +259,12 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
             pytest.skip("Only one eligible token in vocab, skipping ‘with‑eligible’ CBM test")
         other = candidates[0]
         in_seq = torch.tensor([[pad_id, eligible, other, mask_tok]], dtype=torch.long)
-        batch = {k: in_seq.clone() for k in ["position_ids","raw_concept_ids","concept_ids","value_ids"]}
+        batch = {
+            "position_ids": in_seq.clone(),
+            "parent_raw_ids": torch.zeros(in_seq.shape[0], in_seq.shape[1], 1, dtype=torch.long),
+            "concept_ids": in_seq.clone(),
+            "value_ids": in_seq.clone()
+        }
         out = apply_cbm(
             batch.copy(), epoch=10, warmup_epochs=10,
             tokenizer=tk,
@@ -273,7 +289,12 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
     other_min    = next((i for i in range(V) if i not in {pad_id, mask_tok, eligible_min}), None)
     if eligible_min is not None and other_min is not None:
         in_seq3 = torch.tensor([[pad_id, eligible_min, other_min, pad_id]], dtype=torch.long)
-        batch3 = {k: in_seq3.clone() for k in ["position_ids","raw_concept_ids","concept_ids","value_ids"]}
+        batch3 = {
+            "position_ids": in_seq3.clone(),
+            "parent_raw_ids": torch.zeros(in_seq3.shape[0], in_seq3.shape[1], 1, dtype=torch.long),
+            "concept_ids": in_seq3.clone(),
+            "value_ids": in_seq3.clone()
+        }
         out3 = apply_cbm(
             batch3.copy(), epoch=1, warmup_epochs=1,
             tokenizer=tk, forbid_ids=minimal_forbid, max_p=1.0
