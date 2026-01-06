@@ -15,6 +15,7 @@ def mini_tokenizer():
     value2id = {"A": 0, "[NULL]": 1}
     special_tokens = toks[:4]
     token_weights = torch.ones(len(toks))
+    outcome_weights = torch.ones(len(toks))
     important_ids = torch.tensor([], dtype=torch.long)
     token_counts = torch.tensor([], dtype=torch.long)
 
@@ -30,6 +31,7 @@ def mini_tokenizer():
         value2id=value2id,
         special_tokens=special_tokens,
         token_weights=token_weights,
+        outcome_weights=outcome_weights,
         important_token_ids=important_ids,
         token_counts = token_counts,
         tokenid2parent_raw_ids=tokenid2parent_raw_ids,
