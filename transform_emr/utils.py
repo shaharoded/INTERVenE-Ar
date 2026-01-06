@@ -144,6 +144,37 @@ def get_multi_hot_targets(position_ids: torch.Tensor,
 
     return (future > 0).to(torch.float32)
 
+def get_future_outcome_targets(
+    position_ids: torch.Tensor,   # [B, T]
+    outcome_ids: list[int],       # [K] list of outcome token IDs
+) -> torch.Tensor:                # [B, T, K] Float (0.0 or 1.0)
+    """
+    Builds binary targets for auxiliary outcome prediction.
+    target[b, t, k] = 1 if outcome_ids[k] appears in position_ids[b, t+1:]
+    """
+    B, T = position_ids.shape
+    K = len(outcome_ids)
+    device = position_ids.device
+    
+    # [1, 1, K] for broadcasting
+    out_tensor = torch.tensor(outcome_ids, device=device, dtype=torch.long).view(1, 1, K)
+    
+    # 1. Where do outcomes occur? [B, T, K]
+    # matches[b, t, k] is True if token at t is outcome k
+    matches = (position_ids.unsqueeze(-1) == out_tensor) 
+    
+    # 2. Propagate "Future Presence" backwards
+    # We want target[t] to be True if match occurs at any step > t.
+    # Shift matches left by 1 (future relative to t)
+    future_matches = torch.zeros_like(matches)
+    future_matches[:, :-1, :] = matches[:, 1:, :] # shift left
+    
+    # Reverse cumulative max (logical OR) -> "Does it happen anytime after now?"
+    # flip time, cummax, flip back
+    future_presence = future_matches.flip(dims=[1]).cummax(dim=1).values.flip(dims=[1])
+    
+    return future_presence.float()
+
 
 def build_mlm(ids, tokenizer, p=0.15):
     """

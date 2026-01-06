@@ -4,6 +4,7 @@ import pytest
 
 from transform_emr.utils import (
     get_multi_hot_targets,
+    get_future_outcome_targets,
     build_mlm,
     linear_schedule,
     apply_cbm,
@@ -145,6 +146,39 @@ def test_multi_hot_targets_visual_and_assert():
             f"At t={t}, expected {expected} but got {hot_ids}"
         )
 
+def test_get_future_outcome_targets():
+    """
+    Verifies that get_future_outcome_targets correctly flags future events.
+    Scenario: Sequence [A, Sepsis, B, Death, Pad]
+    """
+    # 1. Setup
+    # Let 1=Sepsis, 2=Death, 9=Pad, others=random
+    seq = torch.tensor([[10, 1, 11, 2, 9]]) # [B=1, T=5]
+    outcome_ids = [1, 2] # Sepsis, Death
+    
+    # 2. Run
+    targets = get_future_outcome_targets(seq, outcome_ids) # [1, 5, 2]
+    
+    # 3. Assertions
+    # T=0 (Token 10): Future has Sepsis(1) and Death(2) -> Both True
+    assert targets[0, 0, 0].item() == 1.0, "T=0 should predict future Sepsis"
+    assert targets[0, 0, 1].item() == 1.0, "T=0 should predict future Death"
+    
+    # T=1 (Token 1/Sepsis): Future has Death(2). Sepsis is *current*, not future.
+    # So Sepsis target should be 0 (unless another Sepsis occurs later).
+    assert targets[0, 1, 0].item() == 0.0, "T=1 (Sepsis) should NOT predict future Sepsis (unless another occurs)"
+    assert targets[0, 1, 1].item() == 1.0, "T=1 (Sepsis) should predict future Death"
+    
+    # T=2 (Token 11): Future has Death(2).
+    assert targets[0, 2, 1].item() == 1.0, "T=2 should predict future Death"
+    
+    # T=3 (Token 2/Death): No future outcomes.
+    assert targets[0, 3, 1].item() == 0.0, "T=3 (Death) should have no future Death"
+    
+    # T=4 (Pad): No future.
+    assert targets[0, 4, 0].item() == 0.0
+    
+    print("test_get_future_outcome_targets: passed.")
 
 def test_linear_schedule_visual_and_assert():
     """

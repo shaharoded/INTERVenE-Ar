@@ -4,6 +4,7 @@ from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, colla
 import pandas as pd
 import pytest
 import pickle
+import torch
 from transform_emr.dataset import DataProcessor
 from transform_emr.config.dataset_config import RELEASE_TOKEN, DEATH_TOKEN, ADMISSION_TOKEN
 
@@ -379,3 +380,44 @@ def test_cut_after_k_days(tmp_path, mock_tak_repo, base_ctx):
     assert len(p1) == 2
     assert p1.iloc[0]['TimePoint'] == 24.0
     assert p1.iloc[1]['TimePoint'] == 25.0
+
+
+def test_tokenizer_outcome_weights(tmp_path, mock_tak_repo):
+    # Setup: 4 Patients. 1 Death (P1). 3 Survivors.
+    df = pd.DataFrame({
+        'PatientID': [1, 2, 3, 4],
+        'PositionToken': ['DEATH', 'A', 'A', 'A'], 
+        'StartDateTime': [pd.Timestamp('2020-01-01')] * 4,
+        'EndDateTime': [pd.Timestamp('2020-01-01')] * 4,
+        'ConceptName': ['DEATH', 'A', 'A', 'A'],
+        'Value': [1, 1, 1, 1],
+        'ParentRawConcepts': [['DEATH'], ['A'], ['A'], ['A']],
+        'Concept': ['DEATH', 'A', 'A', 'A'],
+        'ValueToken': ['DEATH', 'A', 'A', 'A']
+    })
+    
+    # Run tokenizer build
+    tokenizer = EMRTokenizer.from_processed_df(df)
+    
+    # Verify Type
+    assert isinstance(tokenizer.outcome_weights, torch.Tensor)
+    assert tokenizer.outcome_weights.shape[0] == len(tokenizer.token2id)
+    
+    # Verify Logic
+    # DEATH: 1 Positive, 3 Negative -> Weight = 3.0
+    death_id = tokenizer.token2id["DEATH"]
+    w_death = tokenizer.outcome_weights[death_id].item()
+    assert abs(w_death - 3.0) < 0.01, f"Expected 3.0, got {w_death}"
+    
+    # A: 3 Positive, 1 Negative -> Weight = 0.333
+    # Note: 'A' is not in OUTCOMES list by default configuration, so it should be default 1.0
+    # unless we mocked the config. 
+    # Let's check default behavior for non-outcome tokens:
+    a_id = tokenizer.token2id["A"]
+    w_a = tokenizer.outcome_weights[a_id].item()
+    assert w_a == 1.0, "Non-outcome tokens should have default weight 1.0"
+
+    # Check persistence
+    tokenizer.save(os.path.join(tmp_path, 'tok.pt'))
+    loaded = EMRTokenizer.load(os.path.join(tmp_path, 'tok.pt'))
+    assert torch.equal(loaded.outcome_weights, tokenizer.outcome_weights)

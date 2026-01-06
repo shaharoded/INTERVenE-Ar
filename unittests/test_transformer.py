@@ -108,7 +108,7 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
     context = torch.zeros(B, 2)
 
     with torch.no_grad():
-        logits, abs_t = model(
+        logits, abs_t, outcomes = model(
             parent_raw_ids=parent_raw,
             concept_ids=concept,
             value_ids=value,
@@ -119,6 +119,7 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
     # Check shapes
     assert logits.shape == (B, T+1, V), f"Expected logits shape {(B, T+1, V)}, got {logits.shape}"
     assert abs_t.shape == (B, T+1), f"Expected abs_t shape {(B, T+1)}, got {abs_t.shape}"
+    assert outcomes.shape == (B, T+1, model.num_outcomes), f"Expected outcomes shape {(B, T+1, model.num_outcomes)}, got {outcomes.shape}"
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_transformer_forward_gpu(mini_transformer, mini_tokenizer):

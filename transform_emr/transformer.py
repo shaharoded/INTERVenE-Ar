@@ -177,12 +177,27 @@ class GPT(nn.Module):
             f"does not match embedder.position_embed ({vocab_size})"
         )
 
+        # Outcome Head (designed to propogate signal to the hidden state that there is an expected outcome soon)
+        # This head maps the embedding dimension to the unique outcome classes (e.g., Death, Sepsis, Hypoglycemia, Release)
+        # A simple MLP classifier
+        self.num_outcomes = len(set(OUTCOMES + TERMINAL_OUTCOMES))
+        
+        # A simple MLP classifier
+        self.outcome_head = nn.Sequential(
+            nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
+            nn.ReLU(),
+            nn.Dropout(cfg["dropout"]),
+            nn.Linear(cfg["embed_dim"], self.num_outcomes) 
+            # Note: No Sigmoid here if using BCEWithLogitsLoss later
+        )
+
         # Δt prediction head (for regression of Δt from admission at each step -> When will each event occur?)
         # --- TIME HEAD (monotone-by-design, allows Δt=0) ---
         self.abs_t_head = nn.Sequential(
             nn.Linear(cfg["embed_dim"], cfg["time2vec_dim"]),
             nn.ReLU(),
-            nn.Linear(cfg["time2vec_dim"], 1)  # Output: scalar abs_t, raw per-step delta logits
+            nn.Linear(cfg["time2vec_dim"], 1)  
+            # Output: scalar abs_t, raw per-step delta logits
         )
 
         self.apply(self._init_weights)
@@ -290,13 +305,16 @@ class GPT(nn.Module):
             context_vec (torch.Tensor)       - age/gender or [] if not used, (B, C)
         
         Returns:
-        logits (FloatTensor): [B, T+1, V]
-            Next-token logits for the sequence with a prepended [CTX].
-            Index 0 corresponds to the [CTX] position.
-        abs_t_pred (FloatTensor): [B, T+1]
-            Monotone absolute time in [0, 1). By convention:
-              - abs_t_pred[:, 0] == 0.0 is the [CTX] slot
-              - training uses abs_t_pred[:, 1:] to align with targets of length T
+            logits (FloatTensor): [B, T+1, V]
+                - Next-token logits for the sequence with a prepended [CTX].
+                - Index 0 corresponds to the [CTX] position.
+            abs_t_pred (FloatTensor): [B, T+1]
+                Monotone absolute time in [0, 1). By convention:
+                - abs_t_pred[:, 0] == 0.0 is the [CTX] slot
+                - training uses abs_t_pred[:, 1:] to align with targets of length T
+            outcome_logits (FloatTensor): [B, T+1, self.num_outcomes]
+                - Logits over the predefined outcomes in the task.
+                - Logits are propagated to the hidden layers, informing the model on expected outcomes.
         """
         def _forward(block, x, mask):
             """Allows gradient checkpointing on blocks -> Memory efficient"""
@@ -328,9 +346,17 @@ class GPT(nn.Module):
                 x = blk(x, key_pad_mask=pad_mask_ctx)
         
         x = self.ln_f(x)                     # [B, T+1, D]
+        
+        # 1. Main next-token prediction head
         logits = self.lm_head(x)             # [B, T+1, V]
 
-        # Absolute time prediction (monotonic)
+        # 2. Outcome Prediction Head (Auxiliary Task)
+        # Input: Contextual embedding at step t (representing history 0..t)
+        # Output: Unnormalized logits for each outcome class [B, T+1, Num_Outcomes]
+        outcome_logits = self.outcome_head(x)
+
+        # 3. Absolute time prediction (monotonic)
+        # Note: We use x[:, :-1] because x[t] predicts time[t+1]
         time_feats = x[:, :-1, :] # features for t predict abs time at t+1  -> [B, T, D]
         delta_raw = self.abs_t_head(time_feats).squeeze(-1)     # [B,T]
         
@@ -347,7 +373,7 @@ class GPT(nn.Module):
         # prepend CTX time = 0  -> [B, T+1]
         abs_t_pred = torch.cat([torch.zeros_like(abs_t_pred[:, :1]), abs_t_pred], dim=1)
 
-        return logits, abs_t_pred
+        return logits, abs_t_pred, outcome_logits
     
 
     def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None):
@@ -436,8 +462,14 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     )
 
     scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
+
+    # Get outcomes weights (from Tokenizer) for pos_weight in BCE loss
+    valid_outcomes = [n for n in model.outcome_names if n in model.embedder.tokenizer.token2id]
+    outcome_token_ids = [model.embedder.tokenizer.token2id[n] for n in valid_outcomes]
+    full_weights = model.embedder.tokenizer.outcome_weights.to(device)
+    pos_weights  = full_weights[outcome_token_ids].to(device)
     
-    # Build criterion once
+    # Build criterions once (for next token BCE and CE losses + aux outcome BCE)
     BCEcriterion = MaskedFocalBCE.from_counts(
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
@@ -452,6 +484,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     CEcriterion = MaskedSetCE(
         label_smoothing=0.0,     # optional
     ).to(device)
+
+    OutcomeCriterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction='none')
 
     ckpt_path = Path(checkpoint_path).resolve()
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -489,7 +523,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         else:
             model.eval()
 
-        total_loss = total_bce = total_penalty = total_dt = 0.0
+        total_loss = total_bce = total_penalty = total_outcome = total_dt = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -505,7 +539,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                       )
 
                 # === Original logits from Model ===
-                logits, abs_t_pred = model(
+                logits, abs_t_pred, outcome_logits = model(
                     parent_raw_ids=batch["parent_raw_ids"],
                     concept_ids=batch["concept_ids"],
                     value_ids=batch["value_ids"],
@@ -544,7 +578,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     pred_logits.clone(), illegal_mask, bonus_mask
                 )
 
-                # === Loss: BCE with logits + CE nudge ===
+                # === Loss: BCE with logits + CE nudge (next token generation task) ===
                 # Multi-hot targets
                 multi_hot = get_multi_hot_targets(
                     position_ids=target_ids,
@@ -601,6 +635,23 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 generative_penalty = (2 * p_illegal + p_unclosed) / 3.0
                 generative_penalty = lambda_pen * generative_penalty
 
+                # === Outcome Loss Calculation ===
+                # Align: Prediction at t (using history 0..t) predicts future of t
+                outcome_pred = outcome_logits[:, :-1, :]  # [B, T, K]
+                
+                # Targets: "Does outcome K happen in future relative to t?"
+                outcome_targets = get_future_outcome_targets(
+                    target_ids,           # [B, T]
+                    outcome_token_ids     # [K]
+                )
+                
+                # Loss
+                #    Only learn from valid (non-pad) time steps.
+                lambda_outcome = 5.0 # Assumption: outcome loss needs to be higher to propogate signal
+                loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T, K]
+                loss_outcome = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+                loss_outcome = lambda_outcome * loss_outcome
+
                 # === Loss: Δt (time) ===
                 # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T])
                 true_abs = batch["abs_ts"].detach().clamp(0.0, 1.0)   # [B,T]
@@ -616,7 +667,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 abs_t_loss = abs_t_loss * lambda_time
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + generative_penalty + abs_t_loss
+                loss = loss_bce + generative_penalty + loss_outcome + abs_t_loss
 
                 # === Backprop and Log ===
                 if train_flag:
@@ -633,6 +684,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 total_loss += loss.item()
                 total_bce += loss_bce.item()
                 total_penalty += generative_penalty.item()
+                total_outcome += loss_outcome.item()
                 total_dt += abs_t_loss.item()
         
         if train_flag:
@@ -647,13 +699,14 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
             total_loss / n_batches,
             total_bce / n_batches,
             total_penalty / n_batches,
+            total_outcome / n_batches,
             total_dt / n_batches,
             val_eval
         )
     
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_pen, tr_dt, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_pen, vl_dt, val_eval = run_epoch(val_dl, epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_pen, tr_outcome, tr_dt, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_pen, vl_outcome, vl_dt, val_eval = run_epoch(val_dl, epoch=epoch, train_flag=False)
 
         # convenience values for printing
         rel_f1 = val_eval["per_class_maxF1"].get("RELEASE", 0.0)
@@ -665,8 +718,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, Pen={tr_pen:.4f}, Δt={tr_dt:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Δt={vl_dt:.4f})
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, Pen={tr_pen:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, Pen={vl_pen:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f})
         --> Val-F1  RELEASE:{rel_f1:.4f}  DEATH:{dth_f1:.4f}  COMPLICATION:{cmp_f1:.4f}""")
 
 

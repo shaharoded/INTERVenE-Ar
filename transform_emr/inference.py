@@ -200,14 +200,14 @@ def infer_event_stream(model,
         # === generation loop =================================================
         steps = 0
         while steps < max_len:
-            logits, abs_t_pred = model(
+            logits, abs_t_pred, _ = model(
                 parent_raw_ids=parent_raw_ids,
                 concept_ids=concept_ids,
                 value_ids=value_ids,
                 position_ids=pos_ids,
                 abs_ts=abs_ts,
                 context_vec=ctx_vec
-            )
+            ) # Need next token and time, not the binary expected outcomes
 
             next_logits = logits[:, -1, :].clone()  # [1,V]
 

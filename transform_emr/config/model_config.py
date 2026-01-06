@@ -12,7 +12,7 @@ MODEL_CONFIG = {
       "ctx_dim": 20, # Fill manually once defined your context data.
       "time2vec_dim": 512,
       "embed_dim": 512,
-      "block_size": 1536,  # //e.g. sequence length, number of tokens processed concurrently
+      "block_size": 512,  # //e.g. sequence length, number of tokens processed concurrently
       "n_head": 8,
       "n_layer": 8,
       "dropout": 0.1,

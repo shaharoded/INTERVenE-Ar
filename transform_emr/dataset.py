@@ -450,7 +450,8 @@ class EMRTokenizer:
         concept2id (Dict[str, int]): Vocabulary mapping for concepts only ("GLUCOSE_STATE"/ "GLUCOSE_TREND")..
         value2id (Dict[str, int]): Vocabulary mapping for concepts+values ("GLUCOSE_STATE_HIGH")
         special_tokens (List[str]): Special tokens like ["MASK"].
-        token_weights (torch.Tensor): Weights used in loss to emphasize important tokens.
+        token_weights (torch.Tensor): Weights used in loss to emphasize important tokens on token generation.
+        outcome_weights (torch.Tensor): Weights for outcome tokens, for BCE loss.
         important_token_ids (torch.Tensor): Token IDs with weight > 1.0.
         token_counts (torch.Tensor): Token counts (distribution).
         pad_token_id (int): ID for padding token.
@@ -459,7 +460,7 @@ class EMRTokenizer:
         null_token_id (int): ID for NULL token.
     """
     def __init__(self, token2id, rawconcept2id, concept2id, value2id, special_tokens, 
-                 token_weights, important_token_ids, token_counts,
+                 token_weights, outcome_weights, important_token_ids, token_counts,
                  tokenid2parent_raw_ids, parent_pad_len):
         self.token2id = token2id
         self.id2token = {i: tok for tok, i in token2id.items()}
@@ -468,6 +469,7 @@ class EMRTokenizer:
         self.value2id = value2id
         self.special_tokens = special_tokens
         self.token_weights = token_weights
+        self.outcome_weights = outcome_weights
         self.important_token_ids = important_token_ids
         self.token_counts = token_counts
         self.tokenid2parent_raw_ids = tokenid2parent_raw_ids
@@ -546,6 +548,33 @@ class EMRTokenizer:
             if tok_id is not None:
                 token_weights[tok_id] = 0.0
         
+        # === Calculate Outcome Weights (Auxiliary Head) ===
+        # We calculate pos_weight based on Patient Prevalence.
+        # Logic: ratio of negative_patients / positive_patients
+        
+        outcome_weights = torch.ones(len(token2id), dtype=torch.float32)
+        all_outcomes = list(set(OUTCOMES + TERMINAL_OUTCOMES))
+        
+        total_patients = df['PatientID'].nunique()
+        patient_tokens = df.groupby("PatientID")["PositionToken"].apply(set)
+        
+        for out_tok in all_outcomes:
+            if out_tok not in token2id:
+                continue
+            
+            tid = token2id[out_tok]
+            
+            # Count positives
+            n_pos = patient_tokens.apply(lambda s: out_tok in s).sum()
+            n_neg = total_patients - n_pos
+            
+            if n_pos > 0:
+                w = n_neg / n_pos
+            else:
+                w = 1.0
+            
+            outcome_weights[tid] = float(w)
+        
         important_token_ids = (token_weights > 1.0).nonzero(as_tuple=True)[0]
 
         # Add token distribution
@@ -606,7 +635,7 @@ class EMRTokenizer:
             ids = encode_parent_names(pos_to_parents[tok])
             lut[tid, :len(ids)] = torch.tensor(ids, dtype=torch.long)
 
-        return cls(token2id, rawconcept2id, concept2id, value2id,special_tokens, token_weights, 
+        return cls(token2id, rawconcept2id, concept2id, value2id,special_tokens, token_weights, outcome_weights,
                    important_token_ids, counts_vec, lut, Pmax)
 
     def save(self, path=os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
@@ -617,6 +646,7 @@ class EMRTokenizer:
             'value2id': self.value2id,
             'special_tokens': self.special_tokens,
             'token_weights': self.token_weights,
+            'outcome_weights': self.outcome_weights,
             'important_token_ids': self.important_token_ids,
             'token_counts': self.token_counts,
             'tokenid2parent_raw_ids': self.tokenid2parent_raw_ids,
@@ -637,6 +667,7 @@ class EMRTokenizer:
             value2id=obj['value2id'],
             special_tokens=obj['special_tokens'],
             token_weights=obj['token_weights'].to(device),
+            outcome_weights=obj['outcome_weights'].to(device),
             important_token_ids=obj['important_token_ids'].to(device),
             token_counts=obj['token_counts'].to(device),
             tokenid2parent_raw_ids=obj['tokenid2parent_raw_ids'].to(device),

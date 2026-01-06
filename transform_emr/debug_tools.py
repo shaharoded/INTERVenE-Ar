@@ -189,7 +189,7 @@ def vocab_cleanup_report(
             break
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        logits, _ = model(
+        logits, _, _ = model(
             raw_concept_ids=batch["raw_concept_ids"],
             concept_ids=batch["concept_ids"],
             value_ids=batch["value_ids"],
@@ -345,7 +345,7 @@ def token_gradient_utility_report(
         if batches > max_batches: break
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        logits, _ = model(**{
+        logits, _, _ = model(**{
             "raw_concept_ids": batch["raw_concept_ids"],
             "concept_ids":     batch["concept_ids"],
             "value_ids":       batch["value_ids"],
@@ -753,7 +753,7 @@ def transformer_training_report(
             break
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        logits_all, abs_t_pred = model(
+        logits_all, abs_t_pred, _ = model(
             raw_concept_ids=batch["raw_concept_ids"],
             concept_ids=batch["concept_ids"],
             value_ids=batch["value_ids"],
@@ -801,7 +801,7 @@ def transformer_training_report(
         Pref = softmax_masked(pred_logits, allowed).detach()
 
         # ZERO context
-        logits_all_zero, _ = model(
+        logits_all_zero, _, _ = model(
             raw_concept_ids=batch["raw_concept_ids"],
             concept_ids=batch["concept_ids"],
             value_ids=batch["value_ids"],
@@ -815,7 +815,7 @@ def transformer_training_report(
         # SHUFFLED context
         B = batch["context_vec"].size(0)
         perm = torch.randperm(B, device=device)
-        logits_all_shuf, _ = model(
+        logits_all_shuf, _, _ = model(
             raw_concept_ids=batch["raw_concept_ids"],
             concept_ids=batch["concept_ids"],
             value_ids=batch["value_ids"],
