@@ -13,8 +13,8 @@ from scipy.stats import spearmanr
 
 from transform_emr.utils import (
     build_luts, get_multi_hot_targets, compute_legality_masks_tf,
-    apply_masks_to_logits, masked_softmax, soft_interval_penalty,
-    soft_meal_order_penalty, _gather_valid_ids
+    apply_masks_to_logits, masked_softmax, soft_illegal_mass_penalty,
+    soft_unclosed_interval_penalty, _gather_valid_ids
 )
 from transform_emr.loss import MaskedFocalBCE
 
@@ -923,13 +923,23 @@ def transformer_training_report(
         dt_viol_den += pmask.sum().item()
 
         # ---- penalties (diagnostic magnitudes)
-        _pen = soft_interval_penalty(
+        # 1. Unclosed Penalty (The new Global Constraint)
+        # We calculate this on MASKED logits, just like in training
+        _pen_unclosed = soft_unclosed_interval_penalty(
             pred_logits, allowed,
-            luts["start_ids_per_base"], luts["end_ids_per_base"],
-            luts["conflict_mat"], alpha=10.0
+            luts["start_ids_per_base"], luts["end_ids_per_base"]
         )
-        pen_int += float(_pen.item())
+        pen_unclosed_metric += float(_pen_unclosed.item())
 
+        # 2. Illegal Mass Penalty (The new Local Constraint)
+        # We calculate this on UNMASKED logits (logits_pre_mask)
+        _pen_illegal = soft_illegal_mass_penalty(
+            logits_pre_mask, illegal_mask, nonpad
+        )
+        pen_illegal_metric += float(_pen_illegal.item())
+
+        # 3. Legacy Breakdown (Optional - to verify redundancy)
+        # These should be mostly zero now because of the hard mask
         Pcpu = P.detach().cpu()
         s_ids_all, s_mask = _gather_valid_ids(luts["start_ids_per_base"])
         e_ids_all, e_mask = _gather_valid_ids(luts["end_ids_per_base"])
@@ -940,18 +950,10 @@ def transformer_training_report(
             p_s = Pcpu[:, :, s_ids]; p_e = Pcpu[:, :, e_ids]
             cs_s = torch.cumsum(p_s, dim=1); cs_e = torch.cumsum(p_e, dim=1)
             open_before = torch.relu(torch.cat([torch.zeros_like(cs_s[:, :1]), cs_s[:, :-1]-cs_e[:, :-1]], dim=1))
+            
+            # These are the "redundant" terms killed by the mask
             pen_end_no_open += float((p_e * torch.exp(-10.0*open_before)).sum().item())
             pen_dup         += float((p_s * (1.0 - torch.exp(-10.0*open_before))).sum().item())
-            cm = luts["conflict_mat"][vm][:, vm].float().cpu()
-            if cm.numel():
-                open_conf = torch.einsum('btn,nm->btm', open_before, cm)
-                pen_cnf += float((p_s * (1.0 - torch.exp(-10.0*open_conf))).sum().item())
-            open_final = torch.relu(cs_s[:, -1, :] - cs_e[:, -1, :])
-            pen_unclosed += float(open_final.sum().item())
-
-        pen_meal += float(soft_meal_order_penalty(
-            pred_logits, allowed, luts["meal_rank"], decay=0.9, beta=8.0
-        ).item())
 
     # aggregates
     n_batches = max(1, batches_done)
@@ -1020,8 +1022,8 @@ def transformer_training_report(
         ms = lambda lst: (sum(lst)/len(lst)) if lst else 0.0
         print("[Set-mass by freq] head={:.3f}  mid={:.3f}  tail={:.3f}".format(ms(pset_head), ms(pset_mid), ms(pset_tail)))
     print("[Δt] MAE={:.3f}  R2={:.3f}  Spearman={:.3f}  viol_rate={:.3f}".format(mae, r2, rho, viol_rate))
-    print("[Soft penalties] interval={:.4f} (end_no_open={:.3f}, dup={:.3f}, cnf={:.3f}, unclosed={:.3f})  meal={:.4f}"
-          .format(pen_interval, pen_end_no_open, pen_dup, pen_cnf, pen_unclosed, pen_meal))
+    print("[Soft penalties] IllegalMass={:.4f}  Unclosed={:.4f} | (Legacy: end_no_open={:.3f}, dup={:.3f})"
+            .format(pen_illegal_metric, pen_unclosed_metric, pen_end_no_open, pen_dup))
     
     print("[CTX] ΔBCE zero-normal={:.4f}  ΔBCE shuffle-normal={:.4f}  "
         "meanKL_zero={:.4f}  meanKL_shuffle={:.4f}"

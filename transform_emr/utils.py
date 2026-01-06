@@ -865,6 +865,8 @@ def soft_interval_penalty(
     Returns:
         penalty: scalar in [0,1]
         details: dict of raw & normalized components (if return_details=True)
+    
+    NOTE: DEPRECATED. Function is redundant given the function soft_illegal_mass_penalty.
     """
     B, T, V = logits.shape
     device = logits.device
@@ -980,6 +982,8 @@ def soft_meal_order_penalty(
       • First meal (no prior seen) has zero penalty.
 
     Returns: scalar penalty.
+
+    NOTE: DEPRECATED. Function is redundant given the function soft_illegal_mass_penalty.
     """
     B, T, V = logits.shape
     device  = logits.device
@@ -1060,6 +1064,54 @@ def soft_illegal_mass_penalty(
     pen = num / den
     return pen.pow(power)
 
+
+def soft_unclosed_interval_penalty(
+    logits: torch.Tensor,           # [B,T,V] AFTER masking
+    allowed: torch.Tensor,          # [B,T,V] bool
+    start_ids_per_base: torch.Tensor, 
+    end_ids_per_base: torch.Tensor, # [nb]
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Penalizes intervals that remain open at the end of the sequence (step T).
+    This captures global consistency that step-wise masks cannot enforce.
+    
+    Returns: scalar penalty in [0, 1]
+    """
+    B, T, V = logits.shape
+    
+    # 1. Probabilities from MASKED logits (we must respect the mask's decisions)
+    P = masked_softmax(logits, allowed)
+
+    # 2. Gather valid start/end IDs
+    s_ids_all, s_mask = _gather_valid_ids(start_ids_per_base)
+    e_ids_all, e_mask = _gather_valid_ids(end_ids_per_base)
+    valid_mask = s_mask & e_mask
+    
+    if valid_mask.sum() == 0:
+        return logits.new_zeros(())
+
+    s_ids = start_ids_per_base[valid_mask]
+    e_ids = end_ids_per_base[valid_mask]
+    nbv   = s_ids.numel()
+
+    # 3. Calculate total mass given to STARTs and ENDs
+    p_s = P[:, :, s_ids]  # [B,T,nbv]
+    p_e = P[:, :, e_ids]  # [B,T,nbv]
+
+    total_starts = torch.sum(p_s, dim=1) # [B, nbv]
+    total_ends   = torch.sum(p_e, dim=1) # [B, nbv]
+
+    # 4. Penalty = Excess starts that were never closed
+    # Relu ensures we don't penalize "extra ends" here (that's handled by illegal mask)
+    open_final = F.relu(total_starts - total_ends) # [B, nbv]
+    
+    # 5. Normalize
+    # We normalize by Batch * Num_Bases. 
+    # (Max penalty is 1.0 if every base is fully open for every patient)
+    pen_unclosed = open_final.sum() / (B * nbv + eps)
+    
+    return pen_unclosed
 
 
 def apply_masks_to_logits(logits, illegal_mask, bonus_mask, bonus_boost=0.2):

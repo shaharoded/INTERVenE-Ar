@@ -15,7 +15,8 @@ from transform_emr.utils import (
     build_luts,
     compute_legality_masks_tf,
     apply_masks_to_logits,
-    build_rep_penalty
+    build_rep_penalty,
+    soft_unclosed_interval_penalty
 )
 from transform_emr.dataset import EMRTokenizer
 
@@ -714,6 +715,56 @@ def test_soft_meal_penalty_recency_and_successor(mini_tokenizer):
 
     assert pen_Dn.item() > pen_Dd.item(), "Recency should prefer Dinner over Night immediately after Lunch"
 
+def test_soft_unclosed_interval_penalty(mini_tokenizer):
+    """
+    Test that soft_unclosed_interval_penalty:
+      - Returns 0 for perfectly paired START/END.
+      - Returns >0 for START without END.
+      - Ignores masked/illegal logits (relies on P).
+    """
+    tk = mini_tokenizer
+    l = build_luts(tk)
+    
+    # Pick a valid base (e.g. A_STATE_Low)
+    base_idx = 0
+    s_id = l["start_ids_per_base"][base_idx].item()
+    e_id = l["end_ids_per_base"][base_idx].item()
+    
+    # 1 Batch, 5 Timesteps, V vocab
+    B, T, V = 1, 5, len(tk.token2id)
+    allowed = torch.ones(B, T, V, dtype=torch.bool)
+    
+    # --- Scenario 1: Closed Interval (Start t=0, End t=4) ---
+    logits_closed = torch.full((B, T, V), -100.0)
+    logits_closed[0, 0, s_id] = 100.0
+    logits_closed[0, 4, e_id] = 100.0
+    
+    pen_closed = soft_unclosed_interval_penalty(
+        logits_closed, allowed, 
+        l["start_ids_per_base"], l["end_ids_per_base"]
+    )
+    # Mass(Start) ≈ 1, Mass(End) ≈ 1 => Diff ≈ 0
+    assert pen_closed.item() < 1e-4, f"Closed sequence should have ~0 penalty, got {pen_closed.item()}"
+
+    # --- Scenario 2: Unclosed Interval (Start t=0, No End) ---
+    logits_open = torch.full((B, T, V), -100.0)
+    logits_open[0, 0, s_id] = 100.0
+    
+    pen_open = soft_unclosed_interval_penalty(
+        logits_open, allowed, 
+        l["start_ids_per_base"], l["end_ids_per_base"]
+    )
+    
+    # Mass(Start) ≈ 1, Mass(End) ≈ 0 => Diff ≈ 1
+    # Normalized by (Batch * Num_Bases)
+    nbv = (l["start_ids_per_base"] >= 0).sum().item()
+    expected = 1.0 / nbv
+    
+    assert pen_open.item() > 0
+    assert abs(pen_open.item() - expected) < 1e-2, f"Expected ~{expected}, got {pen_open.item()}"
+    
+    print("test_soft_unclosed_interval_penalty: passed.")
+    
 
 def test_soft_penalties_agree_with_hard_in_peaked_limit(mini_tokenizer):
     tk = mini_tokenizer

@@ -535,14 +535,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                             )
                 
                 # Soft illegal-mass penalty (pre-mask)
+                # Penalize putting ANY mass on illegal tokens (using UNMASKED logits)
                 nonpad = (target_ids != model.embedder.padding_idx)                # [B,T]
-                p_illegal = soft_illegal_mass_penalty(
-                    logits_pre_mask=pred_logits,
-                    illegal_mask=illegal_mask,
-                    nonpad_mask=nonpad,
-                    margin=0.04,
-                    power=1.0
-                )
+                logits_pre_mask = pred_logits
 
                 # Apply masks BEFORE BCE so gradients learn legality only
                 pred_logits = apply_masks_to_logits(
@@ -576,23 +571,25 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 loss_bce = loss_bce + loss_ce * lambda_ce  # Combining the 2 terms
 
                 # === Loss: Structural penalties on output ===
+                # 1. Soft illegal-mass penalty (pre-mask)
+                # Penalize putting ANY mass on illegal tokens (using UNMASKED logits)
+                p_illegal = soft_illegal_mass_penalty(
+                    logits_pre_mask=logits_pre_mask,
+                    illegal_mask=illegal_mask,
+                    nonpad_mask=nonpad,
+                    margin=0.04,
+                    power=1.0
+                )
+                # 2. Global Closure Violations
+                # Penalize leaving intervals open at the end (using MASKED logits)
+                # This teaches "If you started it, you must finish it"
                 # Load and normalize each penalty (∈ [0, 1]) -> Active grad on penalty functions
-                p_struct = soft_interval_penalty(
-                    pred_logits,             # keep grads
-                    allowed,
-                    luts["start_ids_per_base"],
-                    luts["end_ids_per_base"],
-                    luts["conflict_mat"],
-                    alpha=10.0               # sharpness; 8–12 worked in tests
-                )
-                
-                p_meal = soft_meal_order_penalty(
-                    pred_logits,             # keep grads
-                    allowed,
-                    luts["meal_rank"],
-                    decay=0.9,               # recency memory (0.8–0.95 reasonable)
-                    beta=8.0                 # “seen” squashing sharpness
-                )
+                p_unclosed = soft_unclosed_interval_penalty(
+                                    pred_logits,             # Masked logits
+                                    allowed,
+                                    luts["start_ids_per_base"],
+                                    luts["end_ids_per_base"]
+                                )
 
                 # Average the penalties to bound in [0, 1]
                 lambda_pen = linear_schedule(
@@ -601,7 +598,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     training_settings["phase2_penalty_weight"]
                 )
                 # A little more agressive on teaching against illegal steps, heuristic.
-                generative_penalty = (2 * p_illegal + p_struct + p_meal) / 4.0
+                generative_penalty = (2 * p_illegal + p_unclosed) / 3.0
                 generative_penalty = lambda_pen * generative_penalty
 
                 # === Loss: Δt (time) ===
