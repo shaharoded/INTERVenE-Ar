@@ -268,7 +268,7 @@ Once the EMR structure is captured, the transformer learns to model sequential d
 - How does timing affect outcomes?  
 - How does patient context modulate the trajectory?
 
-The training uses next token prediction loss (k-window BCE) + time prediction MSE (Δt) + structural penalties.
+The training uses next token prediction loss (k-window masked BCE Focal Loss) + time prediction MSE (Δt) + structural penalties + outcome prediction BCE auxillary task.
 The training is guided by teacher's forcing, showing the model the correct context at every step (exposing [0, t-1] at step t from T where T is block_size), while also masking logits for illegal predictions based on the true trajectory. As training progress, the model's input ([0, t-1]) is partially masked (CBM) to teach the model to handle inaccuracies in generation, while avoiding masking same tokens as the EMREmbedding + MEAL + _START + _END tokens, to not clash with the penalties the model recieves.
 
 The training flow uses a warmup period where the model is to learn patterns using a frozen embedder (so that the sharp gradients won't cause forgetting to the embedder's weights).

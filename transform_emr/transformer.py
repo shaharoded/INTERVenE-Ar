@@ -54,13 +54,6 @@ class CausalSelfAttention(nn.Module):
             torch.tril(torch.ones(cfg["block_size"], cfg["block_size"]))
             .view(1, 1, cfg["block_size"], cfg["block_size"])
         )
-    def _scaled_dot_product_attention(self, q, k, v, mask=None):
-        d_k = q.size(-1)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d_k)
-        if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
-        attn_weights = F.softmax(scores, dim=-1)
-        return torch.matmul(attn_weights, v)
     
     def forward(self, x, key_pad_mask=None):
         B, T, C = x.shape
