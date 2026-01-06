@@ -515,8 +515,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 )
 
                 # logits is [B, T+1, V] due to [CTX] token prepending
-                # We want to predict tokens 1 to T given context + tokens 0 to T-1
-                pred_logits = logits[:, 1:, :]            # [B, T, V] - predictions for positions 1 to T (no [CTX])
+                # We want logits 0..T-1 (predictions for targets 0..T-1), which total to tokens 1 to T given context.
+                pred_logits = logits[:, :-1, :]        # [B, T, V] - predictions for positions 1 to T (no [CTX])
                 target_ids = batch["targets"]          # [B, T] - targets for positions 1 to T
                 
                 # === legality masks from Ground Truth + Targets ===
