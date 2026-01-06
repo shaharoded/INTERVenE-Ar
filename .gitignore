@@ -3,6 +3,7 @@ emr_model.zip
 
 # Ignore an entire folder
 venv/
+.venv/
 __pycache__/
 checkpoints/
 images/

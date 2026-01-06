@@ -590,6 +590,14 @@ class EMRTokenizer:
 
         # populate LUT by token id
         for tok, tid in token2id.items():
+            # Special tokens map to [NULL] as their parent raw concept
+            if tok in special_tokens:
+                if "[NULL]" not in rawconcept2id:
+                    raise ValueError("[Tokenizer Error] '[NULL]' missing from rawconcept2id.")
+                null_id = rawconcept2id["[NULL]"]
+                lut[tid, 0] = null_id
+                continue
+            
             if tok not in pos_to_parents:
                 raise ValueError(
                     f"[Tokenizer Error] Missing ParentRawConcepts for token '{tok}'. "
