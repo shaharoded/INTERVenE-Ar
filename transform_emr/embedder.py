@@ -224,12 +224,13 @@ class EMREmbedding(nn.Module):
 
         return seq, cond
     
-    def forward_with_decoder(self, batch: dict):
+    def forward_with_decoder(self, batch: dict, context_dropout_prob=0.15):
         """
         Runs full forward pass + decoding (for training phase 1).
         Unpack tuple (ignore cond for simple decoding task, or use it if decoder depended on it)
         In Phase 1, we just predict tokens from embeddings. 
         We are using the context projection in order to bias the embeddings with patient context.
+        Context Dropout is applied here to improve robustness when patient context is missing (inference from phase-1 to phase-2).
 
         Returns:
             logits: [B, T, vocab_size] — scores for next-token prediction
@@ -241,22 +242,30 @@ class EMREmbedding(nn.Module):
         position_ids=batch["position_ids"],
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
-        return_mask=False
+        return_mask=False,
         )  # → returns only [B,T,D]
+
+        # Context Dropout (Crucial for Phase 2 compatibility)
+        if self.training and (torch.rand(1).item() < context_dropout_prob):
+            cond_for_addition = torch.zeros_like(cond)
+        else:
+            cond_for_addition = cond
 
         # Additive Interaction
         # Broadcast context [B, D] -> [B, 1, D] and add to sequence.
         # This biases the event representations based on patient static data.
-        combined_embedding = seq + cond.unsqueeze(1)
+        combined_embedding = seq + cond_for_addition.unsqueeze(1)
 
         return self.decoder(combined_embedding)  # [B,T,V], Predict next token at each step
     
 
-    def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None):
+    def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None, context_dropout_prob=0.15):
         """
         Runs full forward pass + MLM (for training phase 1).
         Same inputs as forward_with_decoder, plus:
             mlm_mask - bool tensor [B,T] where True → this position was masked.
+        
+        Context Dropout is applied here to improve robustness when patient context is missing (inference from phase-1 to phase-2).
         Returns:
             mlm_logits [B, T, vocab_size]
         """
@@ -267,9 +276,16 @@ class EMREmbedding(nn.Module):
         position_ids=masked_pos_ids,  # masked positions used here
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
-        return_mask=False
+        return_mask=False,
         )    # [B,T,D]
-        combined_embedding = seq + cond.unsqueeze(1)
+
+        # Context Dropout (Crucial for Phase 2 compatibility)
+        if self.training and (torch.rand(1).item() < context_dropout_prob):
+            cond_for_addition = torch.zeros_like(cond)
+        else:
+            cond_for_addition = cond
+
+        combined_embedding = seq + cond_for_addition.unsqueeze(1)
         logits = self.mlm_head(combined_embedding)
         
         if mlm_mask is not None:

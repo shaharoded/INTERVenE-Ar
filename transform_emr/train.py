@@ -177,7 +177,7 @@ if __name__ == "__main__":
             embed_dim=MODEL_CONFIG.get("embed_dim")
         )
 
-    # embedder, _, _ = phase_one(embedder=embedder, train_dl=embedder_train_dl, val_dl=val_dl, resume=True)
+    embedder, _, _ = phase_one(embedder=embedder, train_dl=embedder_train_dl, val_dl=val_dl, resume=True)
 
     # --- Phase 2: Train or resume transformer ---
     ckpt_last_path = Path(TRANSFORMER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
