@@ -28,7 +28,7 @@ event-prediction-in-diabetes-care/
 │   ├── utils.py                       # Utility functions for the package (plots + penalties)
 │   └── debug_tools.py                 # Debug loop for epochs (logits)
 ├── data/                              # External data folder (for synthetic or real EMR)
-│   ├── generate_synthetic_data.ipynb  # A notebook that generates synthetic data similar in structure to original (for tests)
+│   ├── generate_synthetic_data.ipynb  # A notebook that generates synthetic data similar in structure to mediator's output (for tests)
 │   ├── train/
 │   └── test/
 ├── unittests/                         # Unit and integration tests (dataset / model / utils)
