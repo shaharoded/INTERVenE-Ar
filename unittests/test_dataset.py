@@ -3,40 +3,84 @@ import os
 from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr
 import pandas as pd
 import pytest
-import pickle
+import json
 import torch
 from transform_emr.dataset import DataProcessor
 from transform_emr.config.dataset_config import RELEASE_TOKEN, DEATH_TOKEN, ADMISSION_TOKEN
 
-# --- Mock Setup (Reuse or place in conftest.py) ---
-class MockTAK:
-    def __init__(self, name, derived_from=None, family=None):
-        self.name = name
-        self.derived_from = derived_from
-        self.family = family
-
-class MockRepo:
-    def __init__(self, items):
-        self.items = items
-    def get(self, name):
-        return self.items.get(name)
-
+# --- Mock TAK Repo Setup (JSON format) ---
 @pytest.fixture
 def mock_tak_repo(tmp_path):
-    repo = MockRepo({
-        "A": MockTAK("A", family="raw-concept"),
-        "B": MockTAK("B", derived_from=["A"]),
-        "C": MockTAK("C", derived_from=["B"]),          # Nested derivation
-        "D": MockTAK("D", family="raw-concept"),        # Independent
-        "Pattern": MockTAK("Pattern", derived_from=["A", "D"]), # Multi-parent
-        "[NULL]": MockTAK("[NULL]", family="raw-concept"),
-        RELEASE_TOKEN: MockTAK(RELEASE_TOKEN, family="raw-concept"),
-        DEATH_TOKEN: MockTAK(DEATH_TOKEN, family="raw-concept"),
-        ADMISSION_TOKEN: MockTAK(ADMISSION_TOKEN, family="raw-concept"),
-    })
-    repo_path = tmp_path / "tak_repo.pkl"
-    with open(repo_path, "wb") as f:
-        pickle.dump(repo, f)
+    """
+    Creates a JSON TAK repo matching the structure of tak-repo-portable.json.
+    Raw concepts have derived_from: null
+    Derived concepts have derived_from: string or array
+    """
+    tak_data = {
+        "taks": {
+            # Raw concepts (derived_from is null)
+            "A": {
+                "name": "A",
+                "derived_from": None
+            },
+            "D": {
+                "name": "D",
+                "derived_from": None
+            },
+            "[NULL]": {
+                "name": "[NULL]",
+                "derived_from": None
+            },
+            RELEASE_TOKEN: {
+                "name": RELEASE_TOKEN,
+                "derived_from": None
+            },
+            DEATH_TOKEN: {
+                "name": DEATH_TOKEN,
+                "derived_from": None
+            },
+            ADMISSION_TOKEN: {
+                "name": ADMISSION_TOKEN,
+                "derived_from": None
+            },
+            # Derived concepts
+            "B": {
+                "name": "B",
+                "derived_from": "A"  # Single derivation
+            },
+            "C": {
+                "name": "C",
+                "derived_from": "B"  # Nested derivation (C -> B -> A)
+            },
+            "Pattern": {
+                "name": "Pattern",
+                "derived_from": ["A", "D"]  # Multi-parent
+            },
+            # Additional concepts for other tests
+            "LongInterval": {
+                "name": "LongInterval",
+                "derived_from": "A"
+            },
+            "InstantEvent": {
+                "name": "InstantEvent",
+                "derived_from": "A"
+            },
+            "Event_A": {
+                "name": "Event_A",
+                "derived_from": "A"
+            },
+            "Event_B": {
+                "name": "Event_B",
+                "derived_from": "D"
+            }
+        },
+        "graph": {},
+        "execution_order": []
+    }
+    
+    repo_path = tmp_path / "tak_repo.json"
+    with open(repo_path, "w", encoding="utf-8") as f:
+        json.dump(tak_data, f, indent=2)
     return str(repo_path)
 
 @pytest.fixture

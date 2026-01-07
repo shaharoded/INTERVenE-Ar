@@ -119,9 +119,9 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
             context_vec=context
         )
     # Check shapes
-    assert logits.shape == (B, T+1, V), f"Expected logits shape {(B, T+1, V)}, got {logits.shape}"
-    assert abs_t.shape == (B, T+1), f"Expected abs_t shape {(B, T+1)}, got {abs_t.shape}"
-    assert outcomes.shape == (B, T+1, model.num_outcomes), f"Expected outcomes shape {(B, T+1, model.num_outcomes)}, got {outcomes.shape}"
+    assert logits.shape == (B, T, V), f"Expected logits shape {(B, T, V)}, got {logits.shape}"
+    assert abs_t.shape == (B, T), f"Expected abs_t shape {(B, T)}, got {abs_t.shape}"
+    assert outcomes.shape == (B, T, model.num_outcomes), f"Expected outcomes shape {(B, T, model.num_outcomes)}, got {outcomes.shape}"
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_transformer_forward_gpu(mini_transformer, mini_tokenizer):
@@ -151,5 +151,5 @@ def test_transformer_forward_gpu(mini_transformer, mini_tokenizer):
     # Check device and shapes
     assert logits.device.type == 'cuda'
     assert abs_t.device.type == 'cuda'
-    assert logits.shape == (B, T+1, V)
-    assert abs_t.shape == (B, T+1)
+    assert logits.shape == (B, T, V)
+    assert abs_t.shape == (B, T)

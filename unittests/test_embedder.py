@@ -57,6 +57,13 @@ def test_embedder_initialization(mini_tokenizer):
 
 @pytest.mark.order(3)
 def test_embedder_forward_and_mask_predict(mini_tokenizer):
+    """
+    Verify shapes for AdaLN-Zero embedder:
+    - Returns (seq, cond) tuple by default.
+    - seq shape is [B, T, D] (NO prepended CTX).
+    - cond shape is [B, D].
+    - Returns (seq, cond, mask) if requested.
+    """
     tokenizer = mini_tokenizer
     ctx_dim = 2
     embed_dim = 7
@@ -75,15 +82,23 @@ def test_embedder_forward_and_mask_predict(mini_tokenizer):
         'abs_ts':          torch.zeros(B, T),
         'patient_contexts': torch.zeros(B, ctx_dim)
     }
-    # forward without mask
-    seq = model(**dummy)
-    assert seq.shape == (B, T+1, embed_dim)
-    # forward with mask
-    seq2, mask = model.forward(**dummy, return_mask=True)
-    assert seq2.shape == (B, T+1, embed_dim)
-    assert mask.shape == (B, T+1)
+    
+    # 1. Forward without mask -> Expect (seq, cond)
+    seq, cond = model(**dummy)
+    
+    # Assert sequence length is preserved (T), not T+1
+    assert seq.shape == (B, T, embed_dim), f"Expected seq shape {(B,T,embed_dim)}, got {seq.shape}"
+    # Assert condition embedding is correct
+    assert cond.shape == (B, embed_dim), f"Expected cond shape {(B,embed_dim)}, got {cond.shape}"
 
-    # test predict_time
+    # 2. Forward with mask -> Expect (seq, cond, mask)
+    seq2, cond2, mask = model.forward(**dummy, return_mask=True)
+    
+    assert seq2.shape == (B, T, embed_dim)
+    assert cond2.shape == (B, embed_dim)
+    assert mask.shape == (B, T), f"Expected mask shape {(B,T)}, got {mask.shape}"
+
+    # 3. Test predict_time (unchanged)
     pred_t = model.predict_time(dummy['abs_ts'])
     assert pred_t.shape == (B, T, 1)
     assert (pred_t >= 0).all() and (pred_t <= 1).all()
@@ -113,12 +128,14 @@ def test_forward_with_decoder_logits(mini_tokenizer):
      "value_ids":       dummy['value_ids'],
      "position_ids":    dummy['position_ids'],
      "abs_ts":          dummy['abs_ts'],
-     # note: forward_with_decoder pulls patient_contexts from "context_vec"
+     # forward_with_decoder pulls from "context_vec" key
      "context_vec":     dummy['patient_contexts'],
     }
-    logits = model.forward_with_decoder(
-        batch
-    )
+    
+    # This calls internal forward ->unpack (seq, cond) -> decoder(seq)
+    logits = model.forward_with_decoder(batch)
+    
     # forward_with_decoder predicts next-token logits: [B, T, vocab_size]
+    # No [CTX] prepended, so T remains T.
     vocab_size = len(tokenizer.token2id)
-    assert logits.shape == (B, T, vocab_size)
+    assert logits.shape == (B, T, vocab_size), f"Expected logits shape {(B,T,vocab_size)}, got {logits.shape}"
