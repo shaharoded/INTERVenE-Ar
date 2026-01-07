@@ -12,7 +12,7 @@ event-prediction-in-diabetes-care/
 ├── transform_emr/                     # Core Python package
 │   ├── config/                        # Configuration modules
 │   │   ├── __init__.py
-│   │   ├── tak-repo.pkl               # TAKRepository object from Mediator (see related project)
+│   │   ├── tak-repo-portable.json     # TAKRepository object from Mediator (see related project)
 │   │   ├── dataset_config.py
 │   │   └── model_config.py
 │   ├── __init__.py                    
@@ -22,7 +22,7 @@ event-prediction-in-diabetes-care/
 │   ├── train.py                       # Full training pipeline (2-phase)
 │   ├── inference.py                   # Inference pipeline
 │   ├── evaluation.ipynb               # Evaluation notebook
-│   ├── loss.py                        # Utility module for special loss (auxillary) criterias
+│   ├── loss.py                        # Utility module for special loss criterias
 │   ├── utils.py                       # Utility functions for the package (plots + penalties)
 │   └── debug_tools.py                 # Debug loop for epochs (logits)
 ├── data/                              # External data folder (for synthetic or real EMR)
@@ -213,7 +213,7 @@ Per-patient Event Tokenization (with normalized absolute timestamps)
 📚 Phase 2 – Pre-train a Transformer decoder over learned embeddings, as a next-token-prediction task.
 │
 ▼
-→ Predict next medical events and deduce outcome predictions from them (in `evaluation.ipynb`)
+→ Predict next medical events (token + time) and deduce outcome predictions from them (in `evaluation.ipynb`)
 
 ---
 
@@ -249,8 +249,14 @@ The embedder uses:
 - 4 levels of tokens - The event token is seperated to 4 hierarichal components to impose similarity between tokens of the same domain: `GLUCOSE` -> `GLUCOSE_TREND` -> `GLUCOSE_TREND_Inc` -> `GLUCOSE_TREND_Inc_START`
 - 1 level of time - ABS T from ADMISSION, to understand global patterns and relationships between non sequential events.
 
+This architecture constructs event representations by concatenating five hierarchical levels: Raw Concept, Concept, Value, Position, and Absolute Time. This creates a dense vector that captures the intrinsic hierarchy of medical concepts (e.g., Glucose_High is a child of Glucose) while explicitly binding them to their timestamp.
+
+We choose concatenation (Early Fusion) for the temporal component-unlike the standard additive approach to preserve the integrity of the medical signal. By keeping the time dimensions separate from the concept dimensions in the input, the model can clearly distinguish the "what" from the "when". This ensures that the core identity of a pathology (e.g., Hyperglycemia) remains stable and recognizable ("Hyperglycemia is Hyperglycemia") regardless of its timing, while allowing the projection layer to learn how time modifies its clinical significance (e.g., Morning vs. Evening).
+
+Context Handling To condition these embeddings on static patient attributes (e.g., Age, Sex), we project the patient context vector and add it to the event sequence. This acts as a global bias, shifting the entire event manifold into a patient-specific subspace. This ensures that even before the Transformer layers, the event representations are already calibrated to the patient's demographic risk profile.
+
 The training uses next token prediction loss (k-window BCE) + time prediction MSE (Δt) + MLM prediction loss.
-MLM will avoid masking tokens which will damage the broader meaning like ADMISSION, [CTX], TERMINAL_OUTCOMES...
+MLM will avoid masking tokens which will damage the broader meaning like ADMISSION, TERMINAL_OUTCOMES...
 
 ---
 
@@ -260,6 +266,8 @@ MLM will avoid masking tokens which will damage the broader meaning like ADMISSI
 |--------------------|---------------------------------------------------------------------------------------------------|
 | `GPT`               | Transformer decoder stack over learned embeddings for next token prediction, with an additional head for delta_t prediction. Model inputs a trained embedder.                                               |
 | `CausalSelfAttention` | Multi-head attention using causal mask to enforce chronology.                                 |
+| `MLP` | SwiGLU MLP (SiLU Gating), based on common LLM optimizations.                                 |
+| `AdaLNBlock` | Transformer block with AdaLN-Zero conditioning (adaptive layer norm), to bias prediction based on the patient context.                                 |
 | `train_transformer()` | Complete training logic for the model using a BCE with multi-hot targets to account for EMR irregularities.                         |
 
 ⚙️ **Phase 2: Learning Sequence Dependencies**  

@@ -134,6 +134,9 @@ class EMREmbedding(nn.Module):
         )
 
         # --- patient‑context slot ----------------------------------------
+        # NOTE: This projection is separate from event embeddings. 
+        # It is not added to event embeddings, nor learns during phase‑1.
+        # Instead, it is passed separately to the transformer, which uses it in AdaLN layers, which will then propagate gradients back here.
         self.context_proj = nn.Linear(ctx_dim, embed_dim, bias=False)
 
         # --- Final projection ---
@@ -226,12 +229,12 @@ class EMREmbedding(nn.Module):
         Runs full forward pass + decoding (for training phase 1).
         Unpack tuple (ignore cond for simple decoding task, or use it if decoder depended on it)
         In Phase 1, we just predict tokens from embeddings. 
-        AdaLN isn't used here unless we add transformer blocks to Phase 1.
+        We are using the context projection in order to bias the embeddings with patient context.
 
         Returns:
             logits: [B, T, vocab_size] — scores for next-token prediction
         """
-        seq, _ = self.forward(
+        seq, cond = self.forward(
         parent_raw_ids=batch["parent_raw_ids"],
         concept_ids=batch["concept_ids"],
         value_ids=batch["value_ids"],
@@ -241,7 +244,12 @@ class EMREmbedding(nn.Module):
         return_mask=False
         )  # → returns only [B,T,D]
 
-        return self.decoder(seq)  # [B,T,V], Predict next token at each step
+        # Additive Interaction
+        # Broadcast context [B, D] -> [B, 1, D] and add to sequence.
+        # This biases the event representations based on patient static data.
+        combined_embedding = seq + cond.unsqueeze(1)
+
+        return self.decoder(combined_embedding)  # [B,T,V], Predict next token at each step
     
 
     def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None):
@@ -252,7 +260,7 @@ class EMREmbedding(nn.Module):
         Returns:
             mlm_logits [B, T, vocab_size]
         """
-        seq, _ = self.forward(
+        seq, cond = self.forward(
         parent_raw_ids=batch["parent_raw_ids"],
         concept_ids=batch["concept_ids"],
         value_ids=batch["value_ids"],
@@ -261,7 +269,8 @@ class EMREmbedding(nn.Module):
         patient_contexts=batch["context_vec"],
         return_mask=False
         )    # [B,T,D]
-        logits = self.mlm_head(seq)
+        combined_embedding = seq + cond.unsqueeze(1)
+        logits = self.mlm_head(combined_embedding)
         
         if mlm_mask is not None:
             logits = logits[mlm_mask] # flatten to [N_masked,V]
