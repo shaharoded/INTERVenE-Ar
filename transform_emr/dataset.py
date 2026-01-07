@@ -5,6 +5,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from joblib import dump
 import pickle
+import json
 import numpy as np
 from collections import Counter
 from typing import Dict, Optional, List
@@ -34,14 +35,18 @@ class DataProcessor:
                  max_input_days=None, 
                  scaler=None, 
                  checkpoint_path=CHECKPOINT_PATH):
-        with open(tak_repo_path, "rb") as f:
-            self.repo = pickle.load(f)
-
+        # Load TAK repository from JSON
+        if not tak_repo_path.endswith('.json'):
+            raise ValueError(f"TAK repo must be a JSON file, got: {tak_repo_path}")
+        
+        with open(tak_repo_path, 'r', encoding='utf-8') as f:
+            json_data = json.load(f)
+        
+        self.repo = json_data.get('taks')
         if self.repo is None:
-            raise ValueError("TAKRepository failed to load (None).")
-
-        if not hasattr(self.repo, "get"):
-            raise ValueError("TAKRepository must expose a .get(name) method.")
+            raise ValueError("JSON file missing 'taks' key.")
+        if not isinstance(self.repo, dict):
+            raise ValueError("'taks' must be a dictionary.")
         
         # Handle compatability issue in complete flow
         if "StartTime" in df.columns and "EndTime" in df.columns:
@@ -228,14 +233,14 @@ class DataProcessor:
         Adds a 'ParentRawConcepts' column to self.df, which contains a list of
         top-level raw concepts for each ConceptName based on the TAKRepository.
         """
-        def __deps_from_derived_from(tak_obj):
+        def __deps_from_derived_from(name: str, tak_dict: dict):
             """
-            Get the list of TAK names that the given TAK object is derived from.
+            Get the list of TAK names that the given TAK is derived from.
             """
-            if not hasattr(tak_obj, "derived_from"):
-                raise ValueError(f"TAK '{tak_obj.name}' has no 'derived_from' attribute.")
+            if 'derived_from' not in tak_dict:
+                raise ValueError(f"TAK '{name}' has no 'derived_from' field.")
 
-            df = tak_obj.derived_from
+            df = tak_dict['derived_from']
 
             if df is None:
                 return []
@@ -252,12 +257,12 @@ class DataProcessor:
                         out.append(item)
                     else:
                         raise ValueError(
-                            f"Invalid derived_from entry in TAK '{tak_obj.name}': {item}"
+                            f"Invalid derived_from entry in TAK '{name}': {item}"
                         )
                 return out
 
             raise ValueError(
-                f"Invalid derived_from type for TAK '{tak_obj.name}': {type(df)}"
+                f"Invalid derived_from type for TAK '{name}': {type(df)}"
             )
 
         def __resolve_top_raw(name: str, seen=None) -> str:
@@ -273,21 +278,19 @@ class DataProcessor:
 
             seen.add(name)
 
-            tak = self.repo.get(name)
-            if tak is None:
+            if name not in self.repo:
                 raise ValueError(f"Concept '{name}' not found in TAKRepository.")
+            
+            tak_dict = self.repo[name]
 
-            if getattr(tak, "family", None) == "raw-concept":
-                return tak.name
-
-            deps = __deps_from_derived_from(tak)
+            # A raw concept has derived_from == null
+            deps = __deps_from_derived_from(name, tak_dict)
             if not deps:
-                raise ValueError(
-                    f"TAK '{name}' is not raw-concept and has empty derived_from."
-                )
+                # This is a raw concept (derived_from is null)
+                return name
 
             if len(deps) > 1:
-                # This should only happen for patterns, but still supported
+                # This should only happen for patterns/events that combine multiple raw concepts
                 raise ValueError(
                     f"Non-pattern TAK '{name}' has multiple derived_from parents: {deps}"
                 )
@@ -296,21 +299,20 @@ class DataProcessor:
         
 
         def _parents_for_concept(concept_name: str):
-            if concept_name in ("[NULL]", "[CTX]", "[MASK]", "[PAD]"):
+            if concept_name in ("[NULL]", "[MASK]", "[PAD]"):
                 return ["[NULL]"]
-            tak = self.repo.get(concept_name)
-            if tak is None:
+            
+            if concept_name not in self.repo:
                 raise ValueError(f"Concept '{concept_name}' not found in TAKRepository.")
-
-            deps = __deps_from_derived_from(tak)
+            
+            tak_dict = self.repo[concept_name]
+            deps = __deps_from_derived_from(concept_name, tak_dict)
+            
             if not deps:
-                # raw concepts must have empty derived_from
-                if getattr(tak, "family", None) != "raw-concept":
-                    raise ValueError(
-                        f"TAK '{concept_name}' has no derived_from but is not raw-concept."
-                    )
-                return [tak.name]
+                # This is a raw concept (derived_from is null)
+                return [concept_name]
 
+            # Resolve all dependencies to their raw parents
             parents = set()
             for dep in deps:
                 parents.add(__resolve_top_raw(dep))
@@ -456,7 +458,6 @@ class EMRTokenizer:
         token_counts (torch.Tensor): Token counts (distribution).
         pad_token_id (int): ID for padding token.
         mask_token_id (int): ID for MASK token.
-        ctx_token_id (int): ID for context token.
         null_token_id (int): ID for NULL token.
     """
     def __init__(self, token2id, rawconcept2id, concept2id, value2id, special_tokens, 
@@ -476,7 +477,7 @@ class EMRTokenizer:
         self.parent_pad_len = parent_pad_len
         
         # Validate presence of mandatory special tokens
-        required_specials = ["[PAD]", "[MASK]", "[NULL]", "[CTX]"]
+        required_specials = ["[PAD]", "[MASK]", "[NULL]"]
         for tok in required_specials:
             if tok not in token2id:
                 raise ValueError(f"[Tokenizer Error] Missing required special token: {tok}")
@@ -484,11 +485,9 @@ class EMRTokenizer:
         self.pad_token_id = token2id["[PAD]"]
         self.mask_token_id = token2id["[MASK]"]
         self.null_token_id = token2id["[NULL]"]
-        self.ctx_token_id = token2id["[CTX]"]
-
 
     @classmethod
-    def from_processed_df(cls, df, special_tokens=["[PAD]", "[MASK]", "[NULL]", "[CTX]"]):
+    def from_processed_df(cls, df, special_tokens=["[PAD]", "[MASK]", "[NULL]"]):
         """
         Takes in a processed dataframe from DataProcessor.run() and builds the 
         tokenizer vocabularies and weights.
