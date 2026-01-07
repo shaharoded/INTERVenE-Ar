@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "transform_emr"
 version = "0.1"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "pandas",
     "numpy", 
-    "torch",
+    "torch>=2.0.0",
     "scikit-learn",
     "matplotlib>=3.7.0",
     "tqdm",

@@ -320,3 +320,8 @@ This work builds on and adapts ideas from the following sources:
 - **nanoGPT** (Karpathy, 2023):  
   The training loop and transformer backbone are adapted from [nanoGPT](https://github.com/karpathy/nanoGPT),  
   with modifications for multi-stream EMR inputs, multiple embeddings, and a k-step prediction loss.
+
+- **AdaLN-Zero** (Peebles, W., & Xie, S., 2023):  
+  Inspired by the paper "Scalable diffusion models with transformers", I added a customized block to the transformer designed to allow static context influence all generation steps. The [paper](https://openaccess.thecvf.com/content/ICCV2023/papers/Peebles_Scalable_Diffusion_Models_with_Transformers_ICCV_2023_paper.pdf) uses this method to inform the diffusion model of the label of the image it should generate.
+
+And more...

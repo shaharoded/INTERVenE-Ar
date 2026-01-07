@@ -265,9 +265,10 @@ class DataProcessor:
                 f"Invalid derived_from type for TAK '{name}': {type(df)}"
             )
 
-        def __resolve_top_raw(name: str, seen=None) -> str:
+        def __resolve_top_raw(name: str, seen=None) -> List[str]:
             """
-            Recursively resolves the top-level raw concept for a given TAK name.
+            Recursively resolves the top-level raw concept(s) for a given TAK name.
+            Returns a list of raw concept names (can be multiple for patterns/events).
             Raises an error if a cycle is detected or if the TAK is not found.
             """
             if seen is None:
@@ -287,15 +288,14 @@ class DataProcessor:
             deps = __deps_from_derived_from(name, tak_dict)
             if not deps:
                 # This is a raw concept (derived_from is null)
-                return name
+                return [name]
 
-            if len(deps) > 1:
-                # This should only happen for patterns/events that combine multiple raw concepts
-                raise ValueError(
-                    f"Non-pattern TAK '{name}' has multiple derived_from parents: {deps}"
-                )
-
-            return __resolve_top_raw(deps[0], seen)
+            # Recursively resolve each dependency (handles both single and multi-parent cases)
+            all_raw_parents = []
+            for dep in deps:
+                all_raw_parents.extend(__resolve_top_raw(dep, seen.copy()))
+            
+            return all_raw_parents
         
 
         def _parents_for_concept(concept_name: str):
@@ -313,9 +313,11 @@ class DataProcessor:
                 return [concept_name]
 
             # Resolve all dependencies to their raw parents
+            # __resolve_top_raw now returns a list, so we need to flatten
             parents = set()
             for dep in deps:
-                parents.add(__resolve_top_raw(dep))
+                raw_parents = __resolve_top_raw(dep)
+                parents.update(raw_parents)
 
             return sorted(parents)
         
@@ -888,7 +890,7 @@ def get_dataloader(
         collate_fn,
         *,
         oversample: bool = False,
-        num_workers: int = os.cpu_count(),
+        num_workers: int = None,
         replacement: bool = True,
         class_weights: Optional[Dict] = None,
 ):
@@ -896,6 +898,9 @@ def get_dataloader(
     Build a DataLoader for an EMRDataset.
     If `oversample=True`, uses a WeightedRandomSampler to balance terminal outcomes.
     """
+    # Set sensible default for num_workers
+    if num_workers is None:
+        num_workers = min(os.cpu_count(), 4) if torch.cuda.is_available() else 0
 
     # ---------- helper ----------
     def _label_visit(token_df, tokenizer):
@@ -928,7 +933,7 @@ def get_dataloader(
                           shuffle=True,
                           collate_fn=collate_fn,
                           num_workers=num_workers,
-                          pin_memory=True)
+                          pin_memory=torch.cuda.is_available())
 
     # ---------- build sample weights ----------
     labels = [_label_visit(dataset.patient_groups[pid], dataset.tokenizer)
@@ -950,4 +955,4 @@ def get_dataloader(
                       sampler=sampler,
                       collate_fn=collate_fn,
                       num_workers=num_workers,
-                      pin_memory=True)
+                      pin_memory=torch.cuda.is_available())

@@ -83,8 +83,7 @@ class EMREmbedding(nn.Module):
       - Patient-level context vector (e.g., age, sex, No. prior admissions in 6 months)
 
     These components are embedded, concatenated, and projected into a shared
-    fixed-size embedding space. A special [CTX] token is prepended to each sequence
-    to incorporate patient-level context at the start of modeling.
+    fixed-size embedding space. A [CTX] projection is added to each sequence to incorporate patient-level context.
 
     All embeddings are regularized with dropout and normalized with LayerNorm.
 
@@ -135,7 +134,6 @@ class EMREmbedding(nn.Module):
         )
 
         # --- patient‑context slot ----------------------------------------
-        self.ctx_token  = nn.Parameter(torch.randn(embed_dim)) # learnable [CTX] token
         self.context_proj = nn.Linear(ctx_dim, embed_dim, bias=False)
 
         # --- Final projection ---
@@ -182,8 +180,9 @@ class EMREmbedding(nn.Module):
             return_mask (bool): Whether to return an attention mask
 
         Returns:
-            embeddings:   [B, T+1, D] — [CTX] prepended
-            attention_mask (optional): [B, T+1] (True for real tokens)
+                    seq:  [B, T, D]  (Event embeddings)
+                    cond: [B, D]     (Patient context for AdaLN blocks of the transformer)
+                    mask: [B, T]     (Padding mask, if return_mask=True)
         """
         # --- Token lookups ---
         
@@ -210,31 +209,29 @@ class EMREmbedding(nn.Module):
         ev_vec = self.final_proj(combined)                                 # [B, T, D]
         ev_vec = self.dropout(ev_vec) / self.scale                         # [B, 1, D]
 
-        # --- [CTX] slot ---
-        # Time embedding for context token with abs_ts = 0
-        ctx_time = self.time_proj(self.time2vec_abs(torch.zeros_like(abs_ts[:, :1])))  # [B, 1, D]
-        ctx_vec = self.ctx_token + self.context_proj(patient_contexts) + ctx_time.squeeze(1)  # [B, D]
-        ctx_vec = ctx_vec.unsqueeze(1)                                  # [B, 1, D]
+        # --- Sequence Norm ---
+        seq = self.layernorm(ev_vec) # [B, T, D]
 
-        seq = torch.cat([ctx_vec, ev_vec], dim=1)                       # [B, T+1, D]
-        seq = self.layernorm(seq)
+        # --- Patient Context (Separated for AdaLN) ---
+        cond = self.context_proj(patient_contexts)      # [B, D]
 
         if return_mask:
             pad_mask = (position_ids != self.padding_idx)
-            pad_mask = torch.cat([torch.ones_like(pad_mask[:, :1]), pad_mask], dim=1)
-            return seq, pad_mask
+            return seq, cond, pad_mask
 
-        return seq
+        return seq, cond
     
     def forward_with_decoder(self, batch: dict):
         """
         Runs full forward pass + decoding (for training phase 1).
-        Same inputs as forward_with_decoder
+        Unpack tuple (ignore cond for simple decoding task, or use it if decoder depended on it)
+        In Phase 1, we just predict tokens from embeddings. 
+        AdaLN isn't used here unless we add transformer blocks to Phase 1.
 
         Returns:
             logits: [B, T, vocab_size] — scores for next-token prediction
         """
-        seq = self.forward(
+        seq, _ = self.forward(
         parent_raw_ids=batch["parent_raw_ids"],
         concept_ids=batch["concept_ids"],
         value_ids=batch["value_ids"],
@@ -242,9 +239,9 @@ class EMREmbedding(nn.Module):
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
         return_mask=False
-        )  # → returns only [B,T+1,D]
+        )  # → returns only [B,T,D]
 
-        return self.decoder(seq[:, :-1, :])  # Predict next token at each step
+        return self.decoder(seq)  # [B,T,V], Predict next token at each step
     
 
     def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None):
@@ -263,10 +260,11 @@ class EMREmbedding(nn.Module):
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
         return_mask=False
-        )    # [B,T+1,D]
-        logits = self.mlm_head(seq[:, 1:, :])                  # drop [CTX]
+        )    # [B,T,D]
+        logits = self.mlm_head(seq)
+        
         if mlm_mask is not None:
-            logits = logits[mlm_mask]                          # flatten to [N_masked,V]
+            logits = logits[mlm_mask] # flatten to [N_masked,V]
         return logits
     
     def save(self, epoch, best_val, optimizer, scheduler, path):
@@ -425,11 +423,11 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             )
 
             multi_hot_targets = get_multi_hot_targets(
-                                                    position_ids=batch["position_ids"], 
-                                                    padding_idx=embedder.padding_idx, 
-                                                    vocab_size=bce_logits.size(-1), 
-                                                    k=training_settings["bce_k_window"]
-                                                    ).masked_fill(illegal, 0.0)
+                                position_ids=batch["position_ids"], 
+                                padding_idx=embedder.padding_idx, 
+                                vocab_size=bce_logits.size(-1), 
+                                k=training_settings["bce_k_window"]
+                                ).masked_fill(illegal, 0.0)
 
             raw = loss_fn(bce_logits, multi_hot_targets)       # [B, T, V], Per-element loss
             weights = ((~illegal) & (batch["position_ids"] != embedder.padding_idx).unsqueeze(-1)).float()  # [B,T,V]
@@ -440,10 +438,9 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             
             # MLM Logits + Loss
             mlm_logits = embedder.forward_with_mlm(
-                                                    batch,
-                                                    mlm_mask=mlm_mask,
-                                                    masked_pos_ids=masked_pos_ids
-                                                )
+                                                batch,
+                                                mlm_mask=mlm_mask,
+                                                masked_pos_ids=masked_pos_ids)
             mlm_labels = batch["position_ids"][mlm_mask]          # ground truth
             mlm_loss = F.cross_entropy(
                 mlm_logits,

@@ -191,7 +191,6 @@ def build_mlm(ids, tokenizer, p=0.15):
     device = ids.device
     never_mask_ids = {
         tokenizer.pad_token_id,
-        tokenizer.ctx_token_id,
         tokenizer.null_token_id,
         tokenizer.token2id.get(ADMISSION_TOKEN),
         *[tokenizer.token2id[tok] for tok in TERMINAL_OUTCOMES],
@@ -462,7 +461,6 @@ def build_luts(tokenizer):
     # ---- forbid list for CBM ----
     forbid = {
         tokenizer.pad_token_id,
-        tokenizer.ctx_token_id,
         tokenizer.null_token_id,
         tokenizer.token2id.get(ADMISSION_TOKEN),
         *[tokenizer.token2id.get(t) for t in TERMINAL_OUTCOMES],
@@ -477,8 +475,7 @@ def build_luts(tokenizer):
     # ---- forbid list for Decoder ----
     block_ids = {
         tokenizer.pad_token_id,
-        tokenizer.mask_token_id,
-        tokenizer.ctx_token_id
+        tokenizer.mask_token_id
     }
     block_ids = [tid for tid in block_ids if tid is not None]
 

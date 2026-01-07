@@ -23,10 +23,9 @@ from transform_emr.loss import MaskedFocalBCE
 
 def _embedder_seq(model, batch):
     """
-    Returns the per-step event embeddings from the embedder: [B, T+1, D].
-    Aligns with your forward that prepends [CTX].
+    Returns the per-step event embeddings from the embedder: [B, T, D].
     """
-    emb = model.embedder.forward(   # your embedder returns embeddings here
+    emb, _ = model.embedder.forward(   # your embedder returns embeddings here
         raw_concept_ids=batch["raw_concept_ids"],
         concept_ids=batch["concept_ids"],
         value_ids=batch["value_ids"],
@@ -35,7 +34,7 @@ def _embedder_seq(model, batch):
         patient_contexts=batch["context_vec"],
         return_mask=False,
     )
-    return emb  # [B, T+1, D]
+    return emb  # [B, T, D]
 
 
 def _guess_families(tokenizer, max_groups: int = 8):
@@ -198,9 +197,9 @@ def vocab_cleanup_report(
             context_vec=batch["context_vec"],
         )
 
-        # predict next for steps 1..T (drop [CTX] prediction)
-        pred_logits = logits[:, 1:, :]                # [B,T,V]
-        target_ids  = batch["targets"]                # [B,T]
+        # predict next for steps 1..T
+        pred_logits = logits[:, :-1, :]       # [B, T-1, V]
+        target_ids  = batch["targets"][:, 1:] # [B, T-1]
         illegal_mask, bonus_mask = compute_legality_masks_tf(
             target_ids, luts["is_start"], luts["is_end"], luts["base_id"],
             luts["start_ids_per_base"], luts["end_ids_per_base"],
@@ -354,8 +353,8 @@ def token_gradient_utility_report(
             "context_vec":     batch["context_vec"],
         })
 
-        pred_logits = logits[:, 1:, :]                      # [B,T,V]
-        target_ids  = batch["targets"]                      # [B,T]
+        pred_logits = logits[:, :-1, :]
+        target_ids  = batch["targets"][:, 1:]
         illegal, bonus = compute_legality_masks_tf(
             target_ids, luts["is_start"], luts["is_end"], luts["base_id"],
             luts["start_ids_per_base"], luts["end_ids_per_base"],
@@ -446,8 +445,7 @@ def embedder_representation_report(
         if batches_done > max_batches_probe:
             break
         batch = {k: v.to(device) for k, v in batch.items()}
-        emb = _embedder_seq(model, batch)                   # [B, T+1, D]
-        ev = emb[:, :-1, :]                                 # align with positions 0..T-1
+        ev = _embedder_seq(model, batch)                   # [B, T, D]
         tgt = batch["position_ids"]                         # [B, T]
         pad = tk.pad_token_id
 

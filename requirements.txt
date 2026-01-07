@@ -1,6 +1,6 @@
 pandas
 numpy
-torch
+torch >= 2.0.0
 scikit-learn
 matplotlib>=3.7.0
 tqdm

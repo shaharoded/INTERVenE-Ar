@@ -22,17 +22,6 @@ from transform_emr.utils import *
 from transform_emr.loss import MaskedFocalBCE, MaskedSetCE
 
 
-# ───────── helpers ─────────────────────────────────────────────────────────── #
-class LayerNorm(nn.Module):
-    def __init__(self, ndim, bias=True):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias   = nn.Parameter(torch.zeros(ndim)) if bias else None
-
-    def forward(self, x):
-        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
-
-
 # ───────── components ─────────────────────────────────────────────────────────── #
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention (no rotary/ALiBi; same math as GPT-2)."""
@@ -47,13 +36,6 @@ class CausalSelfAttention(nn.Module):
         self.proj  = nn.Linear(cfg["embed_dim"], cfg["embed_dim"],    bias=cfg["bias"])
         self.attn_dropout  = nn.Dropout(cfg["dropout"])
         self.resid_dropout = nn.Dropout(cfg["dropout"])
-
-        # pre‑built causal mask (triangular) – trimmed in forward
-        self.register_buffer(
-            "causal_mask",
-            torch.tril(torch.ones(cfg["block_size"], cfg["block_size"]))
-            .view(1, 1, cfg["block_size"], cfg["block_size"])
-        )
     
     def forward(self, x, key_pad_mask=None):
         B, T, C = x.shape
@@ -62,9 +44,9 @@ class CausalSelfAttention(nn.Module):
 
         # -- reshape to (B, h, T, d) so SDPA attends along time --
         hd = C // self.n_head
-        q = q.view(B, T, self.n_head, hd).permute(0, 2, 1, 3).contiguous()
-        k = k.view(B, T, self.n_head, hd).permute(0, 2, 1, 3).contiguous()
-        v = v.view(B, T, self.n_head, hd).permute(0, 2, 1, 3).contiguous()
+        q = q.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
+        k = k.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
+        v = v.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
 
         # boolean key mask: True==keep, False==pad → convert to "mask these keys"
         attn_mask = None
@@ -72,21 +54,13 @@ class CausalSelfAttention(nn.Module):
             # key_pad_mask: [B, T] (includes CTX=True at col 0)
             attn_mask = (~key_pad_mask).unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T], True means "mask"
 
-        if hasattr(F, "scaled_dot_product_attention"):
-            attn = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=attn_mask,
-                dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=True
-            )  # -> [B, h, T, d]
-        else:
-            # fallback keeps shapes consistent with (B,h,T,d)
-            d_k = q.size(-1)
-            scores = (q @ k.transpose(-2, -1)) / math.sqrt(d_k)     # [B,h,T,T]
-            if attn_mask is not None:
-                scores = scores.masked_fill(attn_mask, float("-inf"))
-            p = F.softmax(scores, dim=-1)
-            attn = p @ v                                           # [B,h,T,d]
+        # Flash Attention (is_causal=True handles the triangular mask internally)
+        attn = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+            is_causal=True
+        )  # -> [B, h, T, d]
 
         y = attn.transpose(1, 2).contiguous().view(B, T, C)         # -> [B, T, C]
         y = self.proj(y)
@@ -94,29 +68,91 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
+    """
+    SwiGLU MLP (SiLU Gating).
+    Projects to a higher dimension, splits into Gate and Value, and multiplies them.
+    Standard optimization for modern LLMs (LLaMA-style).
+    """
     def __init__(self, cfg):
         super().__init__()
-        self.w1 = nn.Linear(cfg["embed_dim"], 2 * cfg["embed_dim"], bias=cfg["bias"])
-        self.w2 = nn.Linear(   cfg["embed_dim"],     cfg["embed_dim"], bias=cfg["bias"])
+        # Standard GPT uses 4x expansion. 
+        # For SwiGLU, we project to 2 * (4 * dim) so we can split it into two 4x vectors.
+        hidden_dim = 4 * cfg["embed_dim"]
+        
+        self.w1 = nn.Linear(cfg["embed_dim"], 2 * hidden_dim, bias=cfg["bias"])
+        self.w2 = nn.Linear(hidden_dim, cfg["embed_dim"], bias=cfg["bias"])
         self.drop = nn.Dropout(cfg["dropout"])
+
     def forward(self, x):
-        x, gate = self.w1(x).chunk(2, dim=-1)
-        return self.drop(self.w2(F.gelu(x) * gate))
+        # 1. Project to double width
+        projected = self.w1(x)
+        
+        # 2. Split into x (content) and g (gate)
+        x_val, x_gate = projected.chunk(2, dim=-1)
+        
+        # 3. Gating: Val * SiLU(Gate)
+        out = x_val * F.silu(x_gate)
+        
+        # 4. Project back
+        return self.drop(self.w2(out))
 
 
-class Block(nn.Module):
+class AdaLNBlock(nn.Module):
+    """
+    Transformer block with AdaLN-Zero conditioning.
+    
+    Instead of adding [CTX] to the sequence, we inject patient context into
+    the normalization layers of *every* block.
+    
+    Mechanism:
+        1. Project context_emb -> (scale, shift, gate)
+        2. Norm(x) = (x - mu)/sigma * (1 + scale) + shift
+        3. Output = x + gate * Block(Norm(x))
+    
+    Zero Initialization:
+        We initialize the modulation projection to 0. This ensures that at the 
+        start of training, the block acts as an identity function (ignoring context),
+        which stabilizes deep training.
+    """
     def __init__(self, cfg):
-        super().__init__()
-        self.cfg = cfg
-        self.ln1 = LayerNorm(cfg["embed_dim"], bias=cfg["bias"])
-        self.att = CausalSelfAttention(cfg)
-        self.ln2 = LayerNorm(cfg["embed_dim"], bias=cfg["bias"])
-        self.mlp = MLP(cfg)
+            super().__init__()
+            self.att = CausalSelfAttention(cfg)
+            self.mlp = MLP(cfg)
 
-    def forward(self, x, key_pad_mask=None):
-        res_scale = 1 / math.sqrt(2 * self.cfg["n_layer"])
-        x = x + res_scale * self.att(self.ln1(x), key_pad_mask=key_pad_mask)
-        x = x + res_scale * self.mlp(self.ln2(x))
+            # 1. Norms WITHOUT affine parameters (we predict them from context)
+            self.ln1 = nn.LayerNorm(cfg["embed_dim"], elementwise_affine=False, eps=1e-6)
+            self.ln2 = nn.LayerNorm(cfg["embed_dim"], elementwise_affine=False, eps=1e-6)
+
+            # 2. Modulation Head
+            # Predicts 6 params: (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp)
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(cfg["embed_dim"], 6 * cfg["embed_dim"], bias=True)
+            )
+
+            # 3. Zero Init
+            nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, x, cond_emb, key_pad_mask=None):
+        """
+        Calculate modulation parameters [B, 6*D] -> 6 x [B, D] (broadcast over T)
+        x: [B, T, D]
+        cond_emb: [B, D] (Patient Context)
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(cond_emb).chunk(6, dim=1)
+        )
+
+        # -- Attention Sub-block --
+        # modulate(ln(x))
+        norm_x = self.ln1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        x = x + gate_msa.unsqueeze(1) * self.att(norm_x, key_pad_mask=key_pad_mask)
+
+        # -- MLP Sub-block --
+        norm_x = self.ln2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(norm_x)
+
         return x
 
 
@@ -159,8 +195,8 @@ class GPT(nn.Module):
 
         # ─── Build layers ─────────────────────────────────────────────────────────────
         self.drop = nn.Dropout(cfg["dropout"])
-        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg["n_layer"])])
-        self.ln_f  = LayerNorm(cfg["embed_dim"], bias=cfg["bias"])
+        self.blocks = nn.ModuleList([AdaLNBlock(cfg) for _ in range(cfg["n_layer"])])
+        self.ln_f = nn.LayerNorm(cfg["embed_dim"], eps=1e-5) # Final Norm (Standard LayerNorm with learnable affine)
 
         # Next token prediction head (What will be the next event?)
         self.lm_head = nn.Linear(cfg["embed_dim"], vocab_size, bias=False)
@@ -173,7 +209,8 @@ class GPT(nn.Module):
         # Outcome Head (designed to propogate signal to the hidden state that there is an expected outcome soon)
         # This head maps the embedding dimension to the unique outcome classes (e.g., Death, Sepsis, Hypoglycemia, Release)
         # A simple MLP classifier
-        self.num_outcomes = len(set(OUTCOMES + TERMINAL_OUTCOMES))
+        self.outcome_names = list(set(OUTCOMES + TERMINAL_OUTCOMES))
+        self.num_outcomes = len(self.outcome_names)
         
         # A simple MLP classifier
         self.outcome_head = nn.Sequential(
@@ -285,7 +322,7 @@ class GPT(nn.Module):
         )
     
 
-    # ---------------------------------------------------- forward & loss ---- #
+# ---------------------------------------------------- forward ---- #
     def forward(self, parent_raw_ids, concept_ids, value_ids, position_ids,
             abs_ts, context_vec=None):
         """
@@ -298,73 +335,58 @@ class GPT(nn.Module):
             context_vec (torch.Tensor)       - age/gender or [] if not used, (B, C)
         
         Returns:
-            logits (FloatTensor): [B, T+1, V]
-                - Next-token logits for the sequence with a prepended [CTX].
-                - Index 0 corresponds to the [CTX] position.
-            abs_t_pred (FloatTensor): [B, T+1]
-                Monotone absolute time in [0, 1). By convention:
-                - abs_t_pred[:, 0] == 0.0 is the [CTX] slot
-                - training uses abs_t_pred[:, 1:] to align with targets of length T
-            outcome_logits (FloatTensor): [B, T+1, self.num_outcomes]
+            logits (FloatTensor): [B, T, V]
+                - Next-token logits for the sequence.
+                - logits[b, t] predicts input position_ids[b, t+1].
+                - The last logit logits[b, -1] predicts the future after the sequence ends.
+            abs_t_pred (FloatTensor): [B, T]
+                - Predicted absolute time for the *next* event.
+                - abs_t_pred[b, t] predicts the time for the event at t+1.
+            outcome_logits (FloatTensor): [B, T, self.num_outcomes]
                 - Logits over the predefined outcomes in the task.
                 - Logits are propagated to the hidden layers, informing the model on expected outcomes.
         """
-        def _forward(block, x, mask):
-            """Allows gradient checkpointing on blocks -> Memory efficient"""
-            return block(x, key_pad_mask=mask)
+        # 1. Embed (x=[B, T, D], cond=[B, D])
+        # The embedder now returns the sequence and the separate context embedding for AdaLN blocks
+        x, cond_emb, pad_mask = self.embedder(
+            parent_raw_ids, concept_ids, value_ids, position_ids,
+            abs_ts, context_vec, return_mask=True
+        )
+        x = self.drop(x)
 
-        seq, emb_mask = self.embedder(parent_raw_ids, concept_ids, value_ids, position_ids,
-            abs_ts, context_vec, return_mask=True)
-        x = self.drop(seq)  # (B, T+1, D)
-
-        B, Tp1, D = x.shape
-        assert emb_mask.shape == (B, Tp1), "embedder mask must be [B, T+1]"
-        assert emb_mask[:, 0].all(), "[CTX] slot must be True in embedder mask"
-
-        # make a T+1 mask from the batch's position_ids (T) by prepending CTX=True
-        pad_id = self.embedder.padding_idx
-        pad_mask_ctx = torch.cat(
-            [torch.ones(B, 1, dtype=torch.bool, device=x.device),
-            (position_ids != pad_id)], dim=1
-        )  # [B, T+1]
-
-        # they must match
-        assert torch.equal(emb_mask, pad_mask_ctx), \
-            "Embedder mask and (CTX+position_ids)-derived mask disagree — off-by-one or CTX wiring issue"
-        
+        # 2. Blocks with Conditioning (AdaLN)
+        # We pass cond_emb to every block to modulate the normalization layers
         for blk in self.blocks:
             if self.training and self.use_checkpoint:
-                x = checkpoint.checkpoint(_forward, blk, x, pad_mask_ctx, use_reentrant=False)
+                x = checkpoint.checkpoint(
+                    lambda x, c, m: blk(x, c, key_pad_mask=m), 
+                    x, cond_emb, pad_mask, 
+                    use_reentrant=False
+                )
             else:
-                x = blk(x, key_pad_mask=pad_mask_ctx)
+                x = blk(x, cond_emb, key_pad_mask=pad_mask)
         
-        x = self.ln_f(x)                     # [B, T+1, D]
+        x = self.ln_f(x)                     # [B, T, D]
         
-        # 1. Main next-token prediction head
-        logits = self.lm_head(x)             # [B, T+1, V]
+        # 3. Main next-token prediction head
+        logits = self.lm_head(x)             # [B, T, V]
 
-        # 2. Outcome Prediction Head (Auxiliary Task)
+        # 4. Outcome Prediction Head (Auxiliary Task)
         # Input: Contextual embedding at step t (representing history 0..t)
-        # Output: Unnormalized logits for each outcome class [B, T+1, Num_Outcomes]
+        # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
         outcome_logits = self.outcome_head(x)
 
-        # 3. Absolute time prediction (monotonic)
-        # Note: We use x[:, :-1] because x[t] predicts time[t+1]
-        time_feats = x[:, :-1, :] # features for t predict abs time at t+1  -> [B, T, D]
-        delta_raw = self.abs_t_head(time_feats).squeeze(-1)     # [B,T]
+        # 5. Absolute time prediction (monotonic)
+        # We predict the time delta to the *next* event based on the current state.
+        # x[t] contains info up to t. We predict time for t+1.
+        delta_raw = self.abs_t_head(x).squeeze(-1)     # [B,T]
         
         # Enforce non-negative deltas
         delta_pos = F.softplus(delta_raw)
         
-        # Zero PAD positions
-        delta_pos = delta_pos * (position_ids[:, :delta_pos.size(1)] != self.embedder.padding_idx).float()
-
-        # Monotone accumulation and stable mapping to (0,1)
-        csum = torch.cumsum(delta_pos, dim=1)
-        abs_t_pred = -torch.expm1(-csum)         # (0,1), smooth, stable, acts like: 1 - torch.exp(-csum)
-
-        # prepend CTX time = 0  -> [B, T+1]
-        abs_t_pred = torch.cat([torch.zeros_like(abs_t_pred[:, :1]), abs_t_pred], dim=1)
+        # Autoregressive time prediction:
+        # Predicted_Time[t+1] = Actual_Time[t] + Predicted_Delta
+        abs_t_pred = abs_ts + delta_pos                # [B, T]
 
         return logits, abs_t_pred, outcome_logits
     
@@ -374,6 +396,8 @@ class GPT(nn.Module):
             "model_state": self.state_dict(),
             "config": self.cfg,
             "vocab_size": self.embedder.decoder.out_features,
+            "outcome_names": self.outcome_names,
+            "num_outcomes": self.num_outcomes,
         }
         if epoch is not None:
             ckpt["epoch"] = epoch
@@ -395,10 +419,39 @@ class GPT(nn.Module):
         actual_vocab = embedder.decoder.out_features
         if expected_vocab != actual_vocab:
             raise ValueError(
-                f"[GPT.load] Embedder vocab size mismatch: expected {expected_vocab}, got {actual_vocab}"
+                f"[GPT.load] Embedder vocab size mismatch: checkpoint={expected_vocab}, embedder={actual_vocab}"
             )
         
+        # === Outcome configuration check ===
+        if "outcome_names" not in ckpt or "num_outcomes" not in ckpt:
+            raise ValueError(
+                "[GPT.load] Invalid checkpoint: missing 'outcome_names' or 'num_outcomes'. "
+                "Checkpoint was saved with an older version of the code."
+            )
+        
+        expected_outcome_names = set(ckpt["outcome_names"])
+        expected_num_outcomes = ckpt["num_outcomes"]
+        
+        # Validate that current config matches checkpoint
+        current_outcomes = set(OUTCOMES + TERMINAL_OUTCOMES)
+        if expected_outcome_names != current_outcomes:
+            raise ValueError(
+                f"[GPT.load] Outcome configuration mismatch!\n"
+                f"  Checkpoint outcomes: {sorted(expected_outcome_names)}\n"
+                f"  Current config outcomes: {sorted(current_outcomes)}\n"
+                f"  Please use the same OUTCOMES and TERMINAL_OUTCOMES config that was used during training."
+            )
+        
+        # Reconstruct model
         model = cls(cfg=ckpt["config"], embedder=embedder)
+        
+        # Final sanity check
+        if model.num_outcomes != expected_num_outcomes:
+            raise ValueError(
+                f"[GPT.load] Architecture mismatch: checkpoint has {expected_num_outcomes} outcomes, "
+                f"but reconstructed model has {model.num_outcomes}."
+            )
+        
         model.load_state_dict(ckpt["model_state"])
 
         # Return full training state if available
@@ -541,14 +594,25 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     context_vec=batch["context_vec"]
                 )
 
-                # logits is [B, T+1, V] due to [CTX] token prepending
-                # We want logits 0..T-1 (predictions for targets 0..T-1), which total to tokens 1 to T given context.
-                pred_logits = logits[:, :-1, :]        # [B, T, V] - predictions for positions 1 to T (no [CTX])
-                target_ids = batch["targets"]          # [B, T] - targets for positions 1 to T
+                # logits is [B, T, V]
+                # abs_t_pred: [B, T]
+                # outcome_logits: [B, T, K]
+
+                # Slice for Autoregressive Training (Predict Next Token)
+                # Input at t predicts Target at t+1.
+                # We drop the LAST input (nothing to predict after it) and the FIRST target (nothing predicts it)
+
+                # Slicing Logits (Inputs 0 to T-2)
+                pred_logits = logits[:, :-1, :]       # [B, T-1, V]
+
+                # Slicing Targets (Targets 1 to T-1)
+                full_targets = batch["targets"]
+                target_ids   = full_targets[:, 1:]    # [B, T-1] Used for loss calculation
                 
                 # === legality masks from Ground Truth + Targets ===
-                illegal_mask, bonus_mask = compute_legality_masks_tf(
-                                                target_ids,
+                # Compute on FULL targets to preserve state history (t=0)
+                full_illegal, full_bonus = compute_legality_masks_tf(
+                                                full_targets,
                                                 luts["is_start"],
                                                 luts["is_end"],
                                                 luts["base_id"],
@@ -561,6 +625,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                                 luts["predict_block"]
                                             )
                 
+                # Slice the masks to align with target_ids (drop t=0)
+                illegal_mask = full_illegal[:, 1:, :] 
+                bonus_mask   = full_bonus[:, 1:, :]
+
                 # Soft illegal-mass penalty (pre-mask)
                 # Penalize putting ANY mass on illegal tokens (using UNMASKED logits)
                 nonpad = (target_ids != model.embedder.padding_idx)                # [B,T]
@@ -570,6 +638,17 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 pred_logits = apply_masks_to_logits(
                     pred_logits.clone(), illegal_mask, bonus_mask
                 )
+
+                # Outcome Head Slicing
+                # Input at t predicts future relative to t.
+                # We align with the same truncated input sequence (0 to T-2).
+                outcome_pred = outcome_logits[:, :-1, :] # [B, T-1, K]
+
+                # Time Slicing
+                # abs_t_pred[t] is the predicted time for token[t+1]
+                # So abs_t_pred[0] should match abs_ts[1]
+                pred_abs = abs_t_pred[:, :-1]     # [B, T-1]
+                true_abs = batch["abs_ts"][:, 1:] # [B, T-1] (Shifted true times)
 
                 # === Loss: BCE with logits + CE nudge (next token generation task) ===
                 # Multi-hot targets
@@ -628,29 +707,28 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 generative_penalty = (2 * p_illegal + p_unclosed) / 3.0
                 generative_penalty = lambda_pen * generative_penalty
 
-                # === Outcome Loss Calculation ===
-                # Align: Prediction at t (using history 0..t) predicts future of t
-                outcome_pred = outcome_logits[:, :-1, :]  # [B, T, K]
-                
+                # === Outcome Loss Calculation ===                
                 # Targets: "Does outcome K happen in future relative to t?"
-                outcome_targets = get_future_outcome_targets(
-                    target_ids,           # [B, T]
+                all_outcome_targets = get_future_outcome_targets(
+                    full_targets,           # [B, T]
                     outcome_token_ids     # [K]
                 )
                 
-                # Loss
+                # Slice to align with inputs 0..T-2 (dropping the last step T-1)
+                outcome_targets = all_outcome_targets[:, :-1, :] # [B, T-1, K]
+                
                 #    Only learn from valid (non-pad) time steps.
-                lambda_outcome = 5.0 # Assumption: outcome loss needs to be higher to propogate signal
-                loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T, K]
+                lambda_outcome = linear_schedule(
+                    epoch,
+                    training_settings['warmup_epochs'],
+                    training_settings["phase2_outcome_weight"]
+                )
+                loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T-1, K]
                 loss_outcome = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
                 loss_outcome = lambda_outcome * loss_outcome
 
                 # === Loss: Δt (time) ===
-                # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T])
-                true_abs = batch["abs_ts"].detach().clamp(0.0, 1.0)   # [B,T]
-                pred_abs = abs_t_pred[:, 1:]                          # [B,T]  drop CTX
-                nonpad = (target_ids != model.embedder.padding_idx)     # [B,T] bool
-
+                # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T-1])
                 abs_t_loss = F.mse_loss(pred_abs[nonpad], true_abs[nonpad], reduction="mean")
                 lambda_time = linear_schedule(
                     epoch,

@@ -153,8 +153,6 @@ def infer_event_stream(model,
         abs_ts         = torch.tensor([df["TimePoint"].tolist()],     dtype=torch.float32, device=device) / 336.0
 
         # Log inputs
-        rows.append({"PatientID": pid, "Step": 0, "Token": "[CTX]", "TimePoint": 0.0,
-                     "IsInput": 1, "IsOutcome": 0, "IsTerminal": 0})
         for i in range(pos_ids.size(1)):
             tid = pos_ids[0, i].item()
             rows.append({
@@ -200,6 +198,7 @@ def infer_event_stream(model,
         # === generation loop =================================================
         steps = 0
         while steps < max_len:
+            # Unpack 3 values: logits, time, outcomes(ignored)
             logits, abs_t_pred, _ = model(
                 parent_raw_ids=parent_raw_ids,
                 concept_ids=concept_ids,
