@@ -33,8 +33,9 @@ MODEL_CONFIG = {
 TRAINING_SETTINGS = {
     "phase1_n_epochs": 100,
     "phase2_n_epochs": 100,
-    "warmup_epochs": 5,
-    "patience": 10,
+    "foundational_epochs": 5, # Number of epochs considered as foundational training phase (only for phase 2 where conflicting tasks exist).
+    "warmup_epochs": 10,
+    "early-stop-patience": 10,
     
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 5e-4,

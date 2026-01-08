@@ -525,7 +525,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             bad_epochs = 0
         elif epoch >= training_settings["warmup_epochs"]:
             bad_epochs += 1
-            if bad_epochs >= training_settings["patience"]:
+            if bad_epochs >= training_settings["early-stop-patience"]:
                 print("[Phase-1]: Early stopping triggered.")
                 break
         else:

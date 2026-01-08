@@ -220,12 +220,21 @@ def set_embedder_frozen(model, freeze: bool):
     model.embedder.eval() if freeze else model.embedder.train()
     
 
-def linear_schedule(epoch: int, warmup: int, max_val: float) -> float:
-    """Simple linear ramp from 0→max_val over `warmup` epochs."""
-    return max_val * min(epoch / warmup, 1.0)
+def linear_schedule(epoch: int, start_epoch: int, end_epoch: int, max_val: float) -> float:
+    """
+    Ramps from 0 -> max_val, but ONLY starts ramping after `start_epoch`.
+    Will reach max_val at `end_epoch`.
+    """
+    if epoch < start_epoch:
+        return 0.0
+    
+    # How many epochs have we been active?
+    active_epochs = epoch - start_epoch
+    
+    return max_val * min(active_epochs / end_epoch, 1.0)
 
 
-def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.25):
+def apply_cbm(batch, tokenizer, forbid_ids, p=0.25):
     """
     Transformer CBM (Curriculum by Masking) Helper.
     Logic: Mask tokens that won't hurt the general timeline or conflict with penalties.
@@ -236,15 +245,11 @@ def apply_cbm(batch, epoch, warmup_epochs, tokenizer, forbid_ids, max_p=0.25):
 
     batch: dict of tensors
     tokenizer: EMRTokenizer
-    epoch: int, epoch number
-    warmup_epochs: int, total number of warmup epochs from training_config
     forbid_ids: LongTensor of ids that must never be masked (PAD, CTX, ADMISSION, TERMINALS...)
-    max_ratio: float, max masking ratio of the input
+    p: float, masking ratio of the input
 
     NOTE: This basically means that masked tokens are marked as acceptable noise. 
     """    
-    p = linear_schedule(epoch, warmup_epochs, max_p)
-
     pos_ids = batch["position_ids"]
     device = pos_ids.device
     B, T = pos_ids.shape
@@ -321,6 +326,7 @@ def mix_with_predictions(
     Returns:
       mixed_ids : [B, T] LongTensor
       mix_mask  : [B, T] BoolTensor, True where pred_ids replaced GT
+    NOTE: Currently not used in the codebase.
     """    
     device = gt_ids.device
     B, T = gt_ids.shape
