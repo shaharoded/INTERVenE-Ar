@@ -20,12 +20,12 @@ class DataProcessor:
     Handles the dataprocess needed to build the tokenizer / train / val / test.
     use max_input_days to trim a test dataset before using it for prediction.
 
-    Expected columns for temporal_df: ['PatientID', 'ConceptName', 'StartDateTime', 'EndDateTime', 'Value']
-    Expected columns for context_df: ['PatientID'] + context columns.
+    Expected columns for temporal_df: ['PatientId', 'ConceptName', 'StartDateTime', 'EndDateTime', 'Value']
+    Expected columns for context_df: ['PatientId'] + context columns.
 
     Attributes:
     df (pd.DataFrame): Transformed long-format event dataframe after all processing.
-    context_df (pd.DataFrame): Patient context dataframe with PatientID as index.
+    context_df (pd.DataFrame): Patient context dataframe with PatientId as index.
     scaler (StandardScaler): Scaler fitted to context_df and optionally saved to disk.
     checkpoint_path (str): Path to save the scaler / tokenizer at for later usage.
 
@@ -78,7 +78,7 @@ class DataProcessor:
         # Process on context_df
         if 'index' in self.context_df.columns:
             self.context_df = self.context_df.drop(columns=['index'])
-        self.context_df = self.context_df.set_index("PatientID").drop(columns=["PatientID"], errors="ignore").astype("float32")
+        self.context_df = self.context_df.set_index("PatientId").drop(columns=["PatientId"], errors="ignore").astype("float32")
         self._fit_scaler()
         return self.df, self.context_df
 
@@ -97,19 +97,19 @@ class DataProcessor:
 
     def _validate_and_align_inputs(self):
         """
-        Validates required columns, datetime types, and aligns PatientIDs between
+        Validates required columns, datetime types, and aligns PatientIds between
         temporal (df) and context (patient_context_df) data. Will also sort the temporal data.
 
         Returns:
             Tuple of (cleaned_df, cleaned_patient_context_df)
         """
         # 1. Required columns check
-        required_columns = ['PatientID', 'ConceptName', 'StartDateTime', 'EndDateTime', 'Value']
+        required_columns = ['PatientId', 'ConceptName', 'StartDateTime', 'EndDateTime', 'Value']
         for col in required_columns:
             if col not in self.df.columns:
                 raise ValueError(f"Missing required column in temporal data: {col}")
-        if 'PatientID' not in self.context_df.columns:
-            raise ValueError("Missing 'PatientID' column in context data")
+        if 'PatientId' not in self.context_df.columns:
+            raise ValueError("Missing 'PatientId' column in context data")
 
         # 2. Check datetime dtypes
         if not pd.api.types.is_datetime64_any_dtype(self.df['StartDateTime']):
@@ -117,39 +117,39 @@ class DataProcessor:
         if not pd.api.types.is_datetime64_any_dtype(self.df['EndDateTime']):
             raise TypeError("EndDateTime column must be of datetime64[ns] dtype.")
 
-        # 3. Handle duplicate PatientIDs in context
-        dupe_counts = self.context_df['PatientID'].value_counts()
+        # 3. Handle duplicate PatientIds in context
+        dupe_counts = self.context_df['PatientId'].value_counts()
         duplicates = dupe_counts[dupe_counts > 1]
         if not duplicates.empty:
-            print(f"Found {len(duplicates)} PatientIDs with duplicate rows in context_df. Aggregating by max value...")
-            self.context_df = self.context_df.groupby('PatientID').max().reset_index()
+            print(f"Found {len(duplicates)} PatientIds with duplicate rows in context_df. Aggregating by max value...")
+            self.context_df = self.context_df.groupby('PatientId').max().reset_index()
 
         # 4. Align temporal and context data
-        temporal_ids = set(self.df['PatientID'])
-        context_ids = set(self.context_df['PatientID'])
+        temporal_ids = set(self.df['PatientId'])
+        context_ids = set(self.context_df['PatientId'])
 
         missing_ids = temporal_ids - context_ids
         extra_ids = context_ids - temporal_ids
 
         if missing_ids:
-            print(f"Adding {len(missing_ids)} missing PatientIDs to context_df with placeholder values (-1).")
+            print(f"Adding {len(missing_ids)} missing PatientIds to context_df with placeholder values (-1).")
             placeholder_df = pd.DataFrame({
-                'PatientID': list(missing_ids),
+                'PatientId': list(missing_ids),
                 **{
                     col: [-1] * len(missing_ids)
                     for col in self.context_df.columns
-                    if col != 'PatientID'
+                    if col != 'PatientId'
                 }
             })
             self.context_df = pd.concat([self.context_df, placeholder_df], ignore_index=True)
 
         if extra_ids:
-            print(f"Dropping {len(extra_ids)} unmatched PatientIDs from context_df.")
-            self.context_df = self.context_df[self.context_df['PatientID'].isin(temporal_ids)].copy()
+            print(f"Dropping {len(extra_ids)} unmatched PatientIds from context_df.")
+            self.context_df = self.context_df[self.context_df['PatientId'].isin(temporal_ids)].copy()
 
         # 5. Final integrity checks
-        assert self.context_df['PatientID'].is_unique, "PatientID must be unique in context_df after alignment"
-        assert set(self.df['PatientID']) == set(self.context_df['PatientID']), "Mismatched PatientIDs after alignment"
+        assert self.context_df['PatientId'].is_unique, "PatientId must be unique in context_df after alignment"
+        assert set(self.df['PatientId']) == set(self.context_df['PatientId']), "Mismatched PatientIds after alignment"
     
 
     def _fix_back_to_back_intervals(self, epsilon=pd.Timedelta(seconds=1)):
@@ -158,11 +158,11 @@ class DataProcessor:
         (same patient), shift the *start* forward by `epsilon` to preserve
         START/END ordering for tokenisation.
         """
-        df = self.df.sort_values(['PatientID', 'StartDateTime']).reset_index(drop=True).copy()
+        df = self.df.sort_values(['PatientId', 'StartDateTime']).reset_index(drop=True).copy()
 
         same_time = (
             (df['StartDateTime']
-            == df.groupby('PatientID')['EndDateTime'].shift(1))
+            == df.groupby('PatientId')['EndDateTime'].shift(1))
         )
 
         # shift only the conflicted rows
@@ -211,7 +211,7 @@ class DataProcessor:
             return group
 
         self.df = (
-            self.df.groupby("PatientID", group_keys=False)[self.df.columns]
+            self.df.groupby("PatientId", group_keys=False)[self.df.columns]
                 .apply(process_group)
                 .reset_index(drop=True)
         )
@@ -220,8 +220,8 @@ class DataProcessor:
     def _normalize_time(self):
         df = self.df.copy()
         df["IsAdmission"] = df["ConceptName"] == ADMISSION_TOKEN
-        df["VisitCounter"] = df.groupby("PatientID")["IsAdmission"].cumsum()
-        df["VisitID"] = df["PatientID"].astype(str) + "_" + df["VisitCounter"].astype(str)
+        df["VisitCounter"] = df.groupby("PatientId")["IsAdmission"].cumsum()
+        df["VisitID"] = df["PatientId"].astype(str) + "_" + df["VisitCounter"].astype(str)
         df["VisitStart"] = df.groupby("VisitID")["StartDateTime"].transform('min')
         df["RelStartTime"] = (df["StartDateTime"] - df["VisitStart"]).dt.total_seconds() / 3600.0 # In hours
         df["RelEndTime"] = (df["EndDateTime"] - df["VisitStart"]).dt.total_seconds() / 3600.0 # In hours
@@ -332,7 +332,7 @@ class DataProcessor:
         - Keeps instantaneous events as single tokens.
         
         Returns:
-            DataFrame with ['PatientID', 'RawConcept', 'Concept', 'ValueToken', 'PositionToken', 'TimePoint'].
+            DataFrame with ['PatientId', 'RawConcept', 'Concept', 'ValueToken', 'PositionToken', 'TimePoint'].
         """
         df = self.df
         rows = []
@@ -356,7 +356,7 @@ class DataProcessor:
             for pos, tp in zip(pos_tokens, time_points):
                 full_token = f"{base_token}_{pos}" if pos else base_token
                 rows.append({
-                    'PatientID': row.PatientID,
+                    'PatientId': row.PatientId,
                     'Concept': concept,
                     'ValueToken': value,
                     'PositionToken': full_token,
@@ -366,7 +366,7 @@ class DataProcessor:
         df = pd.DataFrame(rows)
 
         # --- Sort and compute time deltas ---
-        self.df = df.sort_values(['PatientID', 'TimePoint'])
+        self.df = df.sort_values(['PatientId', 'TimePoint'])
     
 
     def _insert_null_tokens(self, gap_hrs: int = 3) -> None:
@@ -378,7 +378,7 @@ class DataProcessor:
             return
 
         rows_out = []
-        for pid, grp in self.df.groupby("PatientID"):
+        for pid, grp in self.df.groupby("PatientId"):
             grp = grp.sort_values("TimePoint")            # safety
             open_stack, last_tp = 0, None
 
@@ -390,7 +390,7 @@ class DataProcessor:
                     gap = tp - last_tp
                     if gap >= gap_hrs and open_stack == 0:
                         rows_out.append({
-                            "PatientID": pid,
+                            "PatientId": pid,
                             "RawConcept": "[NULL]",
                             "Concept":    "[NULL]",
                             "ValueToken": "[NULL]",
@@ -418,8 +418,8 @@ class DataProcessor:
         Trims token-level data to only include tokens occurring within the first `k` days (from admission).
         Drops visits where no events remain after truncation.
 
-        NOTE: This version fits a data process where PatientID is actually the visitID, meaning every ID belongs 
-        to only 1 group of records. If you want generation based on PatientID that can have the information of a few 
+        NOTE: This version fits a data process where PatientId is actually the visitID, meaning every ID belongs 
+        to only 1 group of records. If you want generation based on PatientId that can have the information of a few 
         visits you'll need to change the key here to VisitCounter, but to ensure it is also passed from _expand_tokens().
 
         """
@@ -427,16 +427,16 @@ class DataProcessor:
         k_hours = self.max_input_days * 24
 
         # Only keep visits that originally last longer than k days
-        visit_max_times = df.groupby("PatientID")["TimePoint"].max()
+        visit_max_times = df.groupby("PatientId")["TimePoint"].max()
         long_enough_visits = visit_max_times[visit_max_times > k_hours].index
-        df = df[df["PatientID"].isin(long_enough_visits)].copy()
+        df = df[df["PatientId"].isin(long_enough_visits)].copy()
 
         # Keep only events up to k_days
         df = df[df["TimePoint"] <= k_hours].copy()
 
         # Drop visits with no records remaining
-        remaining_visits = df.groupby("PatientID").size()
-        df = df[df["PatientID"].isin(remaining_visits[remaining_visits > 1].index)]
+        remaining_visits = df.groupby("PatientId").size()
+        df = df[df["PatientId"].isin(remaining_visits[remaining_visits > 1].index)]
 
         self.df = df
 
@@ -556,8 +556,8 @@ class EMRTokenizer:
         outcome_weights = torch.ones(len(token2id), dtype=torch.float32)
         all_outcomes = list(set(OUTCOMES + TERMINAL_OUTCOMES))
         
-        total_patients = df['PatientID'].nunique()
-        patient_tokens = df.groupby("PatientID")["PositionToken"].apply(set)
+        total_patients = df['PatientId'].nunique()
+        patient_tokens = df.groupby("PatientId")["PositionToken"].apply(set)
         
         for out_tok in all_outcomes:
             if out_tok not in token2id:
@@ -692,10 +692,10 @@ class EMRDataset(Dataset):
 
         Attr:
             self.tokenizer (EMRTokenizer): A tokenizer object capable of encoding and decoding all temporal tokens (and subtokens as required)
-            self.context_df (pd.DataFrame): Patient-level context features (indexed by PatientID), scaled to zero mean and unit variance.
+            self.context_df (pd.DataFrame): Patient-level context features (indexed by PatientId), scaled to zero mean and unit variance.
             self.tokens_df (pd.DataFrame): Long-format temporal event dataframe with per-token attributes and timing features.
-            self.patient_ids (np.ndarray): Array of unique PatientIDs present in the dataset.
-            self.patient_groups (Dict[str, pd.DataFrame]): Mapping from PatientID to their corresponding token DataFrame.
+            self.patient_ids (np.ndarray): Array of unique PatientIds present in the dataset.
+            self.patient_groups (Dict[str, pd.DataFrame]): Mapping from PatientId to their corresponding token DataFrame.
         """
         self.tokenizer = tokenizer
         self.tokens_df = processed_df
@@ -721,8 +721,8 @@ class EMRDataset(Dataset):
             self.__encode_parent_list
         )
 
-        self.patient_ids = self.tokens_df['PatientID'].unique()
-        self.patient_groups = {pid: self.tokens_df[self.tokens_df['PatientID'] == pid] for pid in self.patient_ids}
+        self.patient_ids = self.tokens_df['PatientId'].unique()
+        self.patient_groups = {pid: self.tokens_df[self.tokens_df['PatientId'] == pid] for pid in self.patient_ids}
 
     def __encode_parent_list(self, parents: List[str]) -> List[int]:
         ids = []

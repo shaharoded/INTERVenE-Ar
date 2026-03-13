@@ -10,18 +10,23 @@ TRAIN_CTX_DATA_FILE      = os.path.join(PROJECT_ROOT, 'data', 'train', 'syntheti
 TEST_TEMPORAL_DATA_FILE  = os.path.join(PROJECT_ROOT, 'data', 'test', 'synthetic_diabetes_temporal_data.csv')
 TEST_CTX_DATA_FILE       = os.path.join(PROJECT_ROOT, 'data', 'test', 'synthetic_diabetes_context_data.csv')
 
-# Define the prediction targets and <eot> tokens to terminate the inference
+# Define the prediction targets, <bot>, <eot> tokens to terminate the inference
 OUTCOMES = [
-    "KETOACIDOSIS_EVENT",
-    "KIDNEY_COMPLICATION_EVENT",
-    "DIABETIC_COMA_EVENT",
-    "RETINOPATHY_EVENT",
     "DISGLYCEMIA_EVENT",
-    "SEVERE_HYPOGLYCEMIA_EVENT",
-    "HYPEROSMOLALITY_EVENT",
-    "CARDIOVASCULAR_DISORDER_EVENT",
+    "KIDNEY_COMPLICATION_EVENT",
+    "ACUTE_RESPIRATORY_DISORDER",
     "INFECTION_EVENT",
-    "NEUROVASCULAR_COMPLICATION_EVENT"
+    "ATHEROSCLEROSIS_EVENT",
+    "CARDIO-VASCULAR_DISORDER_EVENT",
+    "NERVOUS_SYSTEM_DISORDER_EVENT",
+    "NEUROVASCULAR_COMPLICATION_EVENT",
+    "SKIN_ULCER_EVENT",
+    "OTHER_COMPLICATION_EVENT",
+    "RETINOPATHY_EVENT",
+    "HYPEROSMOLALITY_EVENT",
+    "DIABETIC_COMA_EVENT",
+    "KETOACIDOSIS_EVENT",
+    "ACIDOSIS_EVENT",
 ]
 
 ADMISSION_TOKEN = "ADMISSION_EVENT"

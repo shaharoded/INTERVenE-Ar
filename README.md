@@ -23,22 +23,23 @@ event-prediction-in-diabetes-care/
 │   ├── transformer.py                 # Transformer architecture (GPT) + training
 │   ├── train.py                       # Full training pipeline (2-phase)
 │   ├── inference.py                   # Inference pipeline
-│   ├── evaluation.ipynb               # Evaluation notebook
 │   ├── loss.py                        # Utility module for special loss criterias
 │   ├── utils.py                       # Utility functions for the package (plots + penalties)
 │   └── debug_tools.py                 # Debug loop for epochs (logits)
 ├── data/                              # External data folder (for synthetic or real EMR)
 │   ├── generate_synthetic_data.ipynb  # A notebook that generates synthetic data similar in structure to mediator's output (for tests)
+│   ├── source/                        # Notebook will point here and auto-generate the train-test splits
 │   ├── train/
 │   └── test/
 ├── unittests/                         # Unit and integration tests (dataset / model / utils)
+├── evaluation.ipynb                   # Main research and experiments notebook
+├── README.md                         
 ├── .gitignore
 ├── requirements.txt
 ├── LICENCE
 ├── CITATION.cff
 ├── setup.py
-├── pyproject.toml
-└── README.md
+└── pyproject.toml
 ```
 
 As noted, this model feeds of the output of the [Mediator](https://github.com/shaharoded/Mediator) temporal abstraction engine.
@@ -184,7 +185,7 @@ New-Item -ItemType Directory -Path .\transform_emr_temp | Out-Null
 
 # Copy only what's needed
 Copy-Item -Path .\transform_emr\* -Destination .\transform_emr_temp\transform_emr -Recurse
-Copy-Item -Path .\setup.py, .\README.md, .\requirements.txt -Destination .\transform_emr_temp
+Copy-Item -Path .\setup.py, .\evaluation.ipynb, .\README.md, .\requirements.txt -Destination .\transform_emr_temp
 
 # Zip it
 Compress-Archive -Path .\transform_emr_temp\* -DestinationPath .\emr_model.zip -Force

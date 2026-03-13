@@ -79,8 +79,16 @@ def infer_event_stream(model,
 
     def decode_token_components(token_str):
         parts = token_str.split("_")
-        concept = "_".join(parts[:-2]) if parts[-2] in ("STATE", "TREND", "CONTEXT", "EVENT", "PATTERN") else "_".join(parts)
-        value = "_".join(parts[:-1]) if parts[-1] in ("START", "END") else "_".join(parts)
+        concept = (
+            "_".join(parts[:-2])
+            if len(parts) >= 2 and parts[-2] in ("STATE", "TREND", "CONTEXT", "EVENT", "PATTERN")
+            else "_".join(parts)
+        )
+        value = (
+            "_".join(parts[:-1])
+            if len(parts) >= 2 and parts[-1] in ("START", "END")
+            else "_".join(parts)
+        )
         return (
             tok.concept2id.get(concept, tok.mask_token_id),
             tok.value2id.get(value, tok.mask_token_id)
@@ -145,10 +153,11 @@ def infer_event_stream(model,
         ctx_vec = torch.tensor(dataset.context_df.loc[pid].values, dtype=torch.float32).unsqueeze(0).to(device)
 
         # Prepare input (same as before)
-        parent_raw_ids = torch.tensor([df["ParentRawConceptIDs"].tolist()], dtype=torch.long, device=device)
+        pos_ids        = torch.tensor([df["PositionID"].tolist()],    dtype=torch.long, device=device)
+        # Use the pre-padded LUT [V, Pmax] so every token maps to a fixed-length parent vector
+        parent_raw_ids = tok.tokenid2parent_raw_ids[pos_ids[0]].unsqueeze(0).to(device)  # [1, T, P]
         concept_ids    = torch.tensor([df["ConceptID"].tolist()],     dtype=torch.long, device=device)
         value_ids      = torch.tensor([df["ValueID"].tolist()],       dtype=torch.long, device=device)
-        pos_ids        = torch.tensor([df["PositionID"].tolist()],    dtype=torch.long, device=device)
         # Re-normalize hours → [0,1] using the same 336h window (which were de-normalized for the df output)
         abs_ts         = torch.tensor([df["TimePoint"].tolist()],     dtype=torch.float32, device=device) / 336.0
 
@@ -156,7 +165,7 @@ def infer_event_stream(model,
         for i in range(pos_ids.size(1)):
             tid = pos_ids[0, i].item()
             rows.append({
-                "PatientID": pid,
+                "PatientId": pid,
                 "Step": i + 1,
                 "TimePoint": abs_ts[0, i].item()*336.0,
                 "Token": id2token.get(tid, f"<UNK_{tid}>"),
@@ -241,7 +250,7 @@ def infer_event_stream(model,
             pred_abs = pred_abs_norm * 336.0
 
             rows.append({
-                "PatientID": pid,
+                "PatientId": pid,
                 "Step": pos_ids.shape[1] + 1,
                 "TimePoint": pred_abs,
                 "Token": tok_str,
@@ -283,7 +292,7 @@ def infer_event_stream(model,
             term_logits = logits[:, -1, term_list]
             best = term_list[int(torch.argmax(term_logits))]
             rows.append({
-                "PatientID": pid,
+                "PatientId": pid,
                 "Step": pos_ids.shape[1] + 1,
                 "Token": id2token[best],
                 "TimePoint": pred_abs,

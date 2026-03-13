@@ -5,8 +5,8 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 
 # Checkpoint paths
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, 'checkpoints')
-EMBEDDER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase1', 'best_embedder.pt')
-TRANSFORMER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'best_model.pt')
+EMBEDDER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase1', 'ckpt_best.pt')
+TRANSFORMER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'ckpt_best.pt')
 
 # MODEL_CONFIG = {
 #       "ctx_dim": 45, # Fill manually once defined your context data.

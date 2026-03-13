@@ -645,7 +645,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     
                     batch = apply_cbm(batch=batch, 
                                       tokenizer=model.embedder.tokenizer, 
-                                      forbid_mask_ids=luts["forbid_mask_ids"], 
+                                      forbid_ids=luts["forbid_mask_ids"], 
                                       p=p)
 
                 # === Original logits from Model ===
