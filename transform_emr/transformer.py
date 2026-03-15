@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 from pathlib import Path
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.embedder import EMREmbedding
@@ -627,7 +627,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
         total_loss = total_bce = total_ce = total_penalty = total_outcome = total_dt = 0.0
         with torch.set_grad_enabled(train_flag):
-            for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
+            for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
                 # === Apply CBM on training batchs ===

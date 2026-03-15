@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import sklearn.preprocessing
 import math
 from pathlib import Path
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
@@ -420,7 +420,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         embedder.train() if train_flag else embedder.eval()
         total_loss, total_bce, total_dt, total_mlm = 0.0, 0.0, 0.0, 0.0
 
-        for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False):
+        for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
             batch = {k: v.to(device) for k, v in batch.items()}
             
             if train_flag:
