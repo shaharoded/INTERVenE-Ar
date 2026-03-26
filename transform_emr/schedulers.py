@@ -5,11 +5,27 @@ schedulers.py
 Unified auxiliary loss weighting scheduler for Phase-1 (embedding) and Phase-2 (transformer) training.
 
 LambdaScheduleController:
-  - Reads auxiliary schedule from training config (which auxiliaries, when they start, ramp durations).
-  - Implements frozen-fraction calibration: lambda_max = fraction_cap * main_loss / aux_loss (once, then fixed).
-  - Applies optional linear ramp from 0 to lambda_max (ramp_epochs=1 means no ramp, immediate full power).
-  - Supports optional plateau-based curriculum for Phase-2 stage transitions.
-  - Single interface for both phases; both pass their phase-specific config.
+  - Accepts a phase-specific schedule config dict (from TRAINING_SETTINGS["phase1_scheduler"] or ["phase2_scheduler"]).
+  - Defines auxiliary tasks and their curriculum via an `order` list-of-lists:
+      - Each inner list is a stage of aux tasks that activate together.
+      - Stage 0 activates immediately at start_epoch.
+      - Subsequent stages are unlocked dynamically when the active loss plateaus.
+  - Frozen-fraction calibration: lambda_max = fraction_cap * main_loss / aux_loss (computed once, then fixed).
+  - Linear ramp from 0 to lambda_max over ramp_epochs (ramp_epochs=1 means immediate, no ramp).
+  - Warmup tracking: reports the epoch after which early stopping may begin.
+
+Config expected shape (phase-specific dict):
+    {
+        "aux_fraction_caps":  {name: fraction, ...},
+        "order":              [[name, ...], [name, ...], ...],
+        "ramp_epochs":        {name: int, ...},
+        # Multi-stage only (len(order) > 1):
+        "plateau_min_delta":  float,
+        "plateau_patience":   int | [int, ...],   # one per stage transition
+        "min_stage_epochs":   int | [int, ...],   # min epochs per stage before advancing
+        # Optional fallback fraction when a name is missing from aux_fraction_caps:
+        "aux_max_fraction_default": float,
+    }
 """
 
 
@@ -20,7 +36,7 @@ def linear_schedule(epoch: int, start_epoch: int, end_epoch: int, max_val: float
     """
     if epoch < start_epoch:
         return 0.0
-    if end_epoch <= start_epoch:  # ramp_epochs <= 1: immediate activation
+    if end_epoch <= start_epoch:
         return max_val
     progress = min(max((epoch - start_epoch) / float(end_epoch - start_epoch), 0.0), 1.0)
     return max_val * progress
@@ -30,248 +46,213 @@ class LambdaScheduleController:
     """
     Unified scheduler for auxiliary loss weighting.
 
-    Handles both Phase-1 (embedding) and Phase-2 (transformer) training with:
-    - Frozen-fraction calibration: compute lambda_max once, keep it fixed.
-    - Linear ramp (ramp_epochs=1 means immediate, no actual ramping).
-    - Optional plateau-based curriculum for Phase-2 stage gating.
+    Handles both Phase-1 (embedding) and Phase-2 (transformer) training from a single
+    phase-specific config dict. Phase behaviour is driven purely by the `order` list:
+      - Single stage  → Phase-1 style: all aux tasks activate immediately, no plateau gating.
+      - Multi-stage   → Phase-2 style: stage 0 activates immediately; later stages unlock
+                        on plateau detection of all currently active objectives.
 
-    Expected usage:
-      - Once per epoch (after validation): call update(epoch, vl_main, aux_loss_dict)
-      - Per batch: call get_lambdas(epoch) to retrieve current lambda values
-      - Optional logging: call status_line(epoch)
+    Usage:
+      - Once per epoch (after validation): call update(epoch, vl_main, **aux_losses)
+          where aux_losses keys are plain aux names (e.g., mlm=0.4, dt=0.1).
+      - Per batch: call get_lambdas(epoch) to retrieve current lambda values.
+      - Optional logging: call status_line(epoch).
     """
 
-    def __init__(self, training_settings: dict, start_epoch: int = 0):
+    def __init__(self, schedule_config: dict, start_epoch: int = 0):
         """
-        Initialize scheduler by reading auxiliary schedule from training config.
-
         Parameters
         ----------
-        training_settings : dict
-            Training config. Expected keys for Phase-1:
-              - phase1_aux_fraction_caps: dict of {name: fraction}
-              - phase1_dynamic_schedule: dict with mlm_ramp_epochs, dt_ramp_epochs
-              - aux_max_fraction_default: fallback fraction cap
-            For Phase-2:
-              - phase2_aux_fraction_caps: dict of {name: fraction}
-              - phase2_dynamic_schedule: dict with ce/dt/penalty/outcome ramp_epochs and plateau settings
-              - aux_max_fraction_default: fallback fraction cap
-
+        schedule_config : dict
+            Phase-specific scheduler config (see module docstring for expected keys).
         start_epoch : int
             Current training epoch (for checkpoint resume).
         """
-        self.training_settings = training_settings
+        self._cfg = schedule_config
         self.start_epoch = int(start_epoch)
-        self.default_fraction = float(training_settings.get("aux_max_fraction_default", 0.2))
-        self.min_aux_loss = 1e-8
-        self.max_lambda_clamp = 100.0
+        self._default_fraction = float(schedule_config.get("aux_max_fraction_default", 0.20))
+        self._min_aux_loss = 1e-8
+        self._max_lambda_clamp = 100.0
 
-        # Internal state: {name: {start_epoch, ramp_epochs, fraction, lambda_max, ...}}
+        caps = schedule_config.get("aux_fraction_caps", {})
+        ramp_cfg = schedule_config.get("ramp_epochs", {})
+        order = schedule_config.get("order", [])
+        self._order = order  # [[aux_name, ...], ...]
+
+        # Register all auxiliaries across all stages
         self._auxiliaries = {}
+        for stage_idx, stage_auxi in enumerate(order):
+            s_epoch = self.start_epoch if stage_idx == 0 else None
+            for name in stage_auxi:
+                self._register_aux(
+                    name=name,
+                    start_epoch=s_epoch,
+                    ramp_epochs=max(1, int(ramp_cfg.get(name, 1))),
+                    fraction=caps.get(name),
+                )
 
-        # Determine phase based on available config keys
-        if "phase2_auxiliary_schedule" in training_settings or "phase2_aux_fraction_caps" in training_settings:
-            self._init_phase2()
-        else:
-            self._init_phase1()
+        # Multi-stage: set up plateau-based curriculum
+        n_stages = len(order)
+        self._has_dynamic = n_stages > 1
 
-    def _init_phase1(self):
-        """Initialize Phase-1 (embedding) configuration."""
-        caps = self.training_settings.get("phase1_aux_fraction_caps", {})
-        sched = self.training_settings.get("phase1_dynamic_schedule", {})
+        if self._has_dynamic:
+            patience_cfg = schedule_config.get("plateau_patience", 3)
+            if isinstance(patience_cfg, int):
+                patience_cfg = [patience_cfg] * (n_stages - 1)
+            min_epochs_cfg = schedule_config.get("min_stage_epochs", 5)
+            if isinstance(min_epochs_cfg, int):
+                min_epochs_cfg = [min_epochs_cfg] * (n_stages - 1)
 
-        # Phase-1 has MLM and DT, both starting at epoch 0 with ramp=1 (immediate)
-        self._register_aux(
-            name="mlm",
-            start_epoch=self.start_epoch,
-            ramp_epochs=max(1, int(sched.get("mlm_ramp_epochs", 1))),
-            fraction=caps.get("mlm"),
-        )
-        self._register_aux(
-            name="dt",
-            start_epoch=self.start_epoch,
-            ramp_epochs=max(1, int(sched.get("dt_ramp_epochs", 1))),
-            fraction=caps.get("dt"),
-        )
+            self.plateau_min_delta = float(schedule_config.get("plateau_min_delta", 1e-4))
+            self._plateau_patience = patience_cfg   # one entry per stage transition
+            self._min_stage_epochs = min_epochs_cfg # one entry per stage transition
 
-        self.dynamic_enabled = False
-        self.warmup_complete_epoch = None
+            self._current_stage = 0
+            self._stage_start_epoch = self.start_epoch
+            self._stage_best = float("inf")
+            self._stage_bad_epochs = 0
 
-    def _init_phase2(self):
-        """Initialize Phase-2 (transformer) configuration with optional plateau curriculum."""
-        caps = self.training_settings.get("phase2_aux_fraction_caps", {})
-        dyn_cfg = self.training_settings.get("phase2_dynamic_schedule", {})
+        self._warmup_complete_epoch = None
 
-        # CE and DT start immediately at epoch 0
-        self._register_aux(
-            name="ce",
-            start_epoch=self.start_epoch,
-            ramp_epochs=max(1, int(dyn_cfg.get("ce_ramp_epochs", 5))),
-            fraction=caps.get("ce"),
-        )
-        self._register_aux(
-            name="dt",
-            start_epoch=self.start_epoch,
-            ramp_epochs=max(1, int(dyn_cfg.get("dt_ramp_epochs", 5))),
-            fraction=caps.get("dt"),
-        )
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        # Check if dynamic curriculum is enabled
-        self.dynamic_enabled = bool(dyn_cfg.get("enabled", False))
-
-        if self.dynamic_enabled:
-            # Penalty and outcome are unlocked dynamically based on plateau detection
-            self._register_aux(
-                name="penalty",
-                start_epoch=None,  # Unlocked later
-                ramp_epochs=max(1, int(dyn_cfg.get("penalty_ramp_epochs", 5))),
-                fraction=caps.get("penalty"),
-            )
-            self._register_aux(
-                name="outcome",
-                start_epoch=None,  # Unlocked later
-                ramp_epochs=max(1, int(dyn_cfg.get("outcome_ramp_epochs", 5))),
-                fraction=caps.get("outcome"),
-            )
-
-            # Plateau tracking state
-            self.plateau_min_delta = float(dyn_cfg.get("plateau_min_delta", 1e-4))
-            self.base_plateau_patience = max(1, int(dyn_cfg.get("base_plateau_patience", 3)))
-            self.penalty_plateau_patience = max(1, int(dyn_cfg.get("penalty_plateau_patience", 3)))
-            self.min_base_epochs = max(1, int(dyn_cfg.get("min_base_epochs", 5)))
-            self.min_penalty_epochs = max(1, int(dyn_cfg.get("min_penalty_epochs", 5)))
-
-            self.base_best = float("inf")
-            self.base_bad_epochs = 0
-            self.pen_best = float("inf")
-            self.pen_bad_epochs = 0
-            self.warmup_complete_epoch = None
-        else:
-            # Static schedule: penalty and outcome start at fixed epochs
-            warmup_epochs = int(self.training_settings.get("warmup_epochs", 100))
-            foundational_epochs = int(self.training_settings.get("foundational_epochs", 50))
-            secondary_epochs = int((foundational_epochs + 1) // 2)
-
-            self._register_aux(
-                name="penalty",
-                start_epoch=secondary_epochs,
-                ramp_epochs=foundational_epochs,
-                fraction=caps.get("penalty"),
-            )
-            self._register_aux(
-                name="outcome",
-                start_epoch=foundational_epochs,
-                ramp_epochs=warmup_epochs - foundational_epochs,
-                fraction=caps.get("outcome"),
-            )
-            self.warmup_complete_epoch = warmup_epochs
-
-    def _register_aux(self, name: str, start_epoch: int | None, ramp_epochs: int, fraction: float | None):
-        """Register an auxiliary component."""
+    def _register_aux(self, name: str, start_epoch, ramp_epochs: int, fraction):
         self._auxiliaries[name] = {
             "name": name,
             "start_epoch": start_epoch,
             "ramp_epochs": max(1, int(ramp_epochs)),
-            "fraction": float(self.default_fraction if fraction is None else fraction),
-            "lambda_max": None,  # Calibrated on first call
+            "fraction": float(self._default_fraction if fraction is None else fraction),
+            "lambda_max": None,
             "anchor_main_loss": None,
             "anchor_aux_loss": None,
         }
 
-    def update(self, epoch: int, vl_main: float, **aux_losses):
+    @staticmethod
+    def _check_plateau(metric_val, best_val, bad_epochs, min_delta, patience):
+        """Returns (new_best, new_bad_epochs, is_plateau)."""
+        if metric_val < (best_val - min_delta):
+            return metric_val, 0, False
+        bad_epochs += 1
+        return best_val, bad_epochs, bad_epochs >= patience
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @property
+    def has_dynamic(self) -> bool:
+        """True when the scheduler has more than one stage (plateau-gated curriculum)."""
+        return self._has_dynamic
+
+    def update(self, epoch: int, vl_main: float, **aux_losses) -> list:
         """
-        Calibrate auxiliaries and check for plateau-based stage transitions.
+        Calibrate auxiliaries and advance dynamic stage transitions.
 
         Parameters
         ----------
         epoch : int
             Current epoch.
         vl_main : float
-            Validation main loss (BCE for both phases).
+            Validation main loss (e.g. BCE).
         **aux_losses : float
-            Named keyword args for each auxiliary loss (e.g., vl_mlm_raw, vl_dt_raw, vl_ce_raw, ...).
+            Named keyword args using plain aux names as keys
+            (e.g. mlm=0.4, dt=0.1, ce=0.3, penalty=0.2, outcome=0.5).
 
         Returns
         -------
         list[str]
-            Messages for logging (calibration events, stage transitions).
+            Log messages for calibration events and stage transitions.
         """
         messages = []
 
-        # Calibrate each auxiliary once
+        # Step 1: Check for stage transitions FIRST so newly unlocked aux can
+        # be calibrated in the same call.
+        if self._has_dynamic:
+            messages.extend(self._check_stage_transitions(epoch, vl_main, aux_losses))
+
+        # Step 2: Calibrate each auxiliary once (when active and loss is available).
         for name, spec in self._auxiliaries.items():
-            if name not in aux_losses:
-                continue
+            if spec["start_epoch"] is None:
+                continue  # Not yet unlocked
             if spec["lambda_max"] is not None:
                 continue  # Already calibrated
-
+            if name not in aux_losses:
+                continue  # Loss not provided this call
             vl_aux = float(aux_losses[name])
-            if vl_aux > self.min_aux_loss:
-                # Compute lambda_max = fraction * main_loss / aux_loss
-                spec["lambda_max"] = (spec["fraction"] * vl_main) / max(vl_aux, self.min_aux_loss)
-                spec["lambda_max"] = min(spec["lambda_max"], self.max_lambda_clamp)
+            if vl_aux > self._min_aux_loss:
+                lam = (spec["fraction"] * vl_main) / max(vl_aux, self._min_aux_loss)
+                spec["lambda_max"] = min(lam, self._max_lambda_clamp)
                 spec["anchor_main_loss"] = vl_main
                 spec["anchor_aux_loss"] = vl_aux
-
-                # For dynamic auxiliaries, unlock them now
-                if spec["start_epoch"] is None:
-                    spec["start_epoch"] = epoch
-                    messages.append(f"[Scheduler]: {name} auxiliary unlocked at epoch {epoch} with λ_max={spec['lambda_max']:.4f}")
-                else:
-                    messages.append(f"[Scheduler]: {name} auxiliary calibrated at epoch {epoch} with λ_max={spec['lambda_max']:.4f}")
-
-        # Handle plateau-based stage gating for Phase-2 dynamic curriculum
-        if self.dynamic_enabled:
-            messages.extend(self._update_dynamic_stages(epoch, vl_main, aux_losses))
+                messages.append(
+                    f"[Scheduler]: {name} calibrated at epoch {epoch}, "
+                    f"λ_max={spec['lambda_max']:.4f} "
+                    f"(main={vl_main:.4f}, aux={vl_aux:.4f})"
+                )
 
         return messages
 
-    def _update_dynamic_stages(self, epoch: int, vl_main: float, aux_losses: dict) -> list:
-        """Check and advance dynamic stages in Phase-2 curriculum."""
+    def _check_stage_transitions(self, epoch: int, vl_main: float, aux_losses: dict) -> list:
+        """Check whether the next stage should be unlocked based on plateau detection."""
         messages = []
-        vl_ce_raw = float(aux_losses.get("vl_ce_raw", 0.0))
-        vl_dt_raw = float(aux_losses.get("vl_dt_raw", 0.0))
-        vl_pen_raw = float(aux_losses.get("vl_pen_raw", 0.0))
 
-        # Stage 1: Check if base objectives (CE + DT) have plateaued
-        base_metric = vl_main + vl_ce_raw + vl_dt_raw
-        if self._auxiliaries["penalty"]["start_epoch"] is None:
-            self.base_best, self.base_bad_epochs, base_plateau = self._check_plateau(
-                base_metric, self.base_best, self.base_bad_epochs, self.plateau_min_delta, self.base_plateau_patience
-            )
-            trained_base_epochs = epoch - self.start_epoch + 1
-            if trained_base_epochs >= self.min_base_epochs and base_plateau:
-                # Unlock penalty stage
-                self._auxiliaries["penalty"]["start_epoch"] = epoch + 1
-                messages.append(f"[Scheduler][Dynamic]: Penalty stage unlocked at epoch {self._auxiliaries['penalty']['start_epoch']}")
+        # Nothing to do if already at the last stage
+        if self._current_stage >= len(self._order) - 1:
+            return messages
 
-        # Stage 2: Check if penalty stage has plateaued
-        if self._auxiliaries["penalty"]["start_epoch"] is not None and self._auxiliaries["outcome"]["start_epoch"] is None:
-            pen_metric = vl_main + vl_ce_raw + vl_dt_raw + vl_pen_raw
-            self.pen_best, self.pen_bad_epochs, pen_plateau = self._check_plateau(
-                pen_metric, self.pen_best, self.pen_bad_epochs, self.plateau_min_delta, self.penalty_plateau_patience
+        transition_idx = self._current_stage
+        next_stage_idx = self._current_stage + 1
+        next_stage_auxi = self._order[next_stage_idx]
+
+        # If next stage was somehow already unlocked (resume edge case), sync and exit
+        if all(self._auxiliaries[n]["start_epoch"] is not None for n in next_stage_auxi):
+            self._current_stage = next_stage_idx
+            return messages
+
+        # Plateau metric: main loss + all currently active aux losses
+        active_auxi = [n for s in self._order[:next_stage_idx] for n in s]
+        metric = vl_main + sum(float(aux_losses.get(n, 0.0)) for n in active_auxi)
+
+        # Check min-epoch guardrail
+        elapsed = epoch - self._stage_start_epoch + 1
+        min_epochs = self._min_stage_epochs[transition_idx]
+
+        self._stage_best, self._stage_bad_epochs, plateau = self._check_plateau(
+            metric, self._stage_best, self._stage_bad_epochs,
+            self.plateau_min_delta, self._plateau_patience[transition_idx],
+        )
+
+        if elapsed >= min_epochs and plateau:
+            unlock_epoch = epoch + 1
+            for name in next_stage_auxi:
+                self._auxiliaries[name]["start_epoch"] = unlock_epoch
+
+            messages.append(
+                f"[Scheduler][Dynamic]: Stage {next_stage_idx} "
+                f"({', '.join(next_stage_auxi)}) unlocked at epoch {unlock_epoch}"
             )
-            trained_pen_epochs = epoch - self._auxiliaries["penalty"]["start_epoch"] + 1
-            if trained_pen_epochs >= self.min_penalty_epochs and pen_plateau:
-                # Unlock outcome stage
-                self._auxiliaries["outcome"]["start_epoch"] = epoch + 1
-                outcome_ramp = self._auxiliaries["outcome"]["ramp_epochs"]
-                self.warmup_complete_epoch = epoch + 1 + outcome_ramp
-                messages.append(f"[Scheduler][Dynamic]: Outcome stage unlocked at epoch {epoch + 1}; warmup completes at epoch {self.warmup_complete_epoch}")
+
+            # Warmup completes after the last stage's ramp finishes
+            if next_stage_idx == len(self._order) - 1:
+                max_ramp = max(self._auxiliaries[n]["ramp_epochs"] for n in next_stage_auxi)
+                self._warmup_complete_epoch = unlock_epoch + max_ramp
+                messages.append(
+                    f"[Scheduler]: Warmup completes at epoch {self._warmup_complete_epoch}"
+                )
+
+            # Advance tracking state
+            self._current_stage = next_stage_idx
+            self._stage_start_epoch = unlock_epoch
+            self._stage_best = float("inf")
+            self._stage_bad_epochs = 0
 
         return messages
-
-    @staticmethod
-    def _check_plateau(metric_val: float, best_val: float, bad_epochs: int, min_delta: float, patience: int) -> tuple:
-        """Check if metric has plateaued (no improvement for patience epochs)."""
-        if metric_val < (best_val - min_delta):
-            return metric_val, 0, False
-        bad_epochs += 1
-        return best_val, bad_epochs, bad_epochs >= patience
 
     def get_lambdas(self, epoch: int) -> dict:
         """
-        Return current lambda values for all auxiliaries.
+        Return current lambda values for all registered auxiliaries.
 
         Parameters
         ----------
@@ -281,51 +262,38 @@ class LambdaScheduleController:
         Returns
         -------
         dict
-            {aux_name: lambda_value} for all registered auxiliaries.
+            {aux_name: lambda_value}. Returns 0.0 for aux tasks not yet active
+            or not yet calibrated.
         """
         lambdas = {}
         for name, spec in self._auxiliaries.items():
             if spec["start_epoch"] is None or spec["lambda_max"] is None:
-                # Not yet unlocked or calibrated
                 lambdas[name] = 0.0
             else:
-                # Compute ramped lambda
                 start = spec["start_epoch"]
                 ramp = spec["ramp_epochs"]
-                # If ramp <= 1, no actual ramp (end = start triggers immediate condition)
                 end = start if ramp <= 1 else start + ramp
                 lambdas[name] = linear_schedule(epoch, start, end, spec["lambda_max"])
         return lambdas
 
-    def current_warmup_end_epoch(self) -> int | float:
+    def current_warmup_end_epoch(self):
         """
-        Return the epoch after which early-stopping can begin counting.
+        Return the epoch after which early-stopping may begin counting.
 
         Returns
         -------
-        int | float
-            - Static Phase-2: configured warmup_epochs
-            - Dynamic Phase-2: float('inf') until outcome unlocked, then concrete epoch
-            - Phase-1: None (no warmup gating)
+        int | float | None
+            - Multi-stage: float('inf') until last stage unlocked, then concrete epoch.
+            - Single-stage: None (caller manages warmup separately).
         """
-        if self.warmup_complete_epoch is None:
-            return float("inf") if self.dynamic_enabled else None
-        return self.warmup_complete_epoch
+        if not self._has_dynamic:
+            return None
+        if self._warmup_complete_epoch is None:
+            return float("inf")
+        return self._warmup_complete_epoch
 
     def status_line(self, epoch: int) -> str:
-        """
-        Build a human-readable status line for logging.
-
-        Parameters
-        ----------
-        epoch : int
-            Current epoch.
-
-        Returns
-        -------
-        str
-            Formatted string with current lambdas for all auxiliaries.
-        """
+        """Human-readable status line for logging."""
         parts = []
         lambdas = self.get_lambdas(epoch)
         for name in sorted(self._auxiliaries.keys()):
@@ -335,6 +303,4 @@ class LambdaScheduleController:
                 parts.append(f"{name}:λ={lam:.4f}(pending)")
             else:
                 parts.append(f"{name}:λ={lam:.4f}/λ_max={spec['lambda_max']:.4f}")
-        return f"[Scheduler]: {' | '.join(parts)}"
-
-
+        return f"[Scheduler] epoch={epoch} | {' | '.join(parts)}"

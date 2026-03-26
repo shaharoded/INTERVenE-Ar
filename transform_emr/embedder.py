@@ -413,15 +413,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         scheduler.load_state_dict(scheduler_state)
         start_epoch += 1
 
-    phase1_caps = training_settings.get("phase1_aux_fraction_caps", {})
-    phase1_schedule_cfg = training_settings.get("phase1_dynamic_schedule", {})
-    mlm_ramp_epochs = max(1, int(phase1_schedule_cfg.get("mlm_ramp_epochs", 1)))
-    dt_ramp_epochs = max(1, int(phase1_schedule_cfg.get("dt_ramp_epochs", 1)))
-    aux_default_fraction = float(training_settings.get("aux_max_fraction_default", 0.2))
-    
-    # Use unified LambdaScheduleController for Phase-1 (automatically detects configuration)
     schedule_controller = LambdaScheduleController(
-        training_settings=training_settings,
+        schedule_config=training_settings["phase1_scheduler"],
         start_epoch=start_epoch
     )
 
@@ -535,8 +528,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         schedule_events = schedule_controller.update(
             epoch=epoch,
             vl_main=vl_bce,
-            vl_mlm_raw=vl_mlm_raw,
-            vl_dt_raw=vl_dt_raw,
+            mlm=vl_mlm_raw,
+            dt=vl_dt_raw,
         )
         for msg in schedule_events:
             print(msg)

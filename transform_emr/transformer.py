@@ -607,7 +607,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         print("[Phase-2]: Starting transformer training loop...")
 
     schedule_controller = LambdaScheduleController(
-        training_settings=training_settings,
+        schedule_config=training_settings["phase2_scheduler"],
         start_epoch=start_epoch
     )
 
@@ -851,14 +851,14 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         schedule_events = schedule_controller.update(
             epoch=epoch,
             vl_main=vl_bce,
-            vl_ce_raw=vl_ce_raw,
-            vl_pen_raw=vl_pen_raw,
-            vl_out_raw=vl_outcome_raw,
-            vl_dt_raw=vl_dt_raw,
+            ce=vl_ce_raw,
+            dt=vl_dt_raw,
+            penalty=vl_pen_raw,
+            outcome=vl_outcome_raw,
         )
         for msg in schedule_events:
             print(msg)
-        if schedule_controller.dynamic_enabled:
+        if schedule_controller.has_dynamic:
             print(schedule_controller.status_line(epoch))
 
 

@@ -85,13 +85,13 @@ def mock_tak_repo(tmp_path):
 
 @pytest.fixture
 def base_ctx():
-    return pd.DataFrame({'PatientID': [1], 'Age': [30]})
+    return pd.DataFrame({'PatientId': [1], 'Age': [30]})
 
 @pytest.mark.order(1)
 def test_synthetic_data_pipeline(tmp_path, capsys, mock_tak_repo):
     # --- create a tiny two‑patient temporal table ---
     df = pd.DataFrame({
-        'PatientID':     [1, 1, 2, 2],
+        'PatientId':     [1, 1, 2, 2],
         'StartDateTime': ['2020-01-01 00:00:00', '2020-01-02 01:00:00',
                           '2020-02-01 00:00:00', '2020-02-02 02:00:00'],
         'EndDateTime':   ['2020-01-01 03:00:00', '2020-01-02 03:00:00',
@@ -100,7 +100,7 @@ def test_synthetic_data_pipeline(tmp_path, capsys, mock_tak_repo):
         'Value':         [1.0, 2.0, 3.0, 4.0]
     })
     ctx = pd.DataFrame({
-        'PatientID': [1, 2],
+        'PatientId': [1, 2],
         'Gender':    [0, 1],
         'Age':       [30, 40]
     })
@@ -146,8 +146,8 @@ def test_synthetic_data_pipeline(tmp_path, capsys, mock_tak_repo):
     null_rows = temporal_df[temporal_df['Concept'] == '[NULL]']
     assert not null_rows.empty, 'Expected at least one NULL token row'
     # Pick first NULL and verify its TimePoint is midpoint of its neighbors
-    pid = null_rows.iloc[0]['PatientID']
-    df_pid = temporal_df[temporal_df['PatientID'] == pid].sort_values('TimePoint').reset_index(drop=True)
+    pid = null_rows.iloc[0]['PatientId']
+    df_pid = temporal_df[temporal_df['PatientId'] == pid].sort_values('TimePoint').reset_index(drop=True)
     # locate NULL index
     null_idx = df_pid.index[df_pid['Concept'] == '[NULL]'][0]
     # ensure it's not at the very start or end
@@ -163,7 +163,7 @@ def test_synthetic_data_pipeline(tmp_path, capsys, mock_tak_repo):
 def test_fix_back_to_back_intervals(tmp_path, mock_tak_repo):  # <--- Added mock_tak_repo fixture here
     # Setup: Patient 1 has an interval ending exactly when the next one starts
     df = pd.DataFrame({
-        'PatientID': [1, 1],
+        'PatientId': [1, 1],
         'ConceptName': ['A', 'A'],
         'StartDateTime': [
             pd.Timestamp('2020-01-01 10:00:00'),
@@ -175,7 +175,7 @@ def test_fix_back_to_back_intervals(tmp_path, mock_tak_repo):  # <--- Added mock
         ],
         'Value': [1, 2]
     })
-    ctx = pd.DataFrame({'PatientID': [1], 'Age': [30]})
+    ctx = pd.DataFrame({'PatientId': [1], 'Age': [30]})
     
     # Run processor
     # Pass the mock_tak_repo path instead of "dummy_path"
@@ -207,7 +207,7 @@ def test_truncate_after_terminal_event(tmp_path, mock_tak_repo, base_ctx):
     2. If RELEASE is followed by DEATH within 30 days, merge them (RELEASE becomes DEATH).
     """
     df = pd.DataFrame({
-        'PatientID': [1, 1, 1, 1],
+        'PatientId': [1, 1, 1, 1],
         'ConceptName': ['A', RELEASE_TOKEN, DEATH_TOKEN, 'B'],
         'StartDateTime': [
             pd.Timestamp('2020-01-01 10:00'),
@@ -246,7 +246,7 @@ def test_normalize_time(tmp_path, mock_tak_repo, base_ctx):
     Test normalization relative to the 'ADMISSION_TOKEN' start time.
     """
     df = pd.DataFrame({
-        'PatientID': [1, 1, 1],
+        'PatientId': [1, 1, 1],
         'ConceptName': [ADMISSION_TOKEN, 'A', 'B'],
         'StartDateTime': [
             pd.Timestamp('2020-01-01 10:00'), # Visit Start
@@ -281,7 +281,7 @@ def test_add_parent_raw_concepts(tmp_path, mock_tak_repo, base_ctx):
     Test resolving parent concepts via the TAK hierarchy (MockRepo).
     """
     df = pd.DataFrame({
-        'PatientID': [1, 1, 1, 1],
+        'PatientId': [1, 1, 1, 1],
         # We simulate 'Concept' column existence as it is usually created by prior steps
         'Concept': ['A', 'B', 'C', 'Pattern'], 
         # Dummy cols required for DataProcessor init
@@ -312,7 +312,7 @@ def test_expand_tokens(tmp_path, mock_tak_repo, base_ctx):
     Test splitting intervals into START/END tokens vs keeping instant events.
     """
     df = pd.DataFrame({
-        'PatientID': [1, 1],
+        'PatientId': [1, 1],
         'ConceptName': ['LongInterval', 'InstantEvent'],
         'StartDateTime': [
             pd.Timestamp('2020-01-01 10:00:00'),
@@ -352,7 +352,7 @@ def test_insert_null_tokens(tmp_path, mock_tak_repo, base_ctx):
     Fixed: Used two separate instant events to ensure open_stack==0 during the gap.
     """
     df = pd.DataFrame({
-        'PatientID': [1, 1],
+        'PatientId': [1, 1],
         # Scenario: Two events separated by 10 hours.
         # Event 1 at T=0.0
         # Event 2 at T=10.0
@@ -392,7 +392,7 @@ def test_cut_after_k_days(tmp_path, mock_tak_repo, base_ctx):
     2. For valid visits, cut all events happening after K days.
     """
     df = pd.DataFrame({
-        'PatientID': [1, 1, 1, 2],
+        'PatientId': [1, 1, 1, 2],
         'TimePoint': [
             24.0,       # Day 1 (Patient 1) - Kept
             25.0,       # Day 1 + 1hr (Patient 1) - Kept (Need >1 events to survive filtering)
@@ -414,10 +414,10 @@ def test_cut_after_k_days(tmp_path, mock_tak_repo, base_ctx):
     res = proc.df
 
     # Patient 2 should be dropped (Max time 24h < 120h threshold)
-    assert 2 not in res['PatientID'].values
+    assert 2 not in res['PatientId'].values
     
     # Patient 1 should remain
-    p1 = res[res['PatientID'] == 1]
+    p1 = res[res['PatientId'] == 1]
     
     # The Day 10 event (240.0) should be cut
     # The Day 1 events (24.0 and 25.0) should remain
@@ -429,7 +429,7 @@ def test_cut_after_k_days(tmp_path, mock_tak_repo, base_ctx):
 def test_tokenizer_outcome_weights(tmp_path, mock_tak_repo):
     # Setup: 4 Patients. 1 Death (P1). 3 Survivors.
     df = pd.DataFrame({
-        'PatientID': [1, 2, 3, 4],
+        'PatientId': [1, 2, 3, 4],
         'PositionToken': ['DEATH_EVENT', 'A', 'A', 'A'], 
         'StartDateTime': [pd.Timestamp('2020-01-01')] * 4,
         'EndDateTime': [pd.Timestamp('2020-01-01')] * 4,

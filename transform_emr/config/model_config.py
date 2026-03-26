@@ -41,63 +41,56 @@ TRAINING_SETTINGS = {
     "phase2_learning_rate": 5e-4,
     "weight_decay": 1e-3,
 
-    # Default cap used by auxiliary schedulers when no component-specific cap is provided.
-    # Interpretation: at calibration epoch, weighted auxiliary contribution is targeted
-    # to be at most this fraction of validation BCE (main task loss).
-    "aux_max_fraction_default": 0.20,
-    
     "batch_size": 64, # Number of patients processed concurrently
     "bce_k_window": 10, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
-    
+
     # Phase-1 loss settings
     "phase1_bce_weight": 1.0, # Main objective anchor. Keep as 1.0.
-    # For each auxiliary component, cap weighted contribution relative to BCE.
-    # Lambda max is calibrated ONCE when first available (using validation losses),
-    # then kept fixed for the rest of training.
-    "phase1_aux_fraction_caps": {
-        "mlm": 0.20, # MLM auxiliary capped to 20% of BCE at calibration point
-        "dt": 0.20,  # Time regression auxiliary capped to 20% of BCE at calibration point
+
+    # Phase-1 auxiliary scheduler.
+    # Single stage: mlm and dt both activate immediately (ramp_epochs=1 means no ramp).
+    # Lambda max is calibrated ONCE on the first epoch when each aux loss is available,
+    # then kept fixed. Weighted contribution is capped to `fraction` of validation BCE.
+    "phase1_scheduler": {
+        "aux_fraction_caps": {
+            "mlm": 0.20,  # MLM auxiliary capped to 20% of BCE at calibration epoch
+            "dt":  0.20,  # Time regression auxiliary capped to 20% of BCE at calibration epoch
+        },
+        "order": [["mlm", "dt"]],  # Single stage: both active from the start
+        "ramp_epochs": {
+            "mlm": 1,  # No ramp (immediate full lambda after calibration)
+            "dt":  1,
+        },
+        "aux_max_fraction_default": 0.20,
     },
 
-    # Phase-1 scheduler settings (same pattern as phase-2, but minimal by default).
-    # Keep both at 1 to make activation nearly immediate after first calibration.
-    "phase1_dynamic_schedule": {
-        "mlm_ramp_epochs": 1, # Ramp MLM lambda to its frozen calibrated max
-        "dt_ramp_epochs": 1,  # Ramp Δt lambda to its frozen calibrated max
-    },
-    
     # Phase-2 loss settings
     "phase2_bce_weight": 1.0, # Main objective anchor. Keep as 1.0.
-    # Same fixed-at-calibration cap policy for phase-2 auxiliaries.
-    # Stage gating/ramp decides when each aux becomes active; these set each aux max.
-    "phase2_aux_fraction_caps": {
-        "ce": 0.20,       # Next-token CE nudge cap
-        "penalty": 0.20,  # Structural legality penalty cap
-        "outcome": 0.20,  # Future-outcome auxiliary cap
-        "dt": 0.20,       # Time regression cap
-    },
 
-    # Dynamic curriculum for phase-2:
-    # - Unlock penalty only after base task plateaus.
-    # - Unlock outcome only after penalty-augmented task plateaus.
-    # - Warmup ends dynamically after the outcome ramp completes.
-    "phase2_dynamic_schedule": {
-        "enabled": True,          # If False, use static epoch-based schedule
-        "plateau_min_delta": 1e-4, # Minimum improvement to reset plateau counter
-        "base_plateau_patience": 3, # Patience before unlocking penalty stage
-        "penalty_plateau_patience": 3, # Patience before unlocking outcome stage
-
-        # Guardrails so transitions don't happen too early.
-        "min_base_epochs": 5,    # Minimum epochs before penalty can unlock
-        "min_penalty_epochs": 5, # Minimum epochs before outcome can unlock
-
-        # Ramp lengths after each stage is unlocked.
-        "penalty_ramp_epochs": 5, # Ramp penalty lambda from 0 to calibrated max
-        "outcome_ramp_epochs": 5, # Ramp outcome lambda from 0 to calibrated max
-
-        # Optional ramps for always-available phase-2 auxiliaries.
-        # Set to 1 for near-immediate activation after first calibration.
-        "ce_ramp_epochs": 1,
-        "dt_ramp_epochs": 1,
+    # Phase-2 auxiliary scheduler.
+    # Multi-stage curriculum: stages unlock sequentially based on plateau detection.
+    #   Stage 0: [ce, dt]      — active from epoch 0, ramp immediately
+    #   Stage 1: [penalty]     — unlocked when stage-0 objectives plateau
+    #   Stage 2: [outcome]     — unlocked when stage-1 objectives plateau
+    # Warmup ends after the outcome ramp completes (dynamic, set by scheduler).
+    "phase2_scheduler": {
+        "aux_fraction_caps": {
+            "ce":      0.20,  # Next-token CE nudge cap
+            "dt":      0.20,  # Time regression cap
+            "penalty": 0.20,  # Structural legality penalty cap
+            "outcome": 0.20,  # Future-outcome auxiliary cap
+        },
+        "order": [["ce", "dt"], ["penalty"], ["outcome"]],
+        "ramp_epochs": {
+            "ce":      1,  # No ramp
+            "dt":      1,  # No ramp
+            "penalty": 5,  # Gradual ramp after unlocking
+            "outcome": 5,  # Gradual ramp after unlocking
+        },
+        # Plateau detection settings (applied per stage transition, in order)
+        "plateau_min_delta": 1e-4,
+        "plateau_patience":  [3, 3],  # Patience per transition: [0→1, 1→2]
+        "min_stage_epochs":  [5, 5],  # Min epochs per stage before advancing
+        "aux_max_fraction_default": 0.20,
     },
 }
