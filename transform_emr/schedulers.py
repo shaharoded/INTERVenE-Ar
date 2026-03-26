@@ -16,15 +16,12 @@ LambdaScheduleController:
 
 Config expected shape (phase-specific dict):
     {
-        "aux_fraction_caps":  {name: fraction, ...},
+        "aux_fraction_caps":  {name: fraction, ...},  # required; every aux name must be present
         "order":              [[name, ...], [name, ...], ...],
         "ramp_epochs":        {name: int, ...},
         # Multi-stage only (len(order) > 1):
         "plateau_min_delta":  float,
         "plateau_patience":   int | [int, ...],   # one per stage transition
-        "min_stage_epochs":   int | [int, ...],   # min epochs per stage before advancing
-        # Optional fallback fraction when a name is missing from aux_fraction_caps:
-        "aux_max_fraction_default": float,
     }
 """
 
@@ -70,25 +67,30 @@ class LambdaScheduleController:
         """
         self._cfg = schedule_config
         self.start_epoch = int(start_epoch)
-        self._default_fraction = float(schedule_config.get("aux_max_fraction_default", 0.20))
         self._min_aux_loss = 1e-8
         self._max_lambda_clamp = 100.0
 
-        caps = schedule_config.get("aux_fraction_caps", {})
+        caps = schedule_config["aux_fraction_caps"]
         ramp_cfg = schedule_config.get("ramp_epochs", {})
         order = schedule_config.get("order", [])
         self._order = order  # [[aux_name, ...], ...]
 
-        # Register all auxiliaries across all stages
+        # Register all auxiliaries across all stages.
+        # Raises KeyError immediately if any aux name is missing from aux_fraction_caps.
         self._auxiliaries = {}
         for stage_idx, stage_auxi in enumerate(order):
             s_epoch = self.start_epoch if stage_idx == 0 else None
             for name in stage_auxi:
+                if name not in caps:
+                    raise KeyError(
+                        f"aux_fraction_caps is missing an entry for '{name}'. "
+                        f"Add it explicitly — no silent defaults."
+                    )
                 self._register_aux(
                     name=name,
                     start_epoch=s_epoch,
                     ramp_epochs=max(1, int(ramp_cfg.get(name, 1))),
-                    fraction=caps.get(name),
+                    fraction=caps[name],
                 )
 
         # Multi-stage: set up plateau-based curriculum
@@ -99,13 +101,9 @@ class LambdaScheduleController:
             patience_cfg = schedule_config.get("plateau_patience", 3)
             if isinstance(patience_cfg, int):
                 patience_cfg = [patience_cfg] * (n_stages - 1)
-            min_epochs_cfg = schedule_config.get("min_stage_epochs", 5)
-            if isinstance(min_epochs_cfg, int):
-                min_epochs_cfg = [min_epochs_cfg] * (n_stages - 1)
 
             self.plateau_min_delta = float(schedule_config.get("plateau_min_delta", 1e-4))
             self._plateau_patience = patience_cfg   # one entry per stage transition
-            self._min_stage_epochs = min_epochs_cfg # one entry per stage transition
 
             self._current_stage = 0
             self._stage_start_epoch = self.start_epoch
@@ -118,12 +116,12 @@ class LambdaScheduleController:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _register_aux(self, name: str, start_epoch, ramp_epochs: int, fraction):
+    def _register_aux(self, name: str, start_epoch, ramp_epochs: int, fraction: float):
         self._auxiliaries[name] = {
             "name": name,
             "start_epoch": start_epoch,
             "ramp_epochs": max(1, int(ramp_epochs)),
-            "fraction": float(self._default_fraction if fraction is None else fraction),
+            "fraction": float(fraction),
             "lambda_max": None,
             "anchor_main_loss": None,
             "anchor_aux_loss": None,
@@ -215,16 +213,12 @@ class LambdaScheduleController:
         active_auxi = [n for s in self._order[:next_stage_idx] for n in s]
         metric = vl_main + sum(float(aux_losses.get(n, 0.0)) for n in active_auxi)
 
-        # Check min-epoch guardrail
-        elapsed = epoch - self._stage_start_epoch + 1
-        min_epochs = self._min_stage_epochs[transition_idx]
-
         self._stage_best, self._stage_bad_epochs, plateau = self._check_plateau(
             metric, self._stage_best, self._stage_bad_epochs,
             self.plateau_min_delta, self._plateau_patience[transition_idx],
         )
 
-        if elapsed >= min_epochs and plateau:
+        if plateau:
             unlock_epoch = epoch + 1
             for name in next_stage_auxi:
                 self._auxiliaries[name]["start_epoch"] = unlock_epoch

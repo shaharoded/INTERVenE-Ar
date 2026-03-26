@@ -470,8 +470,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             den = weights.sum().clamp_min(1.0)
             bce_loss = (raw * weights).sum() / den
 
-            bce_loss *= training_settings["phase1_bce_weight"] # Applying weight (scale)
-            
             # MLM Logits + Loss
             mlm_logits = embedder.forward_with_mlm(
                                                 batch,

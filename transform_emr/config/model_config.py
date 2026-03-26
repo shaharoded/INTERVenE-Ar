@@ -33,19 +33,18 @@ MODEL_CONFIG = {
 TRAINING_SETTINGS = {
     "phase1_n_epochs": 100,
     "phase2_n_epochs": 100,
-    "foundational_epochs": 5, # Number of epochs considered as foundational training phase (only for phase 2 where conflicting tasks exist).
+    # Controls how fast CBM (curriculum batch masking) ramps up its masking
+    # probability during phase-2 training. Independent of the aux-loss schedule.
+    "cbm_ramp_epochs": 5,
     "warmup_epochs": 10,
     "early-stop-patience": 10,
-    
+
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 5e-4,
     "weight_decay": 1e-3,
 
     "batch_size": 64, # Number of patients processed concurrently
     "bce_k_window": 10, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
-
-    # Phase-1 loss settings
-    "phase1_bce_weight": 1.0, # Main objective anchor. Keep as 1.0.
 
     # Phase-1 auxiliary scheduler.
     # Single stage: mlm and dt both activate immediately (ramp_epochs=1 means no ramp).
@@ -61,11 +60,7 @@ TRAINING_SETTINGS = {
             "mlm": 1,  # No ramp (immediate full lambda after calibration)
             "dt":  1,
         },
-        "aux_max_fraction_default": 0.20,
     },
-
-    # Phase-2 loss settings
-    "phase2_bce_weight": 1.0, # Main objective anchor. Keep as 1.0.
 
     # Phase-2 auxiliary scheduler.
     # Multi-stage curriculum: stages unlock sequentially based on plateau detection.
@@ -90,7 +85,5 @@ TRAINING_SETTINGS = {
         # Plateau detection settings (applied per stage transition, in order)
         "plateau_min_delta": 1e-4,
         "plateau_patience":  [3, 3],  # Patience per transition: [0→1, 1→2]
-        "min_stage_epochs":  [5, 5],  # Min epochs per stage before advancing
-        "aux_max_fraction_default": 0.20,
     },
 }

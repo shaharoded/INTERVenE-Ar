@@ -41,7 +41,6 @@ def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activatio
         "aux_fraction_caps": {"mlm": 0.20, "dt": 0.20},
         "order": [["mlm", "dt"]],
         "ramp_epochs": {"mlm": 1, "dt": 1},
-        "aux_max_fraction_default": 0.20,
     }
     controller = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
     assert controller.has_dynamic is False
@@ -81,8 +80,6 @@ def test_unified_lambda_schedule_controller_phase2_ramp_progression():
         "ramp_epochs": {"ce": 5, "dt": 5, "penalty": 5, "outcome": 5},
         "plateau_min_delta": 1e-4,
         "plateau_patience": [3, 3],
-        "min_stage_epochs": [5, 5],
-        "aux_max_fraction_default": 0.20,
     }
     controller = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
     assert controller.has_dynamic is True
@@ -112,8 +109,8 @@ def test_unified_lambda_schedule_controller_phase2_ramp_progression():
 def test_scheduler_stage_transitions_and_warmup():
     """
     Phase-2 dynamic curriculum:
-      - Penalty unlocks only after stage-0 plateaus AND min_stage_epochs elapsed.
-      - Outcome unlocks only after stage-1 plateaus.
+      - Penalty unlocks after stage-0 plateaus (patience=2 consecutive non-improving epochs).
+      - Outcome unlocks after stage-1 plateaus.
       - warmup_complete_epoch = outcome_start + outcome_ramp_epochs.
       - Improvement resets the plateau counter.
     """
@@ -123,31 +120,28 @@ def test_scheduler_stage_transitions_and_warmup():
         "ramp_epochs": {"ce": 1, "dt": 1, "penalty": 3, "outcome": 3},
         "plateau_min_delta": 1e-4,
         "plateau_patience": [2, 2],
-        "min_stage_epochs": [3, 3],
-        "aux_max_fraction_default": 0.20,
     }
     sc = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
 
-    # --- Calibrate stage 0 ---
-    # Epoch 0: first call → improvement from inf → bad_epochs reset to 0, elapsed=1
+    # Epoch 0: first call → improvement from inf → bad_epochs reset to 0
     sc.update(epoch=0, vl_main=1.0, ce=0.5, dt=0.3)
 
-    # Epoch 1: flat → bad_epochs=1, elapsed=2; patience(2) not met yet → still locked
+    # Epoch 1: flat → bad_epochs=1 < patience=2 → still locked
     sc.update(epoch=1, vl_main=1.0, ce=0.5, dt=0.3)
-    assert sc._auxiliaries["penalty"]["start_epoch"] is None, "bad_epochs=1 < patience=2, too early"
+    assert sc._auxiliaries["penalty"]["start_epoch"] is None, "bad_epochs=1 < patience=2"
 
-    # Epoch 2: flat → bad_epochs=2 == patience AND elapsed=3 == min_stage_epochs → unlocks
+    # Epoch 2: flat → bad_epochs=2 == patience → unlocks
     sc.update(epoch=2, vl_main=1.0, ce=0.5, dt=0.3)
     penalty_start = sc._auxiliaries["penalty"]["start_epoch"]
-    assert penalty_start is not None, "Penalty should be unlocked (elapsed=3, bad_epochs=2)"
+    assert penalty_start is not None, "Penalty should be unlocked (bad_epochs=2)"
 
-    # Improvement resets plateau counter — outcome won't unlock early
+    # Improvement at penalty_start resets plateau counter — outcome won't unlock yet
     sc.update(epoch=penalty_start, vl_main=0.7, ce=0.4, dt=0.2, penalty=0.5)
     assert sc._auxiliaries["outcome"]["start_epoch"] is None
 
-    # Hold flat for min_stage_epochs + plateau_patience to unlock outcome
-    for ep in range(penalty_start + 1, penalty_start + 6):
-        sc.update(epoch=ep, vl_main=0.7, ce=0.4, dt=0.2, penalty=0.5)
+    # Two flat epochs satisfy patience=2 → outcome unlocks
+    sc.update(epoch=penalty_start + 1, vl_main=0.7, ce=0.4, dt=0.2, penalty=0.5)
+    sc.update(epoch=penalty_start + 2, vl_main=0.7, ce=0.4, dt=0.2, penalty=0.5)
     outcome_start = sc._auxiliaries["outcome"]["start_epoch"]
     assert outcome_start is not None, "Outcome should be unlocked now"
 

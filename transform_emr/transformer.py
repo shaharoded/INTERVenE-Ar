@@ -558,7 +558,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     # Training Dynamics
     warmup_epochs = training_settings["warmup_epochs"]
-    foundational_epochs = training_settings["foundational_epochs"]
+    cbm_ramp_epochs = training_settings["cbm_ramp_epochs"]
 
     # Get outcomes weights (from Tokenizer) for pos_weight in BCE loss
     valid_outcomes = [n for n in model.outcome_names if n in model.embedder.tokenizer.token2id]
@@ -635,7 +635,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     # Starting at epoch 0, ramping through the foundational_epochs
                     p = linear_schedule(epoch=epoch, 
                                         start_epoch=0, 
-                                        end_epoch=foundational_epochs, 
+                                        end_epoch=cbm_ramp_epochs,
                                         max_val=0.25)
                     
                     batch = apply_cbm(batch=batch, 
@@ -724,7 +724,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # Calculate BCE loss (only valid positions) 
                 loss_bce, _ = BCEcriterion(pred_logits, multi_hot, allowed)
-                loss_bce = loss_bce * training_settings["phase2_bce_weight"] # Applying weight
                 
                 # === Loss: CE nudge (next token generation task) ===
                 # Foundational task to complement BCE, start at epoch 0, no schedule
