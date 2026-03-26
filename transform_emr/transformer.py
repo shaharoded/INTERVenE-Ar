@@ -431,7 +431,7 @@ class GPT(nn.Module):
         return logits, abs_t_pred, outcome_logits
     
 
-    def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None):
+    def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None, lambda_schedule_state=None):
         ckpt = {
             "model_state": self.state_dict(),
             "config": self.cfg,
@@ -447,6 +447,8 @@ class GPT(nn.Module):
             ckpt["optim_state"] = optimizer.state_dict()
         if scheduler is not None:
             ckpt["scheduler_state"] = scheduler.state_dict()
+        if lambda_schedule_state is not None:
+            ckpt["lambda_schedule_state"] = lambda_schedule_state
         torch.save(ckpt, path)
 
     
@@ -496,11 +498,12 @@ class GPT(nn.Module):
 
         # Return full training state if available
         return (
-        model,
-        ckpt.get("epoch", 0),
-        ckpt.get("best_val", float("inf")),
-        ckpt.get("optim_state", None),
-        ckpt.get("scheduler_state", None)
+            model,
+            ckpt["epoch"],
+            ckpt["best_val"],
+            ckpt["optim_state"],
+            ckpt["scheduler_state"],
+            ckpt["lambda_schedule_state"],
         )
 
 
@@ -592,13 +595,14 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     best_val = float("inf")
     bad_epochs = 0
 
+    lambda_schedule_state = None
     if resume and ckpt_last.exists():
         print(f"[GPT]: Loading model from checkpoint: {ckpt_last}")
-        loaded_model, start_epoch, best_val, opt_state, sch_state  = GPT.load(ckpt_last, embedder=model.embedder, map_location=device)
+        loaded_model, start_epoch, best_val, opt_state, sch_state, lambda_schedule_state = GPT.load(ckpt_last, embedder=model.embedder, map_location=device)
         model.load_state_dict(loaded_model.state_dict())
         optimizer.load_state_dict(opt_state)
-        
-        # Scheduler needs to be re-initiated with the recovered optimizer before loading it's state dict
+
+        # Scheduler needs to be re-initiated with the recovered optimizer before loading its state dict
         scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
         scheduler.load_state_dict(sch_state)
         start_epoch += 1
@@ -610,6 +614,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         schedule_config=training_settings["phase2_scheduler"],
         start_epoch=start_epoch
     )
+    if lambda_schedule_state is not None:
+        schedule_controller.load_state_dict(lambda_schedule_state)
 
     train_losses, val_losses = [], []
     pr_tracker = OutcomePRTracker(
@@ -830,8 +836,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         )
     
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_pen, tr_outcome, tr_dt, _, _, _, _, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_pen, vl_outcome, vl_dt, vl_ce_raw, vl_pen_raw, vl_outcome_raw, vl_dt_raw, val_eval = run_epoch(val_dl, epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_pen, tr_outcome, tr_dt, tr_ce_raw, tr_pen_raw, tr_outcome_raw, tr_dt_raw, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_pen, vl_outcome, vl_dt, _, _, _, _, val_eval = run_epoch(val_dl, epoch=epoch, train_flag=False)
 
         # convenience values for printing
         rel_f1 = val_eval["per_class_maxF1"].get("RELEASE", 0.0)
@@ -849,27 +855,29 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
-            vl_main=vl_bce,
-            ce=vl_ce_raw,
-            dt=vl_dt_raw,
-            penalty=vl_pen_raw,
-            outcome=vl_outcome_raw,
+            vl_total=vl_loss,
+            tr_main=tr_bce,
+            ce=tr_ce_raw,
+            dt=tr_dt_raw,
+            penalty=tr_pen_raw,
+            outcome=tr_outcome_raw,
         )
         for msg in schedule_events:
             print(msg)
         if schedule_controller.has_dynamic:
             print(schedule_controller.status_line(epoch))
 
-
         # Save latest
-        model.save(ckpt_last, epoch, best_val, optimizer, scheduler)
+        model.save(ckpt_last, epoch, best_val, optimizer, scheduler,
+                   lambda_schedule_state=schedule_controller.state_dict())
 
-        # Save best model 
+        # Save best model
         warmup_gate = schedule_controller.current_warmup_end_epoch()
 
         if (vl_loss < best_val - 1e-4) and (epoch >= warmup_gate):
             best_val = vl_loss
-            model.save(ckpt_path, epoch, best_val, optimizer, scheduler)
+            model.save(ckpt_path, epoch, best_val, optimizer, scheduler,
+                       lambda_schedule_state=schedule_controller.state_dict())
             print("[Phase-2]: Current best model saved.")
             bad_epochs = 0
         elif epoch >= warmup_gate:

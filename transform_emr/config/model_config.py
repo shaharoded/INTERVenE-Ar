@@ -47,15 +47,16 @@ TRAINING_SETTINGS = {
     "bce_k_window": 10, # For soft targets per token on BCE loss, number of next tokens to predict jointly.
 
     # Phase-1 auxiliary scheduler.
-    # Single stage: mlm and dt both activate immediately (ramp_epochs=1 means no ramp).
-    # Lambda max is calibrated ONCE on the first epoch when each aux loss is available,
-    # then kept fixed. Weighted contribution is capped to `fraction` of validation BCE.
+    # Single stage: mlm and dt activate after bce_only_epochs of pure BCE training.
+    # Lambda max is calibrated ONCE from training losses at the first active epoch,
+    # then kept fixed. Weighted contribution is capped to `fraction` of training BCE.
     "phase1_scheduler": {
+        "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
         "aux_fraction_caps": {
             "mlm": 0.20,  # MLM auxiliary capped to 20% of BCE at calibration epoch
             "dt":  0.20,  # Time regression auxiliary capped to 20% of BCE at calibration epoch
         },
-        "order": [["mlm", "dt"]],  # Single stage: both active from the start
+        "order": [["mlm", "dt"]],  # Single stage: both active together after bce_only_epochs
         "ramp_epochs": {
             "mlm": 1,  # No ramp (immediate full lambda after calibration)
             "dt":  1,
@@ -64,11 +65,14 @@ TRAINING_SETTINGS = {
 
     # Phase-2 auxiliary scheduler.
     # Multi-stage curriculum: stages unlock sequentially based on plateau detection.
-    #   Stage 0: [ce, dt]      — active from epoch 0, ramp immediately
-    #   Stage 1: [penalty]     — unlocked when stage-0 objectives plateau
-    #   Stage 2: [outcome]     — unlocked when stage-1 objectives plateau
+    #   Stage 0: [ce, dt]      — active after bce_only_epochs, ramp immediately
+    #   Stage 1: [penalty]     — unlocked when stage-0 objectives plateau (after ramp)
+    #   Stage 2: [outcome]     — unlocked when stage-1 objectives plateau (after ramp)
+    # Plateau is measured on vl_total (total weighted validation loss) and only checked
+    # once the current stage's ramp has completed.
     # Warmup ends after the outcome ramp completes (dynamic, set by scheduler).
     "phase2_scheduler": {
+        "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
         "aux_fraction_caps": {
             "ce":      0.20,  # Next-token CE nudge cap
             "dt":      0.20,  # Time regression cap

@@ -297,8 +297,8 @@ class EMREmbedding(nn.Module):
             logits = logits[mlm_mask] # flatten to [N_masked,V]
         return logits
     
-    def save(self, epoch, best_val, optimizer, scheduler, path):
-        torch.save({
+    def save(self, epoch, best_val, optimizer, scheduler, path, lambda_schedule_state=None):
+        ckpt = {
             "epoch": epoch,
             "best_val": best_val,
             "optim_state": optimizer.state_dict(),
@@ -311,7 +311,10 @@ class EMREmbedding(nn.Module):
                 "dropout": self.dropout.p,
                 "vocab_size": self.position_embed.num_embeddings,
             }
-        }, path)
+        }
+        if lambda_schedule_state is not None:
+            ckpt["lambda_schedule_state"] = lambda_schedule_state
+        torch.save(ckpt, path)
     
     @classmethod
     def load(cls, path, tokenizer, map_location="cpu"):
@@ -351,7 +354,7 @@ class EMREmbedding(nn.Module):
         )
         model.load_state_dict(ckpt["model_state"])
 
-        return model, ckpt["epoch"], ckpt["best_val"], ckpt["optim_state"], ckpt["scheduler_state"]
+        return model, ckpt["epoch"], ckpt["best_val"], ckpt["optim_state"], ckpt["scheduler_state"], ckpt["lambda_schedule_state"]
 
 
 def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_path=EMBEDDER_CHECKPOINT, 
@@ -405,9 +408,10 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     best_val = float("inf")
     bad_epochs = 0
     
+    lambda_schedule_state = None
     if resume and ckpt_last.exists():
         print(f"[Phase-1] Resuming from checkpoint: {ckpt_last}")
-        embedder, start_epoch, best_val, optim_state, scheduler_state = EMREmbedding.load(ckpt_last, tokenizer=embedder.tokenizer, map_location=device)
+        embedder, start_epoch, best_val, optim_state, scheduler_state, lambda_schedule_state = EMREmbedding.load(ckpt_last, tokenizer=embedder.tokenizer, map_location=device)
         embedder.to(device)
         optimizer.load_state_dict(optim_state)
         scheduler.load_state_dict(scheduler_state)
@@ -417,6 +421,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         schedule_config=training_settings["phase1_scheduler"],
         start_epoch=start_epoch
     )
+    if lambda_schedule_state is not None:
+        schedule_controller.load_state_dict(lambda_schedule_state)
 
     # ----- Epoch function -----
     def run_epoch(loader, epoch, train_flag=False):
@@ -519,15 +525,19 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
 
     # ----- Training loop -----
     for epoch in range(start_epoch, training_settings["phase1_n_epochs"] + 1):
-        tr_tot, tr_bce, tr_dt, tr_mlm, _, _ = run_epoch(train_loader, epoch=epoch, train_flag=True)
-        vl_tot, vl_bce, vl_dt, val_mlm, vl_dt_raw, vl_mlm_raw = run_epoch(val_loader, epoch=epoch, train_flag=False)
+        tr_tot, tr_bce, tr_dt, tr_mlm, tr_dt_raw, tr_mlm_raw = run_epoch(train_loader, epoch=epoch, train_flag=True)
+        vl_tot, vl_bce, vl_dt, val_mlm, _, _ = run_epoch(val_loader, epoch=epoch, train_flag=False)
 
-        # Update auxiliary scheduler (calibration for MLM and DT auxiliaries)
+        # Update auxiliary scheduler:
+        #   vl_total  → plateau detection
+        #   tr_main   → calibration denominator (training BCE)
+        #   mlm/dt    → calibration numerator (training raw aux losses)
         schedule_events = schedule_controller.update(
             epoch=epoch,
-            vl_main=vl_bce,
-            mlm=vl_mlm_raw,
-            dt=vl_dt_raw,
+            vl_total=vl_tot,
+            tr_main=tr_bce,
+            mlm=tr_mlm_raw,
+            dt=tr_dt_raw,
         )
         for msg in schedule_events:
             print(msg)
@@ -545,12 +555,14 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             --> Aux-λ {schedule_controller.status_line(epoch)}""")
 
         # Save last checkpoint
-        embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last)
+        embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last,
+                      lambda_schedule_state=schedule_controller.state_dict())
 
-        # Save best model        
+        # Save best model
         if (vl_tot < best_val - 1e-4) and (epoch >= training_settings["warmup_epochs"]):
             best_val = vl_tot
-            embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path)
+            embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path,
+                          lambda_schedule_state=schedule_controller.state_dict())
             print("[Phase-1]: Current best model saved.")
             bad_epochs = 0
         elif epoch >= training_settings["warmup_epochs"]:

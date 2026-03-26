@@ -33,11 +33,13 @@ def test_linear_schedule_import_is_from_schedulers():
 def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activation():
     """
     Phase-1 scheduling contract:
-      - Aux keys are mlm/dt with ramp=1 (immediate full λ after calibration).
-      - update() uses plain aux names (mlm, dt) as kwargs.
+      - bce_only_epochs=1 means aux activates at epoch 1, not 0.
+      - Calibration uses tr_main (training BCE) not validation.
+      - update() uses vl_total for plateau, tr_main+aux names for calibration.
       - Single-stage: has_dynamic=False, current_warmup_end_epoch() returns None.
     """
     cfg = {
+        "bce_only_epochs": 1,
         "aux_fraction_caps": {"mlm": 0.20, "dt": 0.20},
         "order": [["mlm", "dt"]],
         "ramp_epochs": {"mlm": 1, "dt": 1},
@@ -46,22 +48,22 @@ def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activatio
     assert controller.has_dynamic is False
     assert controller.current_warmup_end_epoch() is None
 
-    # Before calibration everything should be zero.
-    l0 = controller.get_lambdas(epoch=0)
-    assert l0["mlm"] == 0.0 and l0["dt"] == 0.0
+    # Before bce_only_epochs passes, lambdas = 0.
+    assert controller.get_lambdas(epoch=0)["mlm"] == 0.0
 
-    # Calibrate using plain aux names.
-    events = controller.update(epoch=0, vl_main=2.0, mlm=1.0, dt=0.5)
-    assert len(events) >= 2
+    # First active epoch (1): calibrate using training losses.
+    events = controller.update(epoch=1, vl_total=1.8, tr_main=2.0, mlm=1.0, dt=0.5)
+    assert len(events) >= 2  # one calibration message per aux
 
-    # With ramp=1 and start_epoch=0, λ should be at full calibrated value immediately.
-    l1 = controller.get_lambdas(epoch=0)
-    assert l1["mlm"] == pytest.approx(0.4)   # 0.2 * 2.0 / 1.0
-    assert l1["dt"] == pytest.approx(0.8)    # 0.2 * 2.0 / 0.5
+    # lambda_max = fraction * tr_main / tr_aux
+    # mlm: 0.20 * 2.0 / 1.0 = 0.40;  dt: 0.20 * 2.0 / 0.5 = 0.80
+    l1 = controller.get_lambdas(epoch=1)
+    assert l1["mlm"] == pytest.approx(0.40)
+    assert l1["dt"] == pytest.approx(0.80)
 
-    # Calibration is frozen; second update with different losses should not change λ_max.
-    controller.update(epoch=1, vl_main=10.0, mlm=10.0, dt=10.0)
-    l2 = controller.get_lambdas(epoch=1)
+    # Calibration is frozen — second update must not change lambda_max.
+    controller.update(epoch=2, vl_total=1.0, tr_main=10.0, mlm=10.0, dt=10.0)
+    l2 = controller.get_lambdas(epoch=2)
     assert l2["mlm"] == pytest.approx(l1["mlm"])
     assert l2["dt"] == pytest.approx(l1["dt"])
 
@@ -69,12 +71,13 @@ def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activatio
 def test_unified_lambda_schedule_controller_phase2_ramp_progression():
     """
     Phase-2 scheduling contract:
-      - CE/DT start together at epoch 0.
-      - Ramp follows configured ramp_epochs.
-      - Penalty/Outcome keep zero before unlock (multi-stage dynamic curriculum).
+      - Stage-0 (ce, dt) activates at epoch 1 (bce_only_epochs=1), ramp_epochs=5.
+      - Ramp runs from start_epoch to start_epoch+ramp_epochs (epoch 1 to 6).
+      - Penalty/Outcome stay zero before unlock.
       - has_dynamic=True; current_warmup_end_epoch() is inf until outcome unlocked.
     """
     cfg = {
+        "bce_only_epochs": 1,
         "aux_fraction_caps": {"ce": 0.20, "dt": 0.20, "penalty": 0.20, "outcome": 0.20},
         "order": [["ce", "dt"], ["penalty"], ["outcome"]],
         "ramp_epochs": {"ce": 5, "dt": 5, "penalty": 5, "outcome": 5},
@@ -85,36 +88,40 @@ def test_unified_lambda_schedule_controller_phase2_ramp_progression():
     assert controller.has_dynamic is True
     assert controller.current_warmup_end_epoch() == float("inf")
 
-    # Calibrate CE/DT using plain aux names.
-    controller.update(epoch=0, vl_main=2.0, ce=1.0, dt=0.5)
+    # Calibrate at first active epoch (1) using training losses.
+    controller.update(epoch=1, vl_total=2.0, tr_main=2.0, ce=1.0, dt=0.5)
+    # lambda_max: ce=0.40, dt=0.80. ramp start=1, end=6.
 
-    # Target lambdas: ce=0.4, dt=0.8; at epoch=0 ramp starts at 0 (ramp_epochs=5>1).
-    lam0 = controller.get_lambdas(epoch=0)
-    assert lam0["ce"] == pytest.approx(0.0)
-    assert lam0["dt"] == pytest.approx(0.0)
-    assert lam0["penalty"] == pytest.approx(0.0)
-    assert lam0["outcome"] == pytest.approx(0.0)
+    # At start of ramp (epoch 1): linear_schedule(1, 1, 6, max) = 0.
+    lam1 = controller.get_lambdas(epoch=1)
+    assert lam1["ce"] == pytest.approx(0.0)
+    assert lam1["dt"] == pytest.approx(0.0)
+    assert lam1["penalty"] == pytest.approx(0.0)
+    assert lam1["outcome"] == pytest.approx(0.0)
 
-    # Mid-ramp check at epoch=2 with ramp=5.
-    lam2 = controller.get_lambdas(epoch=2)
-    assert lam2["ce"] == pytest.approx(0.4 * (2 / 5), rel=1e-6)
-    assert lam2["dt"] == pytest.approx(0.8 * (2 / 5), rel=1e-6)
+    # Mid-ramp at epoch 3: (3-1)/(6-1) = 2/5.
+    lam3 = controller.get_lambdas(epoch=3)
+    assert lam3["ce"] == pytest.approx(0.40 * (2 / 5), rel=1e-6)
+    assert lam3["dt"] == pytest.approx(0.80 * (2 / 5), rel=1e-6)
 
-    # End-ramp at epoch=5 reaches full λ_max.
-    lam5 = controller.get_lambdas(epoch=5)
-    assert lam5["ce"] == pytest.approx(0.4, rel=1e-6)
-    assert lam5["dt"] == pytest.approx(0.8, rel=1e-6)
+    # End-ramp at epoch 6: (6-1)/(6-1) = 1 → full lambda_max.
+    lam6 = controller.get_lambdas(epoch=6)
+    assert lam6["ce"] == pytest.approx(0.40, rel=1e-6)
+    assert lam6["dt"] == pytest.approx(0.80, rel=1e-6)
 
 
 def test_scheduler_stage_transitions_and_warmup():
     """
-    Phase-2 dynamic curriculum:
-      - Penalty unlocks after stage-0 plateaus (patience=2 consecutive non-improving epochs).
-      - Outcome unlocks after stage-1 plateaus.
+    Phase-2 dynamic curriculum with ramp-delay gating:
+      - bce_only_epochs=1: stage-0 (ce, dt) starts at epoch 1, ramp=1 → ramp_end=1.
+      - Plateau check for stage 0→1 starts at epoch >= ramp_end (epoch 1).
+      - Penalty unlocks after patience=2 non-improving vl_total epochs.
+      - Plateau check for stage 1→2 is SKIPPED during penalty ramp (epochs penalty_start to penalty_start+3).
+      - Outcome unlocks after patience=2 non-improving epochs post-ramp.
       - warmup_complete_epoch = outcome_start + outcome_ramp_epochs.
-      - Improvement resets the plateau counter.
     """
     cfg = {
+        "bce_only_epochs": 1,
         "aux_fraction_caps": {"ce": 0.20, "dt": 0.20, "penalty": 0.20, "outcome": 0.20},
         "order": [["ce", "dt"], ["penalty"], ["outcome"]],
         "ramp_epochs": {"ce": 1, "dt": 1, "penalty": 3, "outcome": 3},
@@ -123,35 +130,87 @@ def test_scheduler_stage_transitions_and_warmup():
     }
     sc = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
 
-    # Epoch 0: first call → improvement from inf → bad_epochs reset to 0
-    sc.update(epoch=0, vl_main=1.0, ce=0.5, dt=0.3)
+    # Epoch 1: first active epoch. Calibrates + plateau check starts.
+    # vl_total=1.8 is improvement over inf → bad=0.
+    sc.update(epoch=1, vl_total=1.8, tr_main=1.0, ce=0.5, dt=0.3)
+    assert sc._auxiliaries["penalty"]["start_epoch"] is None
 
-    # Epoch 1: flat → bad_epochs=1 < patience=2 → still locked
-    sc.update(epoch=1, vl_main=1.0, ce=0.5, dt=0.3)
-    assert sc._auxiliaries["penalty"]["start_epoch"] is None, "bad_epochs=1 < patience=2"
+    # Epoch 2: vl_total flat → bad=1 < patience=2 → locked.
+    sc.update(epoch=2, vl_total=1.8, tr_main=1.0, ce=0.5, dt=0.3)
+    assert sc._auxiliaries["penalty"]["start_epoch"] is None, "bad=1 < patience=2"
 
-    # Epoch 2: flat → bad_epochs=2 == patience → unlocks
-    sc.update(epoch=2, vl_main=1.0, ce=0.5, dt=0.3)
+    # Epoch 3: bad=2 = patience → penalty unlocks at epoch 4.
+    sc.update(epoch=3, vl_total=1.8, tr_main=1.0, ce=0.5, dt=0.3)
     penalty_start = sc._auxiliaries["penalty"]["start_epoch"]
-    assert penalty_start is not None, "Penalty should be unlocked (bad_epochs=2)"
+    assert penalty_start == 4, f"Expected penalty_start=4, got {penalty_start}"
 
-    # Improvement at penalty_start resets plateau counter — outcome won't unlock yet
-    sc.update(epoch=penalty_start, vl_main=0.7, ce=0.4, dt=0.2, penalty=0.5)
+    # During penalty ramp (penalty_start=4, ramp_epochs=3, ramp_end=7):
+    # plateau check for outcome is SKIPPED at epochs 4, 5, 6.
+    sc.update(epoch=4, vl_total=1.5, tr_main=0.7, ce=0.4, dt=0.2, penalty=0.4)
+    sc.update(epoch=5, vl_total=1.5, tr_main=0.7, ce=0.4, dt=0.2, penalty=0.4)
+    sc.update(epoch=6, vl_total=1.5, tr_main=0.7, ce=0.4, dt=0.2, penalty=0.4)
+    assert sc._auxiliaries["outcome"]["start_epoch"] is None, "Must not unlock during penalty ramp"
+
+    # Epoch 7: ramp ends (ramp_end=7). First plateau check for stage 1→2.
+    # vl_total=1.0 is improvement over inf → bad=0.
+    sc.update(epoch=7, vl_total=1.0, tr_main=0.6, ce=0.3, dt=0.2, penalty=0.4)
     assert sc._auxiliaries["outcome"]["start_epoch"] is None
 
-    # Two flat epochs satisfy patience=2 → outcome unlocks
-    sc.update(epoch=penalty_start + 1, vl_main=0.7, ce=0.4, dt=0.2, penalty=0.5)
-    sc.update(epoch=penalty_start + 2, vl_main=0.7, ce=0.4, dt=0.2, penalty=0.5)
+    # Epoch 8: flat → bad=1.
+    sc.update(epoch=8, vl_total=1.0, tr_main=0.6, ce=0.3, dt=0.2, penalty=0.4)
+    assert sc._auxiliaries["outcome"]["start_epoch"] is None, "bad=1 < patience=2"
+
+    # Epoch 9: bad=2 = patience → outcome unlocks at epoch 10.
+    sc.update(epoch=9, vl_total=1.0, tr_main=0.6, ce=0.3, dt=0.2, penalty=0.4)
     outcome_start = sc._auxiliaries["outcome"]["start_epoch"]
-    assert outcome_start is not None, "Outcome should be unlocked now"
+    assert outcome_start == 10, f"Expected outcome_start=10, got {outcome_start}"
 
-    # Warmup = outcome_start + ramp_epochs(3)
-    assert sc.current_warmup_end_epoch() == outcome_start + 3
+    # Warmup = outcome_start + ramp_epochs(3).
+    assert sc.current_warmup_end_epoch() == 13
 
-    # Lambda for penalty ramps correctly from 0 to λ_max over 3 epochs
+    # Penalty lambda ramps: 0 at start, lambda_max at start+3.
     pen_max = sc._auxiliaries["penalty"]["lambda_max"]
     assert sc.get_lambdas(penalty_start)["penalty"] == pytest.approx(0.0)
     assert sc.get_lambdas(penalty_start + 3)["penalty"] == pytest.approx(pen_max)
+
+
+def test_scheduler_state_dict_roundtrip():
+    """state_dict() / load_state_dict() restores calibration and stage state exactly."""
+    cfg = {
+        "bce_only_epochs": 1,
+        "aux_fraction_caps": {"ce": 0.20, "dt": 0.20, "penalty": 0.20, "outcome": 0.20},
+        "order": [["ce", "dt"], ["penalty"], ["outcome"]],
+        "ramp_epochs": {"ce": 1, "dt": 1, "penalty": 3, "outcome": 3},
+        "plateau_min_delta": 1e-4,
+        "plateau_patience": [2, 2],
+    }
+    sc = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
+    sc.update(epoch=1, vl_total=1.8, tr_main=1.0, ce=0.5, dt=0.3)
+    sc.update(epoch=2, vl_total=1.8, tr_main=1.0, ce=0.5, dt=0.3)
+    sc.update(epoch=3, vl_total=1.8, tr_main=1.0, ce=0.5, dt=0.3)
+
+    state = sc.state_dict()
+
+    # New controller with same config, restore state.
+    sc2 = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
+    sc2.load_state_dict(state)
+
+    assert sc2._auxiliaries["ce"]["lambda_max"] == pytest.approx(sc._auxiliaries["ce"]["lambda_max"])
+    assert sc2._auxiliaries["penalty"]["start_epoch"] == sc._auxiliaries["penalty"]["start_epoch"]
+    assert sc2._current_stage == sc._current_stage
+    assert sc2._stage_bad_epochs == sc._stage_bad_epochs
+    assert sc2.get_lambdas(4) == sc.get_lambdas(4)
+
+
+def test_scheduler_missing_cap_raises():
+    """Missing aux_fraction_caps entry raises KeyError at construction, not silently."""
+    cfg = {
+        "aux_fraction_caps": {"ce": 0.20},  # dt missing
+        "order": [["ce", "dt"]],
+        "ramp_epochs": {"ce": 1, "dt": 1},
+    }
+    with pytest.raises(KeyError, match="dt"):
+        LambdaScheduleController(schedule_config=cfg, start_epoch=0)
 
 @pytest.fixture(scope="module")
 def mini_tokenizer():

@@ -137,7 +137,7 @@ def run_two_phase_training():
     ckpt_embedder_path = Path(EMBEDDER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
 
     if ckpt_embedder_path.exists():
-        embedder, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
+        embedder, _, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
     else:
         embedder = EMREmbedding(
             tokenizer=tokenizer,
@@ -152,7 +152,7 @@ def run_two_phase_training():
     ckpt_last_path = Path(TRANSFORMER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
 
     if ckpt_last_path.exists():
-        model, _, _, _, _ = GPT.load(ckpt_last_path, embedder=embedder)
+        model, _, _, _, _, _ = GPT.load(ckpt_last_path, embedder=embedder)
     else:
         model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
 
@@ -168,7 +168,7 @@ if __name__ == "__main__":
 
     if ckpt_embedder_path.exists():
         # Not really needed. train_embedder function also calles EMREmbedding.load() on assumed checkpoint.
-        embedder, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
+        embedder, _, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
     else:
         embedder = EMREmbedding(
             tokenizer=tokenizer,
@@ -184,7 +184,7 @@ if __name__ == "__main__":
 
     if ckpt_last_path.exists():
         # Not really needed. train_transformer function also calles GPT.load() on assumed checkpoint.
-        model, _, _, _, _ = GPT.load(ckpt_last_path, embedder=embedder)
+        model, _, _, _, _, _ = GPT.load(ckpt_last_path, embedder=embedder)
     else:
         model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
 
