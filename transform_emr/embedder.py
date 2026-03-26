@@ -249,7 +249,8 @@ class EMREmbedding(nn.Module):
         # Context Dropout (Crucial for Phase 2 compatibility)
         # Keep tensor-side branch for stable, vectorized execution.
         if self.training:
-            drop = torch.rand(1, device=cond.device) < context_dropout_prob
+            B = cond.size(0)
+            drop = (torch.rand(B, 1, device=cond.device) < context_dropout_prob)  # [B, 1] per-sample
             cond_for_addition = torch.where(drop, torch.zeros_like(cond), cond)
         else:
             cond_for_addition = cond
@@ -285,7 +286,8 @@ class EMREmbedding(nn.Module):
         # Context Dropout (Crucial for Phase 2 compatibility)
         # Keep tensor-side branch for stable, vectorized execution.
         if self.training:
-            drop = torch.rand(1, device=cond.device) < context_dropout_prob
+            B = cond.size(0)
+            drop = (torch.rand(B, 1, device=cond.device) < context_dropout_prob)  # [B, 1] per-sample
             cond_for_addition = torch.where(drop, torch.zeros_like(cond), cond)
         else:
             cond_for_addition = cond
@@ -297,10 +299,11 @@ class EMREmbedding(nn.Module):
             logits = logits[mlm_mask] # flatten to [N_masked,V]
         return logits
     
-    def save(self, epoch, best_val, optimizer, scheduler, path, lambda_schedule_state=None):
+    def save(self, epoch, best_val, optimizer, scheduler, path, lambda_schedule_state=None, bad_epochs=0):
         ckpt = {
             "epoch": epoch,
             "best_val": best_val,
+            "bad_epochs": bad_epochs,
             "optim_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
             "model_state": self.state_dict(),
@@ -354,7 +357,7 @@ class EMREmbedding(nn.Module):
         )
         model.load_state_dict(ckpt["model_state"])
 
-        return model, ckpt["epoch"], ckpt["best_val"], ckpt["optim_state"], ckpt["scheduler_state"], ckpt["lambda_schedule_state"]
+        return model, ckpt["epoch"], ckpt["best_val"], ckpt["optim_state"], ckpt["scheduler_state"], ckpt["lambda_schedule_state"], ckpt.get("bad_epochs", 0)
 
 
 def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_path=EMBEDDER_CHECKPOINT, 
@@ -411,7 +414,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     lambda_schedule_state = None
     if resume and ckpt_last.exists():
         print(f"[Phase-1] Resuming from checkpoint: {ckpt_last}")
-        embedder, start_epoch, best_val, optim_state, scheduler_state, lambda_schedule_state = EMREmbedding.load(ckpt_last, tokenizer=embedder.tokenizer, map_location=device)
+        embedder, start_epoch, best_val, optim_state, scheduler_state, lambda_schedule_state, bad_epochs = EMREmbedding.load(ckpt_last, tokenizer=embedder.tokenizer, map_location=device)
         embedder.to(device)
         optimizer.load_state_dict(optim_state)
         scheduler.load_state_dict(scheduler_state)
@@ -491,11 +494,12 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             mlm_loss = mlm_raw * lambdas["mlm"]
             
             # Δt regression supervision
-            # Predict normalised absolute time for every step
+            # Predict normalised absolute time for every step (non-padding only)
+            nonpad = (batch["position_ids"] != embedder.padding_idx)  # [B,T]
             pred_t = embedder.predict_time(batch["abs_ts"])            # [B,T,1]
             dt_raw = F.mse_loss(
-                pred_t.squeeze(-1),                                    # [B,T]
-                batch["abs_ts"],                                       # [B,T]
+                pred_t.squeeze(-1)[nonpad],                            # [N_real]
+                batch["abs_ts"][nonpad],                               # [N_real]
                 reduction='mean'
             )
             time_loss = dt_raw * lambdas["dt"]
@@ -554,25 +558,28 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             --> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  MLM={val_mlm:.4f}  Δt={vl_dt:.4f})
             --> Aux-λ {schedule_controller.status_line(epoch)}""")
 
-        # Save last checkpoint
-        embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last,
-                      lambda_schedule_state=schedule_controller.state_dict())
-
         # Save best model
         if (vl_tot < best_val - 1e-4) and (epoch >= training_settings["warmup_epochs"]):
             best_val = vl_tot
-            embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path,
-                          lambda_schedule_state=schedule_controller.state_dict())
-            print("[Phase-1]: Current best model saved.")
             bad_epochs = 0
+            embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path,
+                          lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs)
+            print("[Phase-1]: Current best model saved.")
         elif epoch >= training_settings["warmup_epochs"]:
             bad_epochs += 1
             if bad_epochs >= training_settings["early-stop-patience"]:
+                # Save last checkpoint before stopping
+                embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last,
+                              lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs)
                 print("[Phase-1]: Early stopping triggered.")
                 break
         else:
             # If warmup isn't complete - do nothing.
             continue
+
+        # Save last checkpoint (after bad_epochs is updated)
+        embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last,
+                      lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs)
     
     plot_losses(train_losses, val_losses)
     return embedder, train_losses, val_losses

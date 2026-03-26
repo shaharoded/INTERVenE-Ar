@@ -137,7 +137,7 @@ def run_two_phase_training():
     ckpt_embedder_path = Path(EMBEDDER_CHECKPOINT).resolve().parent / "ckpt_last.pt"
 
     if ckpt_embedder_path.exists():
-        embedder, _, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
+        embedder, _, _, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
     else:
         embedder = EMREmbedding(
             tokenizer=tokenizer,
@@ -168,7 +168,7 @@ if __name__ == "__main__":
 
     if ckpt_embedder_path.exists():
         # Not really needed. train_embedder function also calles EMREmbedding.load() on assumed checkpoint.
-        embedder, _, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
+        embedder, _, _, _, _, _, _ = EMREmbedding.load(ckpt_embedder_path, tokenizer=tokenizer)
     else:
         embedder = EMREmbedding(
             tokenizer=tokenizer,
