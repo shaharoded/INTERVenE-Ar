@@ -574,7 +574,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         counts=model.embedder.tokenizer.token_counts,
         token_weights=model.embedder.tokenizer.token_weights,
         beta=0.999, min_count=5, clip_max=8.0,
-        gamma=1.3,         # focal strength
+        gamma=0.5,          # mild focal suppression — pretrained embedder already makes examples "easy"
         tau=0.85,           # pos/neg balance anchor
         neg_bounds=(0.03, 0.3),   # clamp for stability
         label_smoothing=0.0,     # optional
