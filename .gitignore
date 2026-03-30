@@ -1,0 +1,34 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+worktrees/
+results/
+queue/
+
+# Agent prompt files (generated per-session by launchers)
+CLAUDE.md
+AGENTS.md
+
+# Experimental code/artifacts
+dev/
+
+# Autoresearch runtime outputs (untracked across experiments)
+results.tsv
+run.log
+progress.png
+
+# Model checkpoints (large, rebuilt each experiment)
+emr_model/checkpoints/
+
+# Raw data (large source files)
+emr_model/data/source/
+
+# uv lock file (regenerate with: uv lock)
+uv.lock
