@@ -12,7 +12,8 @@ TEST_CTX_DATA_FILE       = os.path.join(PROJECT_ROOT, 'data', 'test', 'synthetic
 
 # Define the prediction targets, <bot>, <eot> tokens to terminate the inference
 OUTCOMES = [
-    "DISGLYCEMIA_EVENT",
+    "DISGLYCEMIA_EVENT_Hypoglycemia",
+    "DISGLYCEMIA_EVENT_Hyperglycemia",
     "KIDNEY_COMPLICATION_EVENT",
     "ACUTE_RESPIRATORY_DISORDER_EVENT",
     "INFECTION_EVENT",
