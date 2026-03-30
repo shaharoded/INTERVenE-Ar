@@ -77,7 +77,7 @@ TRAINING_SETTINGS = {
             "ce":      0.20,  # Next-token CE nudge cap
             "dt":      0.20,  # Time regression cap
             "penalty": 0.20,  # Structural legality penalty cap
-            "outcome": 0.20,  # Future-outcome auxiliary cap
+            "outcome": 0.50,  # Future-outcome auxiliary cap
         },
         "order": [["ce", "dt"], ["penalty"], ["outcome"]],
         "ramp_epochs": {
