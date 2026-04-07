@@ -306,6 +306,7 @@ class EMREmbedding(nn.Module):
             "bad_epochs": bad_epochs,
             "optim_state": optimizer.state_dict(),
             "scheduler_state": scheduler.state_dict(),
+            "lambda_schedule_state": lambda_schedule_state,
             "model_state": self.state_dict(),
             "config": {
                 "ctx_dim": self.context_proj.in_features,
@@ -315,8 +316,6 @@ class EMREmbedding(nn.Module):
                 "vocab_size": self.position_embed.num_embeddings,
             }
         }
-        if lambda_schedule_state is not None:
-            ckpt["lambda_schedule_state"] = lambda_schedule_state
         torch.save(ckpt, path)
     
     @classmethod
@@ -357,7 +356,15 @@ class EMREmbedding(nn.Module):
         )
         model.load_state_dict(ckpt["model_state"])
 
-        return model, ckpt["epoch"], ckpt["best_val"], ckpt["optim_state"], ckpt["scheduler_state"], ckpt["lambda_schedule_state"], ckpt.get("bad_epochs", 0)
+        return (
+            model,
+            ckpt["epoch"],
+            ckpt["best_val"],
+            ckpt["optim_state"],
+            ckpt["scheduler_state"],
+            ckpt.get("lambda_schedule_state"),
+            ckpt.get("bad_epochs", 0),
+        )
 
 
 def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_path=EMBEDDER_CHECKPOINT, 
@@ -453,7 +460,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             bce_logits = embedder.forward_with_decoder(batch)  # [B, T, V]
 
             # build legality with teacher forcing (same LUTs as phase-2)
-            illegal, _ = compute_legality_masks_tf(
+            illegal = compute_legality_masks_tf(
                 position_ids=batch["position_ids"],
                 is_start=luts["is_start"],
                 is_end=luts["is_end"],
@@ -467,12 +474,24 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 predict_block=luts["predict_block"],   # PAD/MASK/CTX only
             )
 
-            multi_hot_targets = get_multi_hot_targets(
-                                position_ids=batch["position_ids"], 
-                                padding_idx=embedder.padding_idx, 
-                                vocab_size=bce_logits.size(-1), 
-                                k=training_settings["bce_k_window"]
-                                ).masked_fill(illegal, 0.0)
+            # Temporal: all tokens within phase1_bce_window_hours
+            _ABS_TS_SCALE = 336.0
+            _P1_WIN = training_settings.get("phase1_bce_window_hours", 3.0) / _ABS_TS_SCALE
+            B_s, T_s = batch["position_ids"].shape
+            V = bce_logits.size(-1)
+            pad_idx = embedder.padding_idx
+            with torch.no_grad():
+                abs_ts = batch["abs_ts"]                        # [B, T]
+                dt = abs_ts.unsqueeze(1) - abs_ts.unsqueeze(2)  # [B, T, T]
+                in_win = (dt > 0) & (dt <= _P1_WIN)             # future tokens within window
+                tok_ids = batch["position_ids"]                 # [B, T]
+                # Expand token ids and scatter into multi-hot
+                tgt = tok_ids.unsqueeze(1).expand(B_s, T_s, T_s).masked_fill(~in_win, pad_idx)
+                multi_hot_targets = torch.zeros(B_s, T_s, V, device=bce_logits.device)
+                multi_hot_targets.scatter_(2, tgt, 1.0)
+                multi_hot_targets[..., pad_idx] = 0.0
+                del dt, in_win, tgt
+            multi_hot_targets = multi_hot_targets.masked_fill(illegal, 0.0)
 
             raw = loss_fn(bce_logits, multi_hot_targets)       # [B, T, V], Per-element loss
             weights = ((~illegal) & (batch["position_ids"] != embedder.padding_idx).unsqueeze(-1)).float()  # [B,T,V]

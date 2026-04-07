@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
 
 # ---------------------------------------------------------------------------
 # Paths — all relative to this file's directory
@@ -35,7 +36,7 @@ if EMR_MODEL_DIR not in sys.path:
     sys.path.insert(0, EMR_MODEL_DIR)
 
 from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr, get_dataloader
-from transform_emr.config.dataset_config import TAK_REPO_PATH
+from transform_emr.config.dataset_config import TAK_REPO_PATH, OUTCOMES
 from transform_emr.utils import get_multi_hot_targets
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,7 @@ from transform_emr.utils import get_multi_hot_targets
 # ---------------------------------------------------------------------------
 
 DATA_DIR               = os.path.join(EMR_MODEL_DIR, "data", "source")
-TEMPORAL_DATA_FILE     = os.path.join(DATA_DIR, "temporal_events.csv")
+TEMPORAL_DATA_FILE     = os.path.join(DATA_DIR, "temporal_data.csv")
 CONTEXT_DATA_FILE      = os.path.join(DATA_DIR, "context_data.csv")
 
 CHECKPOINT_DIR         = os.path.join(EMR_MODEL_DIR, "checkpoints")
@@ -82,11 +83,11 @@ def load_data(sample=None, batch_size=64):
     ctx_df      = pd.read_csv(CONTEXT_DATA_FILE)
 
     if sample is not None:
-        pids   = temporal_df["PatientID"].unique()
+        pids   = temporal_df["PatientId"].unique()
         rng    = np.random.RandomState(RANDOM_SEED)
         chosen = rng.choice(pids, size=min(sample, len(pids)), replace=False)
-        temporal_df = temporal_df[temporal_df["PatientID"].isin(chosen)]
-        ctx_df      = ctx_df[ctx_df["PatientID"].isin(chosen)]
+        temporal_df = temporal_df[temporal_df["PatientId"].isin(chosen)]
+        ctx_df      = ctx_df[ctx_df["PatientId"].isin(chosen)]
 
     tokenizer_path = Path(TOKENIZER_PATH)
     tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,11 +105,11 @@ def load_data(sample=None, batch_size=64):
         tokenizer.save(str(tokenizer_path))
         print(f"[Data]: Tokenizer saved to {tokenizer_path}")
 
-    pids = temporal_df["PatientID"].unique()
+    pids = temporal_df["PatientId"].unique()
     train_ids, val_ids = train_test_split(pids, test_size=VAL_SPLIT, random_state=RANDOM_SEED)
 
-    train_df  = temporal_df[temporal_df.PatientID.isin(train_ids)].copy()
-    val_df    = temporal_df[temporal_df.PatientID.isin(val_ids)].copy()
+    train_df  = temporal_df[temporal_df.PatientId.isin(train_ids)].copy()
+    val_df    = temporal_df[temporal_df.PatientId.isin(val_ids)].copy()
     train_ctx = ctx_df.loc[ctx_df.index.isin(train_ids)]
     val_ctx   = ctx_df.loc[ctx_df.index.isin(val_ids)]
 
@@ -125,43 +126,72 @@ def load_data(sample=None, batch_size=64):
     return embedder_train_dl, transformer_train_dl, val_dl, tokenizer
 
 # ---------------------------------------------------------------------------
-# Fixed evaluation metric (DO NOT CHANGE — this is the ground truth)
+# Fixed evaluation metrics (DO NOT CHANGE — this is the ground truth)
 # ---------------------------------------------------------------------------
 
-EVAL_K_WINDOW = 5  # fixed k for evaluation — independent of training bce_k_window
+EVAL_BCE_K_WINDOW    = 5     # step-based window for BCE (secondary metric only)
+OUTCOME_WINDOW_HOURS = 48.0  # temporal window for AUROC labels
+_ABS_TS_SCALE        = 336.0 # abs_ts = TimePoint_in_hours / 336
+_OUTCOME_WINDOW_NORM = OUTCOME_WINDOW_HOURS / _ABS_TS_SCALE  # in abs_ts units
+
+
+def _get_outcome_token_ids(tokenizer):
+    """Return a list of (outcome_name, token_id) for all outcomes present in the vocab."""
+    return [(name, tokenizer.token2id[name])
+            for name in OUTCOMES if name in tokenizer.token2id]
+
 
 @torch.no_grad()
-def evaluate_val_bce(model, val_dl, device="cuda"):
+def evaluate_val_metrics(model, val_dl, device="cuda"):
     """
-    BCE validation loss with a fixed k=5 look-ahead window.
+    Compute two complementary validation metrics in a single forward pass.
 
-    BCE with multi-hot targets is the right metric for EMR data: multiple
-    events can occur simultaneously (or within a few steps), so penalising
-    the model for not picking a single "correct" token (as CE would do) is
-    inappropriate.
+    Primary — outcome_auroc (higher is better, 0.5 = random, 1.0 = perfect)
+        Mean per-outcome ROC-AUC with a TEMPORAL label, averaged across all
+        outcome types present in the validation set.
 
-    The window is pinned at EVAL_K_WINDOW=5 regardless of the bce_k_window
-    training hyperparameter, so experiments with different k values remain
-    directly comparable.
+        For each specific outcome type o (e.g. KIDNEY_COMPLICATION_EVENT):
+          - Score at position t  = logit for token o at position t
+          - Label at position t  = 1  if outcome o occurs at any future event
+                                       whose timestamp is within OUTCOME_WINDOW_HOURS
+                                       (48 h) of the current event's timestamp
 
-    Lower is better. Padding positions are excluded.
+        The 48 h window is in real patient time (abs_ts units), so label=1 means
+        "this specific complication happens within the next 48 hours."  This is
+        invariant to event density — a quiet period with sparse events gets the
+        same window as a dense ICU period.
+
+        AUROC is computed per outcome type, then averaged.  A model that
+        predicts a complication at random scores ≈ 0.5; it must predict the
+        *correct* complication *when* it is approaching to score well.
+
+    Secondary — val_bce_loss (lower is better)
+        Mean BCE over all token positions (multi-hot, step-based k=5 window).
+        Sanity signal — not the keep/discard criterion.
 
     Returns
     -------
-    float : mean BCE loss over the validation set
+    outcome_auroc : float  (primary — higher is better)
+    val_bce       : float  (secondary — lower is better)
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
     model.eval()
     model.to(device)
 
-    padding_idx   = model.embedder.padding_idx
-    total_loss    = 0.0
-    total_batches = 0
+    tokenizer    = model.embedder.tokenizer
+    padding_idx  = model.embedder.padding_idx
+    outcome_list = _get_outcome_token_ids(tokenizer)  # [(name, tid), ...]
+
+    scores_by_outcome = {tid: [] for _, tid in outcome_list}
+    labels_by_outcome = {tid: [] for _, tid in outcome_list}
+
+    bce_loss_sum = 0.0
+    bce_batches  = 0
 
     for batch in val_dl:
         batch = {key: v.to(device) if torch.is_tensor(v) else v for key, v in batch.items()}
 
-        logits, _, _ = model(
+        logits, _, _, _ = model(
             parent_raw_ids=batch["parent_raw_ids"],
             concept_ids   =batch["concept_ids"],
             value_ids     =batch["value_ids"],
@@ -170,30 +200,87 @@ def evaluate_val_bce(model, val_dl, device="cuda"):
             context_vec   =batch["context_vec"],
         )
 
-        # Autoregressive: logit at t predicts token t+1
         pred_logits = logits[:, :-1, :].float()   # [B, T-1, V]
-        target_ids  = batch["targets"][:, 1:]      # [B, T-1]
+        target_ids  = batch["targets"][:, 1:]      # [B, T-1]  true next tokens
         nonpad      = target_ids != padding_idx    # [B, T-1]
 
         if nonpad.sum() == 0:
             continue
 
+        # Timestamps:
+        #   cur_ts[b, t] = timestamp of last seen event at prediction step t
+        #                = abs_ts[b, t]  (unshifted — this is what the model
+        #                                 has observed up to step t)
+        #   fut_ts[b, t] = timestamp of the true future event at step t
+        #                = abs_ts[b, t+1] (shifted)
+        cur_ts = batch["abs_ts"][:, :-1]   # [B, T-1]
+        fut_ts = batch["abs_ts"][:, 1:]    # [B, T-1]
+
+        # time_in_window[b, t, t'] = True if future event at step t' falls
+        # strictly after t and within 48 h of t's timestamp.
+        # Shape: [B, T-1, T-1]
+        dt = fut_ts.unsqueeze(1) - cur_ts.unsqueeze(2)   # [B, T-1, T-1]
+        time_in_window = (dt > 0) & (dt <= _OUTCOME_WINDOW_NORM)
+
+        # ------------------------------------------------------------------
+        # Primary: per-outcome temporal AUROC
+        # ------------------------------------------------------------------
+        for _, tid in outcome_list:
+            # fut_is_o[b, t'] = 1 if future token at t' is outcome o
+            fut_is_o = (target_ids == tid)                          # [B, T-1]
+
+            # label[b, t] = any future event within 48 h that is outcome o
+            label = (time_in_window & fut_is_o.unsqueeze(1)).any(dim=2)  # [B, T-1]
+
+            # score = logit for outcome o at each prediction position
+            score = pred_logits[:, :, tid]                          # [B, T-1]
+
+            scores_by_outcome[tid].append(score[nonpad].cpu().float().numpy())
+            labels_by_outcome[tid].append(label[nonpad].cpu().float().numpy())
+
+        # ------------------------------------------------------------------
+        # Secondary: BCE loss (step-based, sanity signal only)
+        # ------------------------------------------------------------------
         vocab_size = pred_logits.size(-1)
         multi_hot  = get_multi_hot_targets(
             position_ids=target_ids,
             padding_idx =padding_idx,
-            vocab_size  =vocab_size,
-            k           =EVAL_K_WINDOW,
-        ).to(device)                               # [B, T-1, V]
+            vocab_size   =vocab_size,
+            k            =EVAL_BCE_K_WINDOW,
+        ).to(device)
 
-        # Average BCE over valid (non-pad) positions only
         loss_per_elem = F.binary_cross_entropy_with_logits(
             pred_logits, multi_hot, reduction="none"
-        )                                          # [B, T-1, V]
-        valid_mask = nonpad.unsqueeze(-1).float()  # [B, T-1, 1]
-        loss = (loss_per_elem * valid_mask).sum() / (valid_mask.sum().clamp(min=1) * vocab_size)
+        )
+        valid_mask    = nonpad.unsqueeze(-1).float()
+        bce_loss_sum += (
+            (loss_per_elem * valid_mask).sum() /
+            (valid_mask.sum().clamp(min=1) * vocab_size)
+        ).item()
+        bce_batches  += 1
 
-        total_loss    += loss.item()
-        total_batches += 1
+    # Average per-outcome AUROC
+    aurocs = []
+    for name, tid in outcome_list:
+        scores = np.concatenate(scores_by_outcome[tid])
+        labels = np.concatenate(labels_by_outcome[tid])
+        if labels.sum() == 0:
+            continue  # outcome not present in val set — skip
+        try:
+            aurocs.append(roc_auc_score(labels, scores))
+        except ValueError:
+            pass
 
-    return total_loss / max(total_batches, 1)
+    outcome_auroc = float(np.mean(aurocs)) if aurocs else 0.0
+    val_bce       = bce_loss_sum / max(bce_batches, 1)
+    return outcome_auroc, val_bce
+
+
+# ---------------------------------------------------------------------------
+# Legacy alias — kept so old code that imports evaluate_val_bce still runs
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def evaluate_val_bce(model, val_dl, device="cuda"):
+    """Backward-compatible wrapper. Prefer evaluate_val_metrics."""
+    _, val_bce = evaluate_val_metrics(model, val_dl, device=device)
+    return val_bce

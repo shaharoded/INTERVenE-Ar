@@ -24,8 +24,26 @@ from transform_emr.schedulers import LambdaScheduleController
 
 
 # ───────── components ─────────────────────────────────────────────────────────── #
+def _apply_temporal_rope(x, abs_ts, t_scale=24.0):
+    """Apply RoPE using real timestamps instead of position indices.
+    x: [B, n_head, T, hd], abs_ts: [B, T] (hours, already normalized).
+    Pairs adjacent dims and rotates by abs_ts / t_scale^(2i/d).
+    """
+    B, H, T, hd = x.shape
+    half = hd // 2
+    # Frequency bands: 1 / t_scale^(2i/d) for i in [0, half)
+    freq = 1.0 / (t_scale ** (torch.arange(half, device=x.device, dtype=x.dtype) / half))
+    # theta[b, t, i] = abs_ts[b, t] * freq[i]
+    theta = abs_ts.unsqueeze(-1).to(x.dtype) * freq  # [B, T, half]
+    theta = theta.unsqueeze(1)  # [B, 1, T, half] — broadcast over heads
+    cos_t = torch.cos(theta)
+    sin_t = torch.sin(theta)
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([x1 * cos_t - x2 * sin_t, x2 * cos_t + x1 * sin_t], dim=-1)
+
+
 class CausalSelfAttention(nn.Module):
-    """Multi-head causal self-attention (no rotary/ALiBi; same math as GPT-2)."""
+    """Multi-head causal self-attention with temporal RoPE."""
 
     def __init__(self, cfg):
         super().__init__()
@@ -37,8 +55,8 @@ class CausalSelfAttention(nn.Module):
         self.proj  = nn.Linear(cfg["embed_dim"], cfg["embed_dim"],    bias=cfg["bias"])
         self.attn_dropout  = nn.Dropout(cfg["dropout"])
         self.resid_dropout = nn.Dropout(cfg["dropout"])
-    
-    def forward(self, x, key_pad_mask=None):
+
+    def forward(self, x, key_pad_mask=None, abs_ts=None):
             B, T, C = x.shape
             qkv = self.qkv(x)                      # [B, T, 3C]
             q, k, v = qkv.split(C, dim=-1)         # each [B, T, C]
@@ -48,6 +66,11 @@ class CausalSelfAttention(nn.Module):
             q = q.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
             k = k.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
             v = v.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
+
+            # Apply temporal RoPE to Q and K (no extra memory, no T×T matrix)
+            if abs_ts is not None:
+                q = _apply_temporal_rope(q, abs_ts)
+                k = _apply_temporal_rope(k, abs_ts)
 
             if key_pad_mask is not None:
                 # --- Manual Masking Path (Required when padding is present) ---
@@ -70,7 +93,7 @@ class CausalSelfAttention(nn.Module):
                 # 4. Convert to float mask for SDPA (-inf for mask, 0.0 for keep)
                 # Using zeros_like ensures we match dtype (e.g. float16/bfloat16)
                 attn_mask = torch.zeros_like(combined_mask, dtype=q.dtype).masked_fill(combined_mask, float("-inf"))
-                
+
                 attn = F.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask=attn_mask,
@@ -159,7 +182,7 @@ class AdaLNBlock(nn.Module):
             nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, cond_emb, key_pad_mask=None):
+    def forward(self, x, cond_emb, key_pad_mask=None, abs_ts=None):
         """
         Calculate modulation parameters [B, 6*D] -> 6 x [B, D] (broadcast over T)
         x: [B, T, D]
@@ -172,7 +195,7 @@ class AdaLNBlock(nn.Module):
         # -- Attention Sub-block --
         # modulate(ln(x))
         norm_x = self.ln1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        x = x + gate_msa.unsqueeze(1) * self.att(norm_x, key_pad_mask=key_pad_mask)
+        x = x + gate_msa.unsqueeze(1) * self.att(norm_x, key_pad_mask=key_pad_mask, abs_ts=abs_ts)
 
         # -- MLP Sub-block --
         norm_x = self.ln2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
@@ -261,13 +284,20 @@ class GPT(nn.Module):
             # Note: No Sigmoid here if using BCEWithLogitsLoss later
         )
 
-        # Δt prediction head (for regression of Δt from admission at each step -> When will each event occur?)
-        # --- TIME HEAD (monotone-by-design, allows Δt=0) ---
-        self.abs_t_head = nn.Sequential(
+        # Δt prediction: two-head gate + magnitude design
+        # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
+        # Head 2 (magnitude): regression of Δt magnitude for non-zero cases only
+        self.dt_gate = nn.Sequential(
             nn.Linear(cfg["embed_dim"], cfg["time2vec_dim"]),
             nn.ReLU(),
-            nn.Linear(cfg["time2vec_dim"], 1)  
-            # Output: scalar abs_t, raw per-step delta logits
+            nn.Linear(cfg["time2vec_dim"], 1)
+            # Output: logit for P(Δt > 0)
+        )
+        self.dt_magnitude = nn.Sequential(
+            nn.Linear(cfg["embed_dim"], cfg["time2vec_dim"]),
+            nn.ReLU(),
+            nn.Linear(cfg["time2vec_dim"], 1)
+            # Output: raw magnitude (softplus applied later)
         )
 
         self.apply(self._init_weights)
@@ -399,12 +429,12 @@ class GPT(nn.Module):
         for blk in self.blocks:
             if self.training and self.use_checkpoint:
                 x = checkpoint.checkpoint(
-                    lambda x, c, m: blk(x, c, key_pad_mask=m), 
-                    x, cond_emb, pad_mask, 
+                    lambda x, c, m, t: blk(x, c, key_pad_mask=m, abs_ts=t),
+                    x, cond_emb, pad_mask, abs_ts,
                     use_reentrant=False
                 )
             else:
-                x = blk(x, cond_emb, key_pad_mask=pad_mask)
+                x = blk(x, cond_emb, key_pad_mask=pad_mask, abs_ts=abs_ts)
         
         x = self.ln_f(x)                     # [B, T, D]
         
@@ -416,19 +446,19 @@ class GPT(nn.Module):
         # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
         outcome_logits = self.outcome_head(x)
 
-        # 5. Absolute time prediction (monotonic)
-        # We predict the time delta to the *next* event based on the current state.
-        # x[t] contains info up to t. We predict time for t+1.
-        delta_raw = self.abs_t_head(x).squeeze(-1)     # [B,T]
-        
-        # Enforce non-negative deltas
-        delta_pos = F.softplus(delta_raw)
-        
-        # Autoregressive time prediction:
-        # Predicted_Time[t+1] = Actual_Time[t] + Predicted_Delta
+        # 5. Absolute time prediction (two-head: gate + magnitude)
+        gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
+        mag_raw = self.dt_magnitude(x).squeeze(-1)     # [B,T]
+        mag_pos = F.softplus(mag_raw)                  # non-negative magnitude
+
+        # Expected Δt = sigmoid(gate) * magnitude
+        gate_prob = torch.sigmoid(gate_logit)
+        delta_pos = gate_prob * mag_pos
+
+        # Autoregressive time prediction
         abs_t_pred = abs_ts + delta_pos                # [B, T]
 
-        return logits, abs_t_pred, outcome_logits
+        return logits, abs_t_pred, outcome_logits, gate_logit
     
 
     def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None, lambda_schedule_state=None):
@@ -438,6 +468,7 @@ class GPT(nn.Module):
             "vocab_size": self.embedder.decoder.out_features,
             "outcome_names": self.outcome_names,
             "num_outcomes": self.num_outcomes,
+            "lambda_schedule_state": lambda_schedule_state,
         }
         if epoch is not None:
             ckpt["epoch"] = epoch
@@ -447,8 +478,6 @@ class GPT(nn.Module):
             ckpt["optim_state"] = optimizer.state_dict()
         if scheduler is not None:
             ckpt["scheduler_state"] = scheduler.state_dict()
-        if lambda_schedule_state is not None:
-            ckpt["lambda_schedule_state"] = lambda_schedule_state
         torch.save(ckpt, path)
 
     
@@ -560,7 +589,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
 
     # Training Dynamics
-    warmup_epochs = training_settings["warmup_epochs"]
     cbm_ramp_epochs = training_settings["cbm_ramp_epochs"]
 
     # Get outcomes weights (from Tokenizer) for pos_weight in BCE loss
@@ -618,11 +646,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         schedule_controller.load_state_dict(lambda_schedule_state)
 
     train_losses, val_losses = [], []
-    pr_tracker = OutcomePRTracker(
-        tokenizer=model.embedder.tokenizer,
-        thresholds=(0.05, 0.10, 0.20, 0.30, 0.50),
-        device=device
-    ) # For epoch evaluation
 
     def run_epoch(loader, epoch, train_flag=False):
         if train_flag:
@@ -630,8 +653,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_penalty = total_outcome = total_dt = 0.0
-        total_ce_raw = total_penalty_raw = total_outcome_raw = total_dt_raw = 0.0
+        total_loss = total_bce = total_ce = total_outcome = total_dt = 0.0
+        total_ce_raw = total_outcome_raw = total_dt_raw = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -650,7 +673,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                       p=p)
 
                 # === Original logits from Model ===
-                logits, abs_t_pred, outcome_logits = model(
+                logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
                     parent_raw_ids=batch["parent_raw_ids"],
                     concept_ids=batch["concept_ids"],
                     value_ids=batch["value_ids"],
@@ -662,12 +685,13 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # logits is [B, T, V]
                 # abs_t_pred: [B, T]
                 # outcome_logits: [B, T, K]
+                # dt_gate_logit: [B, T] — logit for P(Δt > 0)
 
                 # Slice for Autoregressive Training (Predict Next Token)
                 # Input at t predicts Target at t+1.
                 # We drop the LAST input (nothing to predict after it) and the FIRST target (nothing predicts it)
 
-                # Slicing Logits (Inputs 0 to T-2)
+                # Slicing Logits (logits 0 to T-2)
                 pred_logits = logits[:, :-1, :]       # [B, T-1, V]
 
                 # Slicing Targets (Targets 1 to T-1)
@@ -676,33 +700,27 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 
                 # === legality masks from Ground Truth + Targets ===
                 # Compute on FULL targets to preserve state history (t=0)
-                full_illegal, full_bonus = compute_legality_masks_tf(
-                                                full_targets,
-                                                luts["is_start"],
-                                                luts["is_end"],
-                                                luts["base_id"],
-                                                luts["start_ids_per_base"],
-                                                luts["end_ids_per_base"],
-                                                luts["meal_rank"],
-                                                luts["meal_pred_rank"],
-                                                luts["K_meals"],
-                                                luts["conflict_mat"],
-                                                luts["predict_block"]
-                                            )
-                
-                # Slice the masks to align with target_ids (drop t=0)
-                illegal_mask = full_illegal[:, 1:, :] 
-                bonus_mask   = full_bonus[:, 1:, :]
+                full_illegal = compute_legality_masks_tf(
+                                      full_targets,
+                                      luts["is_start"],
+                                      luts["is_end"],
+                                      luts["base_id"],
+                                      luts["start_ids_per_base"],
+                                      luts["end_ids_per_base"],
+                                      luts["meal_rank"],
+                                      luts["meal_pred_rank"],
+                                      luts["K_meals"],
+                                      luts["conflict_mat"],
+                                      luts["predict_block"]
+                                  )
 
-                # Soft illegal-mass penalty (pre-mask)
-                # Penalize putting ANY mass on illegal tokens (using UNMASKED logits)
-                nonpad = (target_ids != model.embedder.padding_idx)                # [B,T]
-                logits_pre_mask = pred_logits
+                # Slice to align with target_ids (predict t+1 from position t)
+                illegal_mask = full_illegal[:, 1:, :]
 
-                # Apply masks BEFORE BCE so gradients learn legality only
-                pred_logits = apply_masks_to_logits(
-                    pred_logits.clone(), illegal_mask, bonus_mask
-                )
+                nonpad = (target_ids != model.embedder.padding_idx)      # [B, T-1]
+
+                # Suppress illegal tokens so BCE/CE never learns from them
+                pred_logits = apply_masks_to_logits(pred_logits, illegal_mask)
 
                 # Outcome Head Slicing
                 # Input at t predicts future relative to t.
@@ -715,72 +733,77 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 pred_abs = abs_t_pred[:, :-1]     # [B, T-1]
                 true_abs = batch["abs_ts"][:, 1:] # [B, T-1] (Shifted true times)
 
-                # === Loss: BCE with logits (next token generation task) ===
-                # Multi-hot targets
-                multi_hot = get_multi_hot_targets(
-                    position_ids=target_ids,
-                    padding_idx=model.embedder.padding_idx,
-                    vocab_size=pred_logits.size(-1),
-                    k=training_settings["bce_k_window"]
-                ).masked_fill(illegal_mask, 0.0) # zero‑out illegal targets, no in-place torch operation  
-                
+                # === Loss: BCE with logits — temporal targets ===
+                # For each position t, mark all tokens within the next phase2_bce_window_hours as positives.
+                # abs_ts = hours / 336.
+                _ABS_TS_SCALE = 336.0
+                _BCE_WIN = training_settings.get("phase2_bce_window_hours", 12.0) / _ABS_TS_SCALE
+                with torch.no_grad():
+                    cur_ts  = batch["abs_ts"][:, :-1]   # [B, T-1]
+                    all_ts  = batch["abs_ts"]            # [B, T]
+                    dt_bce  = all_ts.unsqueeze(1) - cur_ts.unsqueeze(2)  # [B, T-1, T]
+                    in_win  = (dt_bce > 0) & (dt_bce <= _BCE_WIN)
+                    B_s, T_in, T_all = in_win.shape
+                    V = pred_logits.size(-1)
+                    pad_idx = model.embedder.padding_idx
+                    tgt_win = full_targets.unsqueeze(1).expand(B_s, T_in, T_all).masked_fill(~in_win, pad_idx)
+                    multi_hot = torch.zeros(B_s, T_in, V, device=device)
+                    multi_hot.scatter_(2, tgt_win, 1.0)
+                    multi_hot[..., pad_idx] = 0.0
+                    del dt_bce, in_win, tgt_win
+                multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
+
                 # mask out illegal classes AND PAD steps from the denominator
                 valid_pos = nonpad.unsqueeze(-1)            # [B,T,1] bool
-                allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool           
+                allowed   = (~illegal_mask) & valid_pos     # [B,T,V] bool
 
-                # Calculate BCE loss (only valid positions) 
+                # Calculate BCE loss (only valid positions)
                 loss_bce, _ = BCEcriterion(pred_logits, multi_hot, allowed)
                 
                 # === Loss: CE nudge (next token generation task) ===
-                # Foundational task to complement BCE, start at epoch 0, no schedule
+                # Foundational task to complement BCE, controlled by schedule
                 loss_ce_raw, _ = CEcriterion(pred_logits, multi_hot, allowed)
                 lambdas = schedule_controller.get_lambdas(epoch)
                 loss_ce = loss_ce_raw * lambdas["ce"]
 
-                # === Loss: Δt (time) ===
-                # Foundational task, start at epoch 0, no schedule
-                # Predict abs_ts using model abs_t_head (already returned as abs_t_pred, shape [B,T-1])
-                abs_t_loss_raw = F.mse_loss(pred_abs[nonpad], true_abs[nonpad], reduction="mean")
+                # === Loss: Δt (time) — two-head: gate + magnitude ===
+                # Gate: binary classification P(Δt > 0)
+                true_dt = true_abs - batch["abs_ts"][:, :-1]  # [B, T-1]
+                gate_pred = dt_gate_logit[:, :-1]              # [B, T-1]
+                dt_nonzero = (true_dt > 1e-8)                  # bool mask for non-simultaneous
+                gate_target = dt_nonzero.float()
+
+                gate_loss = F.binary_cross_entropy_with_logits(
+                    gate_pred[nonpad], gate_target[nonpad], reduction="mean"
+                )
+
+                # Magnitude: MSE on non-zero Δt only
+                nonzero_mask = nonpad & dt_nonzero
+                if nonzero_mask.any():
+                    mag_loss = F.mse_loss(pred_abs[nonzero_mask], true_abs[nonzero_mask], reduction="mean")
+                else:
+                    mag_loss = torch.tensor(0.0, device=pred_abs.device)
+
+                abs_t_loss_raw = gate_loss + mag_loss
                 abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
-                # === Loss: Structural penalties on output ===
-                # Mid-foundational task, starts halfway through foundational phase
-                
-                # 1. Soft illegal-mass penalty (pre-mask)
-                # Penalize putting ANY mass on illegal tokens (using UNMASKED logits)
-                p_illegal = soft_illegal_mass_penalty(
-                    logits_pre_mask=logits_pre_mask,
-                    illegal_mask=illegal_mask,
-                    nonpad_mask=nonpad,
-                    margin=0.04,
-                    power=1.0
-                )
-                # 2. Global Closure Violations
-                # Penalize leaving intervals open at the end (using MASKED logits)
-                # This teaches "If you started it, you must finish it"
-                # Load and normalize each penalty (∈ [0, 1]) -> Active grad on penalty functions
-                p_unclosed = soft_unclosed_interval_penalty(
-                                    pred_logits,             # Masked logits
-                                    allowed,
-                                    luts["start_ids_per_base"],
-                                    luts["end_ids_per_base"]
-                                )
-
-                # Average the penalties to bound in [0, 1]
-                # A little more agressive on teaching against illegal steps, heuristic.
-                generative_penalty_raw = (2 * p_illegal + p_unclosed) / 3.0
-                generative_penalty = lambdas["penalty"] * generative_penalty_raw
-
-                # === Outcome Loss Calculation === 
-                # Post-foundational task, starts after foundational phase               
-                # Targets: "Does outcome K happen in future relative to t?"
-                all_outcome_targets = get_future_outcome_targets(
-                    full_targets,         # [B, T]
-                    outcome_token_ids     # [K]
-                )
-                
-                # Slice to align with inputs 0..T-2 (dropping the last step T-1)
-                outcome_targets = all_outcome_targets[:, :-1, :] # [B, T-1, K]
+                # === Outcome Loss — Time-Decayed Soft Labels ===
+                # For each position t, the target for outcome k is a soft risk score:
+                # sum_s { exp(-dt(t,s) / tau) * 1[token_s == outcome_k] }.clamp(0, 1)
+                # Maximum gradient right before an outcome; decays to zero for distant/absent
+                # outcomes. No hard window boundaries — decay handles separation naturally.
+                _ABS_TS_SCALE = 336.0
+                _TAU     = training_settings.get("outcome_decay_tau_hours", 12.0) / _ABS_TS_SCALE
+                _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
+                with torch.no_grad():
+                    cur_ts = batch["abs_ts"][:, :-1]  # [B, T-1]
+                    dt = batch["abs_ts"].unsqueeze(1) - cur_ts.unsqueeze(2)  # [B, T-1, T]
+                    in_horizon = (dt > 0) & (dt <= _HORIZON)
+                    decay_weights = torch.exp(-dt / _TAU).masked_fill(~in_horizon, 0.0)  # [B, T-1, T]
+                    out_ids_t = torch.tensor(outcome_token_ids, device=device, dtype=torch.long)
+                    matches = (full_targets.unsqueeze(-1) == out_ids_t.view(1, 1, -1)).float()  # [B, T, K]
+                    # [B, T-1, T] x [B, T, K] -> [B, T-1, K]
+                    outcome_targets = torch.bmm(decay_weights, matches).clamp(0.0, 1.0)  # soft [0,1]
                 
                 # Only learn from valid (non-pad) time steps.
                 loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T-1, K]
@@ -788,7 +811,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 loss_outcome = lambdas["outcome"] * loss_outcome_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + generative_penalty + loss_outcome + abs_t_loss
+                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss
 
                 # === Backprop and Log ===
                 if train_flag:
@@ -797,61 +820,39 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     scheduler.step()
-                else:
-                    # Update validation classification metric
-                    pr_tracker.update(pred_logits, allowed, target_ids, nonpad)
-
                 # Update loss
-                total_loss += loss.item()
-                total_bce += loss_bce.item()
-                total_ce += loss_ce.item()
-                total_penalty += generative_penalty.item()
+                total_loss    += loss.item()
+                total_bce     += loss_bce.item()
+                total_ce      += loss_ce.item()
                 total_outcome += loss_outcome.item()
-                total_dt += abs_t_loss.item()
-                total_ce_raw += loss_ce_raw.item()
-                total_penalty_raw += generative_penalty_raw.item()
+                total_dt      += abs_t_loss.item()
+                total_ce_raw      += loss_ce_raw.item()
                 total_outcome_raw += loss_outcome_raw.item()
-                total_dt_raw += abs_t_loss_raw.item()
+                total_dt_raw      += abs_t_loss_raw.item()
         
-        if train_flag:
-            val_eval = None
-        else:
-            val_eval = pr_tracker.compute()   # dict with per-class max-F1 and P/R at that point
-            pr_tracker.reset()
-
         n_batches = len(loader)
 
         return (
-            total_loss / n_batches,
-            total_bce / n_batches,
-            total_ce / n_batches,
-            total_penalty / n_batches,
+            total_loss    / n_batches,
+            total_bce     / n_batches,
+            total_ce      / n_batches,
             total_outcome / n_batches,
-            total_dt / n_batches,
-            total_ce_raw / n_batches,
-            total_penalty_raw / n_batches,
+            total_dt      / n_batches,
+            total_ce_raw      / n_batches,
             total_outcome_raw / n_batches,
-            total_dt_raw / n_batches,
-            val_eval
+            total_dt_raw      / n_batches,
         )
-    
-    for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_pen, tr_outcome, tr_dt, tr_ce_raw, tr_pen_raw, tr_outcome_raw, tr_dt_raw, _ = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_pen, vl_outcome, vl_dt, _, _, _, _, val_eval = run_epoch(val_dl, epoch=epoch, train_flag=False)
 
-        # convenience values for printing
-        rel_f1 = val_eval["per_class_maxF1"].get("RELEASE", 0.0)
-        dth_f1 = val_eval["per_class_maxF1"].get("DEATH", 0.0)
-        cmp_names = [n for n in val_eval["per_class_maxF1"] if n not in ("RELEASE", "DEATH")]
-        cmp_f1 = (sum(val_eval["per_class_maxF1"][n] for n in cmp_names) / max(len(cmp_names), 1)) if cmp_names else 0.0
+    for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
+        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_ce_raw, tr_outcome_raw, tr_dt_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Pen={tr_pen:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Pen={vl_pen:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f})
-        --> Val-F1  RELEASE:{rel_f1:.4f}  DEATH:{dth_f1:.4f}  COMPLICATION:{cmp_f1:.4f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f})""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -859,7 +860,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
             tr_main=tr_bce,
             ce=tr_ce_raw,
             dt=tr_dt_raw,
-            penalty=tr_pen_raw,
             outcome=tr_outcome_raw,
         )
         for msg in schedule_events:
