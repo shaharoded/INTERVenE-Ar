@@ -24,44 +24,23 @@ The training data is derived from MIMIC-III and contains diabetes patients' long
 | `emr_model/data/source/` | Training data (fixed). |
 | `results.tsv` | Experiment log (untracked by git). |
 
-## Quick start
-
-**Requirements:** Python 3.10+, a CUDA GPU (recommended), [uv](https://docs.astral.sh/uv/).
-
-```bash
-# 1. Install dependencies
-uv sync
-
-# 2. Run a single training experiment (both phases)
-python train.py
-```
-
-The first run builds and caches the tokenizer, which takes a few minutes.
-Subsequent runs skip this step.
-
-## Running the agent
-
-Start a Claude Code session in this directory and point it at `program.md`:
-
-```
-Hi, have a look at program.md and let's kick off autoresearch — let's do the setup first.
-```
-
-The agent will create a branch, run the baseline, and iterate autonomously.
-
 ## Metric
 
-`val_ce_loss` — cross-entropy loss on next-event prediction (validation set, padding excluded).
-Lower is better. Defined in `prepare.py::evaluate_val_ce` — never modified.
+**Primary — `outcome_f1` (higher is better)**
+Time-tolerant F1 for clinical outcome prediction. At each position, the model is considered to have "predicted an outcome" if any outcome token (complication, e.g. `KIDNEY_COMPLICATION_EVENT`) appears in its top-15 predictions. A prediction matches a true outcome if they fall within ±48 hours of each other in the patient timeline. Precision and recall are computed from this matching, then combined into F1. This penalises both missed complications (low recall) and false alarms during quiet periods (low precision).
 
-The metric intentionally uses plain CE (not the multi-hot BCE from training) so that changing auxiliary loss weights or k-window size does not affect the comparison. Only actual model quality does.
+**Secondary — `val_bce_loss` (lower is better)**
+Mean BCE over all token positions (multi-hot, fixed k=5 look-ahead window). Used as a sanity signal to detect model collapse; not the autoresearch keep/discard criterion.
+
+Both are computed in `prepare.py::evaluate_val_metrics` — never modified by the agent.
 
 ## Design choices
 
-- **Two-file split.** `prepare.py` is fixed ground truth; `train.py` is fully editable. Clear boundary between what changes and what doesn't.
-- **Fresh start per experiment.** Phase checkpoints are cleared before each run so experiments are independent. The tokenizer is cached across runs (it doesn't depend on hyperparameters).
-- **Epoch budget with early stopping.** Training terminates when validation stops improving (patience = 10 epochs), bounded by a maximum epoch count. This is fair across model sizes.
-- **Single GPU, single file.** No distributed training, no complex configs.
+- **Two-file split.** `prepare.py` is fixed ground truth; `train.py` is fully editable.
+- **Embedder caching.** Phase-1 is skipped automatically when `embed_dim`, `time2vec_dim`, and `ctx_dim` are unchanged — saving ~30 min per experiment.
+- **Fresh Phase-2 per experiment.** Phase-2 checkpoints are cleared before each run so experiments are independent.
+- **Epoch budget with early stopping.** Training terminates when validation stops improving (patience = 10 epochs), bounded by a maximum epoch count.
+- **Data sampling.** `TRAINING_SETTINGS["sample"]` controls how many patients to use. Set to `None` for full training runs.
 
 ## Project structure
 
@@ -82,7 +61,132 @@ emr_model/
     utils.py            utilities
   data/
     source/
-      temporal_events.csv    patient event sequences (~130 MB)
+      temporal_data.csv      patient event sequences
       context_data.csv       patient context features
   checkpoints/          saved model weights (gitignored)
 ```
+
+---
+
+## RunPod: SSH setup
+
+The agent runs on a RunPod GPU pod (A40, 48 GB VRAM).
+
+### First-time SSH key setup (local, run once)
+
+```powershell
+ssh-keygen -t ed25519 -C "runpod" -f "$env:USERPROFILE\.ssh\runpod_ed25519"
+```
+
+Copy the public key to your clipboard:
+```powershell
+Get-Content "$env:USERPROFILE\.ssh\runpod_ed25519.pub" | clip
+```
+
+Paste it into **RunPod → Settings → SSH Public Keys**.
+
+### Add the pod to your SSH config (local)
+
+Edit `~/.ssh/config` (create if it doesn't exist) and add:
+
+```
+Host runpod
+    HostName 194.68.245.49
+    Port     22036
+    User     root
+    IdentityFile ~/.ssh/runpod_ed25519
+```
+
+Replace the `HostName` and `Port` each time you start a new pod (RunPod shows these on the pod's Connect page under "SSH over exposed TCP").
+
+### Connect from VSCode
+
+1. Install the **Remote - SSH** extension.
+2. Press `Ctrl+Shift+P` → `Remote-SSH: Connect to Host` → select `runpod`.
+3. Once connected: **File → Open Folder** → `/workspace/autoresearch`.
+4. Open a terminal and run `claude` to start the agent.
+
+### Connect from PowerShell
+
+```powershell
+ssh runpod
+```
+
+Or without the config entry:
+```powershell
+ssh -i "$env:USERPROFILE\.ssh\runpod_ed25519" -p 22036 root@194.68.245.49
+```
+
+---
+
+## RunPod: pod lifecycle
+
+### Starting a session
+
+1. Go to [runpod.io](https://runpod.io) → **My Pods** → start the pod (or create a new one).
+2. Wait for status to show **Running**.
+3. Click **Connect** → copy the "SSH over exposed TCP" address.
+4. Update `~/.ssh/config` with the new `HostName` and `Port` if they changed.
+5. SSH in and resume work.
+
+### Before stopping the pod (save your work)
+
+The pod's **container disk** is ephemeral — it is wiped when the pod is stopped or deleted. Always save before stopping.
+
+**What needs saving** (copy to your local machine or a RunPod network volume):
+
+| What | Why |
+|------|-----|
+| `results.tsv` | The full experiment log — not in git |
+| `emr_model/checkpoints/tokenizer.pt` | Tokenizer cache — slow to rebuild |
+| `emr_model/checkpoints/phase1/ckpt_best.pt` | Cached embedder — saves ~30 min per experiment |
+| `run.log` | Last run output (optional) |
+
+**Copy everything to local with SCP** (run from PowerShell locally):
+
+```powershell
+# Create a local backup folder
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\runpod_backup"
+
+# Copy the files
+scp -P 22036 root@194.68.245.49:/workspace/autoresearch/results.tsv "$env:USERPROFILE\runpod_backup\"
+scp -P 22036 root@194.68.245.49:/workspace/autoresearch/emr_model/checkpoints/tokenizer.pt "$env:USERPROFILE\runpod_backup\"
+scp -r -P 22036 root@194.68.245.49:/workspace/autoresearch/emr_model/checkpoints/phase1 "$env:USERPROFILE\runpod_backup\"
+```
+
+Or use a RunPod **Network Volume** (persistent across pod restarts) and mount it at `/workspace`.
+
+### Restoring to a new pod
+
+```powershell
+# Push saved files back to the new pod
+scp -P <NEW_PORT> "$env:USERPROFILE\runpod_backup\results.tsv" root@<NEW_HOST>:/workspace/autoresearch/
+scp -P <NEW_PORT> "$env:USERPROFILE\runpod_backup\tokenizer.pt" root@<NEW_HOST>:/workspace/autoresearch/emr_model/checkpoints/
+scp -r -P <NEW_PORT> "$env:USERPROFILE\runpod_backup\phase1" root@<NEW_HOST>:/workspace/autoresearch/emr_model/checkpoints/
+```
+
+Then reinstall dependencies (if not using a network volume):
+
+```bash
+pip install scikit-learn tqdm openpyxl joblib matplotlib pandas pyarrow
+```
+
+### Stopping the pod
+
+Once files are saved: **RunPod → My Pods → Stop**. This pauses billing. The pod can be restarted later.
+
+To permanently delete: **Terminate** (irreversible — all container data is lost).
+
+---
+
+## Running the agent
+
+Start a Claude Code session in this directory and say:
+
+```
+Read program.md and all files listed in the Setup section.
+The baseline is already logged in results.tsv.
+Begin the experiment loop now.
+```
+
+The agent will iterate autonomously, logging every result to `results.tsv`.
