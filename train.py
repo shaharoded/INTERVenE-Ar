@@ -62,7 +62,7 @@ TRAINING_SETTINGS = {
     "cbm_ramp_epochs":  5,
 
     # Warm-up: do not save "best" until this many epochs have passed
-    "warmup_epochs": 5,
+    "lr_warmup_epochs": 5,
 
     # Early stopping patience (epochs without improvement)
     "early-stop-patience": 10,

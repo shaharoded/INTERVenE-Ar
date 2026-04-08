@@ -19,20 +19,19 @@ MODEL_CONFIG = {
     }
 
 TRAINING_SETTINGS = {
-    "phase1_n_epochs": 30,
-    "phase2_n_epochs": 50,
-    # Controls how fast CBM (curriculum batch masking) ramps up its masking
-    # probability during phase-2 training. Independent of the aux-loss schedule.
-    "cbm_ramp_epochs": 5,
-    "warmup_epochs": 5,
-    "early-stop-patience": 10,
+    "phase1_n_epochs": 100,
+    "phase2_n_epochs": 100,
+
+    # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
+    # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
+    "lr_warmup_epochs": 5,
+    "early-stop-patience": 5,
 
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 5e-4,
     "weight_decay": 1e-3,
 
     "batch_size": 64, # Number of patients processed concurrently
-    "sample": 2000,
     "phase1_bce_window_hours": 3.0,
     "phase2_bce_window_hours": 12.0,
 
@@ -40,6 +39,7 @@ TRAINING_SETTINGS = {
     # Single stage: mlm and dt activate after bce_only_epochs of pure BCE training.
     # Lambda max is calibrated ONCE from training losses at the first active epoch,
     # then kept fixed. Weighted contribution is capped to `fraction` of training BCE.
+    # Increase fractions if loss doesn't change during training (e.g. if MLM loss is very small, increase its fraction to give it more weight).
     "phase1_scheduler": {
         "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
         "aux_fraction_caps": {
@@ -61,11 +61,14 @@ TRAINING_SETTINGS = {
     # once the current stage's ramp has completed.
     # Warmup ends after the outcome ramp completes (dynamic, set by scheduler).
     "phase2_scheduler": {
-        "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
+        # Run BCE alone first so auxiliary lambda calibration uses a trained BCE baseline.
+        # This value is also used to align early curricula (CBM ramp from epoch 0 and LR warmup).
+        # You can decouple these by setting a separate `warmup_epochs` for LR in the scheduler and keeping this as the BCE-only period for curriculum and lambda warmup.
+        "bce_only_epochs": 5,
         "aux_fraction_caps": {
-            "ce":      2.00,  # Next-token CE nudge cap
-            "dt":      0.20,  # Time regression cap
-            "outcome": 10.00,  # Future-outcome auxiliary cap
+            "ce":      2.00,    # Next-token CE nudge cap
+            "dt":      0.20,    # Time regression cap
+            "outcome": 10.00,   # Future-outcome auxiliary cap
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {

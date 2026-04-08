@@ -16,87 +16,143 @@ from transform_emr.config.dataset_config import (
 from transform_emr.schedulers import linear_schedule
 
 
-
-def get_multi_hot_targets(position_ids: torch.Tensor,
-                          padding_idx: int,
-                          vocab_size: int,
-                          k: int) -> torch.Tensor:
+@torch.no_grad()
+def get_temporal_multi_hot_targets(
+    target_ids: torch.Tensor,
+    all_abs_ts: torch.Tensor,
+    padding_idx: int,
+    vocab_size: int,
+    window_size: float,
+    query_abs_ts: torch.Tensor | None = None,
+) -> torch.Tensor:
     """
-    For each timestep t, mark all tokens that appear in positions [t+1, t+k]
-    with a multi-hot vector (0/1) over the vocabulary.
+    Build temporal multi-hot targets over a future time window using GPU-efficient
+    searchsorted + prefix-sum approach.
 
-    Parameters
-    ----------
-    position_ids : LongTensor, shape [B, T]
-        Token ids, right-padded with `padding_idx`.
-    padding_idx  : int
-        The pad token id. It will be excluded from the targets.
-    vocab_size   : int
-        Size of the vocabulary.
-    k            : int
-        Lookahead window size.
+    For each query step t, marks token ids that appear at any future step s such that:
+        0 < (all_abs_ts[s] - query_abs_ts[t]) <= window_size
 
-    Returns
-    -------
-    targets : FloatTensor, shape [B, T, V]
-        Multi-hot matrix. targets[b, t, v] == 1 if token v appears in
-        any of the next k positions after t (inclusive of t+1, exclusive of t).
+    IMPORTANT: This function assumes all_abs_ts is NON-DECREASING (sorted) per batch.
+    The dataset MUST maintain this ordering. See dataset.py for sorting guarantees.
+
+    Args:
+        target_ids: [B, T_all] token ids whose occurrences will be marked as positives.
+        all_abs_ts: [B, T_all] absolute timestamps, MUST be non-decreasing per batch.
+        padding_idx: Token id used for PAD. PAD is excluded from targets.
+        vocab_size: Vocabulary size V for output shape.
+        window_size: Future window size (same normalized units as ``all_abs_ts``).
+        query_abs_ts: [B, T_q] optional query timestamps. If omitted, uses ``all_abs_ts``.
+
+    Returns:
+        FloatTensor [B, T_q, V] with 0/1 multi-hot labels.
     """
-    B, T = position_ids.shape
-    device = position_ids.device
+    if query_abs_ts is None:
+        query_abs_ts = all_abs_ts
 
-    # One‐hot: [B, T, V]
-    oh = F.one_hot(position_ids.clamp(min=0), num_classes=vocab_size).to(torch.float32)
-    csum = oh.cumsum(dim=1)  # [B, T, V]
+    B, T_all = target_ids.shape
+    T_q = query_abs_ts.size(1)
 
-    # Build csum_k by shifting left k, then for tail positions repeat the last csum row
-    # 1) core = csum[:, k:] gives shape [B, T–k, V]
-    core   = csum[:, k:]                # sums through position k..T–1
-    # 2) tail = last csum vector repeated k times
-    last   = csum[:, -1:]               # shape [B, 1, V]
-    tail   = last.repeat(1, k, 1)       # shape [B, k, V]
-    # 3) concat back to length T
-    csum_k = torch.cat([core, tail], dim=1)  # [B, T, V]
+    # GPU-friendly searchsorted + prefix-sum approach (O(B * T * log T) instead of O(B * T^2)).
+    # Assumes timestamps are sorted; violation will produce incorrect results silently.
+    left_idx = torch.searchsorted(all_abs_ts, query_abs_ts, right=True)
+    right_idx = torch.searchsorted(all_abs_ts, query_abs_ts + window_size, right=True)
 
-    # future counts in (t+1 .. t+k] = csum_k – csum
-    future = (csum_k - csum).clamp_min(0.0)  # [B, T, V]
+    oh = F.one_hot(target_ids.clamp(min=0), num_classes=vocab_size).to(torch.float32)  # [B, T_all, V]
+    csum = oh.cumsum(dim=1)
 
-    # never supervise PAD
+    # Prefix a zero row so window sum is prefix[right] - prefix[left].
+    prefix = torch.cat(
+        [torch.zeros(B, 1, vocab_size, device=target_ids.device, dtype=csum.dtype), csum],
+        dim=1,
+    )  # [B, T_all+1, V]
+
+    left = left_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
+    right = right_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
+
+    future_counts = prefix.gather(1, right) - prefix.gather(1, left)
+    multi_hot = (future_counts > 0).to(torch.float32)
+
     if 0 <= padding_idx < vocab_size:
-        future[..., padding_idx] = 0.0
+        multi_hot[..., padding_idx] = 0.0
 
-    return (future > 0).to(torch.float32)
+    return multi_hot
 
+
+@torch.no_grad()
 def get_future_outcome_targets(
-    position_ids: torch.Tensor,   # [B, T]
-    outcome_ids: list[int],       # [K] list of outcome token IDs
-) -> torch.Tensor:                # [B, T, K] Float (0.0 or 1.0)
+    target_ids: torch.Tensor,      # [B, T] token ids
+    outcome_ids: list[int],        # [K] list of outcome token IDs
+    all_abs_ts: torch.Tensor | None = None,  # [B, T] absolute timestamps
+    query_abs_ts: torch.Tensor | None = None, # [B, T_q] query timestamps
+    tau: float | None = None,      # decay time constant (hours / 336)
+    horizon: float | None = None,  # max lookahead horizon (hours / 336)
+) -> torch.Tensor:
     """
-    Builds binary targets for auxiliary outcome prediction.
-    target[b, t, k] = 1 if outcome_ids[k] appears in position_ids[b, t+1:]
+    Builds time-aware outcome targets for auxiliary prediction head.
+
+    Two modes:
+    
+    1. **Binary mode** (all_abs_ts=None): 
+       target[b, t, k] = 1 if outcome_ids[k] appears in position_ids[b, t+1:] (anywhere after t).
+       
+    2. **Time-decayed mode** (all_abs_ts provided):
+       target[b, t, k] = soft score ∈ [0, 1]:
+           sum_s { exp(-dt(t,s) / tau) * 1[token_s == outcome_k] }.clamp(0, 1)
+       where dt(t,s) is filtered by 0 < dt <= horizon.
+       Maximum signal for outcomes very soon; decays exponentially to zero.
+
+    Args:
+        target_ids: [B, T] token sequence to search for outcomes.
+        outcome_ids: [K] list of outcome token IDs.
+        all_abs_ts: [B, T] absolute timestamps aligned with target_ids. If provided, enables time decay.
+        query_abs_ts: [B, T_q] query timestamps. If omitted, uses all_abs_ts (same shape as target_ids).
+        tau: Decay time constant (same units as timestamps). Only used if all_abs_ts is provided.
+        horizon: Max lookahead window (same units as timestamps). Only used if all_abs_ts is provided.
+
+    Returns:
+        FloatTensor [B, T_q, K] with outcome probabilities (0/1 for binary, soft [0..1] for decayed).
     """
-    B, T = position_ids.shape
+    # B, T = target_ids.shape
     K = len(outcome_ids)
-    device = position_ids.device
+    device = target_ids.device
     
-    # [1, 1, K] for broadcasting
+    # Build outcome match matrix: [B, T, K]
+    # matches[b, t, k] = 1.0 if target_ids[b, t] == outcome_ids[k]
     out_tensor = torch.tensor(outcome_ids, device=device, dtype=torch.long).view(1, 1, K)
+    matches = (target_ids.unsqueeze(-1) == out_tensor).float()  # [B, T, K]
+
+    # Binary mode: no time information
+    if all_abs_ts is None:
+        # Shift matches to get "future presence": target[t] = any match at s > t
+        future_matches = torch.zeros_like(matches)
+        future_matches[:, :-1, :] = matches[:, 1:, :]
+        future_presence = future_matches.flip(dims=[1]).cummax(dim=1).values.flip(dims=[1])
+        return future_presence
+
+    # Time-decayed mode
+    if query_abs_ts is None:
+        query_abs_ts = all_abs_ts
     
-    # 1. Where do outcomes occur? [B, T, K]
-    # matches[b, t, k] is True if token at t is outcome k
-    matches = (position_ids.unsqueeze(-1) == out_tensor) 
+    if tau is None or horizon is None:
+        raise ValueError(
+            "tau and horizon must be provided when all_abs_ts is given. "
+            "Use model_config.TRAINING_SETTINGS for defaults."
+        )
+
+    # T_q = query_abs_ts.size(1)
+    # Compute time differences: [B, T_q, T]
+    dt = all_abs_ts.unsqueeze(1) - query_abs_ts.unsqueeze(2)
     
-    # 2. Propagate "Future Presence" backwards
-    # We want target[t] to be True if match occurs at any step > t.
-    # Shift matches left by 1 (future relative to t)
-    future_matches = torch.zeros_like(matches)
-    future_matches[:, :-1, :] = matches[:, 1:, :] # shift left
+    # Horizon filtering: 0 < dt <= horizon
+    in_horizon = (dt > 0) & (dt <= horizon)
     
-    # Reverse cumulative max (logical OR) -> "Does it happen anytime after now?"
-    # flip time, cummax, flip back
-    future_presence = future_matches.flip(dims=[1]).cummax(dim=1).values.flip(dims=[1])
+    # Decay weights: exp(-dt / tau), masked to horizon
+    decay_weights = torch.exp(-dt / tau).masked_fill(~in_horizon, 0.0)  # [B, T_q, T]
     
-    return future_presence.float()
+    # Aggregate outcomes via batch matrix multiply: [B, T_q, T] x [B, T, K] -> [B, T_q, K]
+    outcome_targets = torch.bmm(decay_weights, matches).clamp(0.0, 1.0)
+    
+    return outcome_targets
 
 
 def build_mlm(ids, tokenizer, p=0.15):
@@ -559,13 +615,6 @@ def compute_legality_masks_tf(position_ids: torch.LongTensor,
     return illegal
 
 
-@torch.no_grad()
-def _gather_valid_ids(ids_tensor):
-    """Return (ids_valid, mask_valid) where ids_valid has all ids >=0 and mask_valid selects those columns."""
-    mask = ids_tensor >= 0
-    return ids_tensor[mask], mask
-
-
 def masked_softmax(logits, allowed):
     """
     Softmax over allowed classes only; zeros on disallowed.
@@ -588,102 +637,6 @@ def masked_softmax(logits, allowed):
     # stop gradients on fully-masked rows (no learning signal there)
     probs = probs * any_valid.float()
     return probs
-
-
-def soft_illegal_mass_penalty(
-    logits_pre_mask: torch.Tensor,    # [B,T,V] BEFORE apply_masks_to_logits
-    illegal_mask: torch.Tensor,       # [B,T,V] booleans from compute_legality_masks_tf
-    nonpad_mask: torch.Tensor,        # [B,T]   booleans (targets != PAD)
-    margin: float = 0.03,             # small safety margin; set 0 to disable
-    power: float = 1.0                # >1 accentuates heavy offenders
-) -> torch.Tensor:
-    """
-    Penalize probability mass placed on illegal classes *before* masking.
-    Scale ~[0,1]. Fully differentiable w.r.t. logits_pre_mask.
-
-    DEPRECATED — kept for diagnostic use only; removed from the training loss.
-
-    Why: The apply_masks_to_logits hard-mask already enforces legality at every step
-    (illegal logits → -1e9), so the model never selects illegal tokens regardless.
-    The penalty's only purpose would be to make the *pre-mask* distribution internally
-    avoid illegal regions — but BCE/CE gradients drive allowed logits up, which in
-    softmax space *relatively* raises illegal logits. The penalty gradient fights this
-    without enough λ budget to win. Net effect: the penalty fluctuates near its initial
-    value and contributes noise rather than useful signal.
-    Use for inspection (how much illegal mass does the raw network assign?) but not as
-    a training objective.
-    """
-    P = torch.softmax(logits_pre_mask, dim=-1)                     # [B,T,V]
-    mass = (P * illegal_mask).sum(dim=-1)                          # [B,T]
-    if margin > 0:
-        mass = F.relu(mass - margin)                               # hinge around margin
-    num = (mass * nonpad_mask.float()).sum()
-    den = nonpad_mask.float().sum().clamp_min(1.0)
-    pen = num / den
-    return pen.pow(power)
-
-
-def soft_unclosed_interval_penalty(
-    logits: torch.Tensor,           # [B,T,V] AFTER masking
-    allowed: torch.Tensor,          # [B,T,V] bool
-    start_ids_per_base: torch.Tensor,
-    end_ids_per_base: torch.Tensor, # [nb]
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    Penalizes intervals that remain open at the end of the sequence (step T).
-    This captures global consistency that step-wise masks cannot enforce.
-
-    DEPRECATED — kept for diagnostic use only; removed from the training loss.
-
-    Why: The penalty aggregates total probability mass assigned to start tokens vs
-    end tokens across ALL time steps, then penalises relu(total_starts - total_ends).
-    This is a global approximation of a local constraint ("every start must be followed
-    by an end"). The resulting gradient tells the model "assign less mass to starts /
-    more mass to ends everywhere" — a diffuse signal that does not correspond to any
-    specific positional violation. A model satisfying global mass balance (total_starts
-    ≈ total_ends) can still generate structurally invalid sequences at individual steps.
-    The step-wise illegal mask already prevents the worst violations; the penalty adds
-    noise without improving structural correctness in practice.
-    Use for inspection (how much unclosed-interval mass accumulates over a batch?) but
-    not as a training objective.
-
-    Returns: scalar penalty in [0, 1]
-    """
-    B, T, V = logits.shape
-    
-    # 1. Probabilities from MASKED logits (we must respect the mask's decisions)
-    P = masked_softmax(logits, allowed)
-
-    # 2. Gather valid start/end IDs
-    s_ids_all, s_mask = _gather_valid_ids(start_ids_per_base)
-    e_ids_all, e_mask = _gather_valid_ids(end_ids_per_base)
-    valid_mask = s_mask & e_mask
-    
-    if valid_mask.sum() == 0:
-        return logits.new_zeros(())
-
-    s_ids = start_ids_per_base[valid_mask]
-    e_ids = end_ids_per_base[valid_mask]
-    nbv   = s_ids.numel()
-
-    # 3. Calculate total mass given to STARTs and ENDs
-    p_s = P[:, :, s_ids]  # [B,T,nbv]
-    p_e = P[:, :, e_ids]  # [B,T,nbv]
-
-    total_starts = torch.sum(p_s, dim=1) # [B, nbv]
-    total_ends   = torch.sum(p_e, dim=1) # [B, nbv]
-
-    # 4. Penalty = Excess starts that were never closed
-    # Relu ensures we don't penalize "extra ends" here (that's handled by illegal mask)
-    open_final = F.relu(total_starts - total_ends) # [B, nbv]
-    
-    # 5. Normalize
-    # We normalize by Batch * Num_Bases. 
-    # (Max penalty is 1.0 if every base is fully open for every patient)
-    pen_unclosed = open_final.sum() / (B * nbv + eps)
-    
-    return pen_unclosed
 
 
 def apply_masks_to_logits(logits, illegal_mask):
@@ -841,7 +794,311 @@ def audit_generated_stream(
 
 # ---------------------------------------------------------------------------
 # Legacy / diagnostics-only helpers (not used by current training path)
+# These are kept for now for potential future use, but they are not called
 # ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _gather_valid_ids(ids_tensor):
+    """Return (ids_valid, mask_valid) where ids_valid has all ids >=0 and mask_valid selects those columns."""
+    mask = ids_tensor >= 0
+    return ids_tensor[mask], mask
+
+
+def soft_interval_penalty(
+    logits: torch.Tensor,           # [B,T,V] AFTER applying your legality/bonus mask to logits
+    allowed: torch.Tensor,          # [B,T,V] bool (legal & non-PAD)
+    start_ids_per_base: torch.Tensor, 
+    end_ids_per_base: torch.Tensor,  # [nb] (may contain -1)
+    conflict_mat: torch.Tensor,     # [nb,nb] bool
+    alpha: float = 8.0,             # sharpness for sigmoids
+    w_end_no_open: float = 1.0,
+    w_dup_start: float = 1.0,
+    w_conflict: float = 1.0,
+    w_unclosed: float = 0.5,
+    return_details: bool = False,
+    eps: float = 1e-8,              # numerical stability for denominators
+):
+    """
+    Differentiable interval structure penalty.
+    Builds expected 'open mass' from probabilities of *_START/*_END and penalizes:
+      • END with ~no open mass
+      • START when already open (dup)
+      • START when conflicting base open
+      • residual open mass at the end (unclosed)
+    Returns:
+        penalty: scalar in [0,1]
+        details: dict of raw & normalized components (if return_details=True)
+    
+    NOTE: DEPRECATED. Function is redundant given the function soft_illegal_mass_penalty.
+    """
+    B, T, V = logits.shape
+    device = logits.device
+
+    P = masked_softmax(logits, allowed)                       # [B,T,V]
+
+    # Restrict to bases that have both START and END
+    s_ids_all, s_mask = _gather_valid_ids(start_ids_per_base)
+    e_ids_all, e_mask = _gather_valid_ids(end_ids_per_base)
+    valid_mask = s_mask & e_mask
+    if valid_mask.sum() == 0:
+        return (logits.new_zeros(()), {}) if return_details else logits.new_zeros(())
+
+    s_ids = start_ids_per_base[valid_mask]  # [nbv]
+    e_ids = end_ids_per_base[valid_mask]    # [nbv]
+    nbv   = s_ids.numel()
+
+    # START/END probabilities per base
+    p_s = P[:, :, s_ids]  # [B,T,nbv]
+    p_e = P[:, :, e_ids]  # [B,T,nbv]
+
+    # Exclusive prefix "open-before-t" mass
+    cs_s = torch.cumsum(p_s, dim=1)
+    cs_e = torch.cumsum(p_e, dim=1)
+    open_before = F.relu(torch.cat(
+        [torch.zeros(B,1,nbv, device=device, dtype=p_s.dtype),
+         cs_s[:, :-1, :] - cs_e[:, :-1, :]],
+        dim=1
+    ))  # [B,T,nbv]
+
+    # === Raw components (un-normalized) ===
+    # END with no open
+    pen_end_no_open = (p_e * torch.exp(-alpha * open_before)).sum()        # ≤ B*T*nbv
+
+    # DUP START while already open
+    pen_dup_start   = (p_s * (1.0 - torch.exp(-alpha * open_before))).sum()# ≤ B*T*nbv
+
+    # CONFLICT START while conflicting base open
+    if conflict_mat.numel() and nbv:
+        cm_sub    = conflict_mat[valid_mask][:, valid_mask].float()        # [nbv,nbv]
+        open_conf = torch.einsum('btn,nm->btm', open_before, cm_sub)        # [B,T,nbv]
+        pen_conf  = (p_s * (1.0 - torch.exp(-alpha * open_conf))).sum()    # ≤ B*T*nbv
+    else:
+        pen_conf  = logits.new_zeros(())
+
+    # UNCLOSED mass at sequence end
+    open_final   = F.relu(cs_s[:, -1, :] - cs_e[:, -1, :])                  # [B,nbv]
+    pen_unclosed = open_final.sum()                                         # ≤ B*nbv
+
+    # === Strict [0,1] normalization per component ===
+    denom_bt = (B * T * nbv) + eps
+    denom_b  = (B *     nbv) + eps
+
+    norm_end_no_open = pen_end_no_open / denom_bt
+    norm_dup_start   = pen_dup_start   / denom_bt
+    norm_conf        = pen_conf        / denom_bt
+    norm_unclosed    = pen_unclosed    / denom_b
+
+    # Weighted average in [0,1]
+    wsum = (w_end_no_open + w_dup_start + w_conflict + w_unclosed) + eps
+    penalty = (
+        w_end_no_open * norm_end_no_open +
+        w_dup_start   * norm_dup_start   +
+        w_conflict    * norm_conf        +
+        w_unclosed    * norm_unclosed
+    ) / wsum
+
+    if return_details:
+        details = {
+            "raw": {
+                "end_no_open": pen_end_no_open.detach(),
+                "dup_start":   pen_dup_start.detach(),
+                "conflict":    pen_conf.detach(),
+                "unclosed":    pen_unclosed.detach(),
+            },
+            "norm": {
+                "end_no_open": norm_end_no_open.detach().item(),
+                "dup_start":   norm_dup_start.detach().item(),
+                "conflict":    norm_conf.detach().item(),
+                "unclosed":    norm_unclosed.detach().item(),
+            },
+            "meta": {
+                "B": B, "T": T, "nbv": int(nbv), "alpha": float(alpha),
+                "ws": (float(w_end_no_open), float(w_dup_start), float(w_conflict), float(w_unclosed))
+            },
+            # light sanity stats for quick prints
+            "stats": {
+                "p_s_sum": float(p_s.sum().detach()),
+                "p_e_sum": float(p_e.sum().detach()),
+                "open_before_mean": float(open_before.mean().detach()),
+                "open_final_mean": float(open_final.mean().detach())
+            }
+        }
+        return penalty, details
+
+    return penalty
+
+
+def soft_meal_order_penalty(
+    logits: torch.Tensor,             # [B,T,V] AFTER legality/bonus masking
+    allowed: torch.Tensor,            # [B,T,V] bool
+    meal_rank: torch.Tensor,          # [V]  (-1 non-meal else 0..K-1)
+    decay: float = 0.8,               # recency decay (0<decay<1); closer to 1 = longer memory
+    beta: float = 6.0,                # sharpness for “seen” squashing
+    eps: float = 1e-8,
+):
+    """
+    Differentiable cyclic meal-order penalty with *recency*:
+      • Build soft distribution over the **most-recent** meal rank before t via
+        an exponential-decay causal convolution over rank-level meal probabilities.
+      • Allowed rank at t is then the **successor** of that soft last-seen distribution.
+      • Penalize the probability mass on meal ranks that are NOT in that successor distribution.
+      • First meal (no prior seen) has zero penalty.
+
+    Returns: scalar penalty.
+
+    NOTE: DEPRECATED. Function is redundant given the function soft_illegal_mass_penalty.
+    """
+    B, T, V = logits.shape
+    device  = logits.device
+    # No meals -> no penalty
+    if not (meal_rank >= 0).any():
+        return logits.new_zeros(())
+
+    # 1) Probabilities over allowed classes
+    l = logits.masked_fill(~allowed, -1e9)          # [B,T,V]
+    P = torch.exp(l - torch.logsumexp(l, dim=-1, keepdim=True))  # [B,T,V]
+    P = P * allowed.to(P.dtype)
+
+    # 2) Collapse token-level meal probs to rank-level probs: P_rank[b,t,r]
+    meal_ids = (meal_rank >= 0).nonzero(as_tuple=False).squeeze(-1)   # [N_meal_tokens]
+    ranks    = meal_rank[meal_ids].to(torch.long)                     # [N] each in 0..K-1
+    K        = int(meal_rank[meal_rank >= 0].max().item()) + 1
+
+    P_meal_tok = P[:, :, meal_ids]                                    # [B,T,N]
+    P_rank = torch.zeros(B, T, K, device=device)
+    # scatter_add tokens into their ranks
+    P_rank.scatter_add_(dim=2, index=ranks.view(1,1,-1).expand(B,T,-1), src=P_meal_tok)  # [B,T,K]
+
+    # 3) Build soft “most-recent rank before t” via exponential-decay causal conv
+    #    y[:, :, t] = sum_{j <= t} P_rank[:, j] * decay^(t-j)
+    kernel = (decay ** torch.arange(T, device=device, dtype=P_rank.dtype)).view(1,1,T)  # [1,1,T]
+    x = P_rank.transpose(1,2)                                       # [B,K,T]  (channels=K)
+
+    # depthwise kernel: [K, 1, T]
+    base = (decay ** torch.arange(T, device=device, dtype=x.dtype)).view(1, 1, T)
+    w = base.repeat(K, 1, 1)
+
+    # causal conv: padding=T-1 then trim right
+    y_full = F.conv1d(x, w, padding=T-1, groups=K)  # [B, K, T+T-1]
+    y = y_full[:, :, :T]                            # [B, K, T]
+
+    # exclusive prefix: last-seen BEFORE t
+    last_seen = torch.zeros_like(y)
+    last_seen[:, :, 1:] = y[:, :, :-1]                              # [B,K,T]
+    last_seen = last_seen.transpose(1,2)                             # [B,T,K]
+
+    # squash to [0,1], emphasize larger mass
+    seen_soft = 1.0 - torch.exp(-beta * last_seen)                   # [B,T,K]
+    any_seen  = (seen_soft.sum(dim=2, keepdim=True) > 0).float()     # [B,T,1]
+
+    # 4) Successor distribution over ranks (shift by +1 mod K), normalized
+    succ = torch.roll(seen_soft, shifts=+1, dims=2)                  # successor of rank r is (r+1)%K
+    succ = succ / (succ.sum(dim=2, keepdim=True) + eps)              # [B,T,K]; undefined -> handled by any_seen
+
+    # 5) Current meal rank mass vs allowed successor ranks
+    #    penalty = sum_r P_rank[b,t,r] * (1 - succ[b,t,r])  when any_seen>0;  else 0
+    wrong = 1.0 - succ                                               # [B,T,K]
+    pen = (P_rank * wrong * any_seen).sum()                          # scalar
+
+    denom = (B * T + 1.0)
+    return pen / denom
+
+
+def soft_illegal_mass_penalty(
+    logits_pre_mask: torch.Tensor,    # [B,T,V] BEFORE apply_masks_to_logits
+    illegal_mask: torch.Tensor,       # [B,T,V] booleans from compute_legality_masks_tf
+    nonpad_mask: torch.Tensor,        # [B,T]   booleans (targets != PAD)
+    margin: float = 0.03,             # small safety margin; set 0 to disable
+    power: float = 1.0                # >1 accentuates heavy offenders
+) -> torch.Tensor:
+    """
+    Penalize probability mass placed on illegal classes *before* masking.
+    Scale ~[0,1]. Fully differentiable w.r.t. logits_pre_mask.
+
+    NOTE: DEPRECATED — kept for diagnostic use only; removed from the training loss.
+
+    Why: The apply_masks_to_logits hard-mask already enforces legality at every step
+    (illegal logits → -1e9), so the model never selects illegal tokens regardless.
+    The penalty's only purpose would be to make the *pre-mask* distribution internally
+    avoid illegal regions — but BCE/CE gradients drive allowed logits up, which in
+    softmax space *relatively* raises illegal logits. The penalty gradient fights this
+    without enough λ budget to win. Net effect: the penalty fluctuates near its initial
+    value and contributes noise rather than useful signal.
+    Use for inspection (how much illegal mass does the raw network assign?) but not as
+    a training objective.
+    """
+    P = torch.softmax(logits_pre_mask, dim=-1)                     # [B,T,V]
+    mass = (P * illegal_mask).sum(dim=-1)                          # [B,T]
+    if margin > 0:
+        mass = F.relu(mass - margin)                               # hinge around margin
+    num = (mass * nonpad_mask.float()).sum()
+    den = nonpad_mask.float().sum().clamp_min(1.0)
+    pen = num / den
+    return pen.pow(power)
+
+
+def soft_unclosed_interval_penalty(
+    logits: torch.Tensor,           # [B,T,V] AFTER masking
+    allowed: torch.Tensor,          # [B,T,V] bool
+    start_ids_per_base: torch.Tensor,
+    end_ids_per_base: torch.Tensor, # [nb]
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Penalizes intervals that remain open at the end of the sequence (step T).
+    This captures global consistency that step-wise masks cannot enforce.
+
+    NOTE: DEPRECATED — kept for diagnostic use only; removed from the training loss.
+
+    Why: The penalty aggregates total probability mass assigned to start tokens vs
+    end tokens across ALL time steps, then penalises relu(total_starts - total_ends).
+    This is a global approximation of a local constraint ("every start must be followed
+    by an end"). The resulting gradient tells the model "assign less mass to starts /
+    more mass to ends everywhere" — a diffuse signal that does not correspond to any
+    specific positional violation. A model satisfying global mass balance (total_starts
+    ≈ total_ends) can still generate structurally invalid sequences at individual steps.
+    The step-wise illegal mask already prevents the worst violations; the penalty adds
+    noise without improving structural correctness in practice.
+    Use for inspection (how much unclosed-interval mass accumulates over a batch?) but
+    not as a training objective.
+
+    Returns: scalar penalty in [0, 1]
+    """
+    B, T, V = logits.shape
+    
+    # 1. Probabilities from MASKED logits (we must respect the mask's decisions)
+    P = masked_softmax(logits, allowed)
+
+    # 2. Gather valid start/end IDs
+    s_ids_all, s_mask = _gather_valid_ids(start_ids_per_base)
+    e_ids_all, e_mask = _gather_valid_ids(end_ids_per_base)
+    valid_mask = s_mask & e_mask
+    
+    if valid_mask.sum() == 0:
+        return logits.new_zeros(())
+
+    s_ids = start_ids_per_base[valid_mask]
+    e_ids = end_ids_per_base[valid_mask]
+    nbv   = s_ids.numel()
+
+    # 3. Calculate total mass given to STARTs and ENDs
+    p_s = P[:, :, s_ids]  # [B,T,nbv]
+    p_e = P[:, :, e_ids]  # [B,T,nbv]
+
+    total_starts = torch.sum(p_s, dim=1) # [B, nbv]
+    total_ends   = torch.sum(p_e, dim=1) # [B, nbv]
+
+    # 4. Penalty = Excess starts that were never closed
+    # Relu ensures we don't penalize "extra ends" here (that's handled by illegal mask)
+    open_final = F.relu(total_starts - total_ends) # [B, nbv]
+    
+    # 5. Normalize
+    # We normalize by Batch * Num_Bases. 
+    # (Max penalty is 1.0 if every base is fully open for every patient)
+    pen_unclosed = open_final.sum() / (B * nbv + eps)
+    
+    return pen_unclosed
+
 
 def penalty_interval_structure(
     pred_ids: torch.LongTensor,

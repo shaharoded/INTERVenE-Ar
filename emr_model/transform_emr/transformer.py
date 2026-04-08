@@ -20,28 +20,9 @@ from transform_emr.embedder import EMREmbedding
 from transform_emr.config.model_config import *
 from transform_emr.utils import *
 from transform_emr.loss import MaskedFocalBCE, MaskedSetCE
-from transform_emr.schedulers import LambdaScheduleController
+from transform_emr.schedulers import LambdaScheduleController, LRScheduleController
 
-
-# ───────── components ─────────────────────────────────────────────────────────── #
-def _apply_temporal_rope(x, abs_ts, t_scale=24.0):
-    """Apply RoPE using real timestamps instead of position indices.
-    x: [B, n_head, T, hd], abs_ts: [B, T] (hours, already normalized).
-    Pairs adjacent dims and rotates by abs_ts / t_scale^(2i/d).
-    """
-    B, H, T, hd = x.shape
-    half = hd // 2
-    # Frequency bands: 1 / t_scale^(2i/d) for i in [0, half)
-    freq = 1.0 / (t_scale ** (torch.arange(half, device=x.device, dtype=x.dtype) / half))
-    # theta[b, t, i] = abs_ts[b, t] * freq[i]
-    theta = abs_ts.unsqueeze(-1).to(x.dtype) * freq  # [B, T, half]
-    theta = theta.unsqueeze(1)  # [B, 1, T, half] — broadcast over heads
-    cos_t = torch.cos(theta)
-    sin_t = torch.sin(theta)
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat([x1 * cos_t - x2 * sin_t, x2 * cos_t + x1 * sin_t], dim=-1)
-
-
+# ───────── components  ───────────────────────────────────────────────── #
 class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention with temporal RoPE."""
 
@@ -55,6 +36,23 @@ class CausalSelfAttention(nn.Module):
         self.proj  = nn.Linear(cfg["embed_dim"], cfg["embed_dim"],    bias=cfg["bias"])
         self.attn_dropout  = nn.Dropout(cfg["dropout"])
         self.resid_dropout = nn.Dropout(cfg["dropout"])
+        self.rope_t_scale = cfg.get("rope_t_scale", 24.0)
+
+    def _apply_temporal_rope(self, x, abs_ts):
+        """Rotate Q/K by timestamp-dependent phases before dot-product attention.
+
+        This injects absolute time into attention scores by phase-shifting each
+        head channel pair with frequencies scaled by ``rope_t_scale``.
+        """
+        _, _, _, hd = x.shape
+        half = hd // 2
+        freq = 1.0 / (self.rope_t_scale ** (torch.arange(half, device=x.device, dtype=x.dtype) / half))
+        theta = abs_ts.unsqueeze(-1).to(x.dtype) * freq  # [B, T, half]
+        theta = theta.unsqueeze(1)  # [B, 1, T, half] broadcast over heads
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+        x1, x2 = x[..., :half], x[..., half:]
+        return torch.cat([x1 * cos_t - x2 * sin_t, x2 * cos_t + x1 * sin_t], dim=-1)
 
     def forward(self, x, key_pad_mask=None, abs_ts=None):
             B, T, C = x.shape
@@ -69,8 +67,8 @@ class CausalSelfAttention(nn.Module):
 
             # Apply temporal RoPE to Q and K (no extra memory, no T×T matrix)
             if abs_ts is not None:
-                q = _apply_temporal_rope(q, abs_ts)
-                k = _apply_temporal_rope(k, abs_ts)
+                q = self._apply_temporal_rope(q, abs_ts)
+                k = self._apply_temporal_rope(k, abs_ts)
 
             if key_pad_mask is not None:
                 # --- Manual Masking Path (Required when padding is present) ---
@@ -301,9 +299,12 @@ class GPT(nn.Module):
         )
 
         self.apply(self._init_weights)
-        # slightly smaller init for res projections as in gpt‑2
+        # Slightly smaller init for residual projections as in GPT-2:
+        # scale down the output projection of each residual branch by 1/√(2*n_layers)
+        # to keep the residual stream variance bounded at init in deep networks.
+        # Targets: att.proj (attention output) and mlp.w2 (MLP output).
         for n, p in self.named_parameters():
-            if n.endswith("c_proj.weight"):
+            if n.endswith(("att.proj.weight", "mlp.w2.weight")):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg["n_layer"]))
 
         print(f"[GPT]: Total params: {self.get_num_params()/1e6:.2f} M")
@@ -353,45 +354,6 @@ class GPT(nn.Module):
 
         return torch.optim.AdamW(optim_groups, betas=betas)
     
-    def configure_scheduler(self, optimizer, training_settings, train_dl):
-        """
-        Configures the learning rate scheduler for phase 2 training.
-
-        Uses the OneCycleLR scheduler to warm up and then anneal the learning rate
-        over the course of training. Scheduler parameters (like total steps and
-        learning rate) are derived from the provided training settings.
-
-        Args:
-            optimizer (torch.optim.Optimizer): Optimizer instance to schedule.
-            training_settings (dict): Dictionary containing training hyperparameters,
-                including 'phase2_learning_rate' and 'phase2_n_epochs'.
-            train_dl (DataLoader): Training dataloader used to compute steps per epoch.
-
-        Returns:
-            torch.optim.lr_scheduler.OneCycleLR: Configured learning rate scheduler.
-        """
-        # derive warmup fraction from warmup_epochs
-        total_epochs = training_settings["phase2_n_epochs"]
-        warmup_epochs = training_settings["warmup_epochs"]
-        pct = max(1e-6, min(0.9, warmup_epochs / float(total_epochs)))  # e.g., 5/100 = 0.05
-
-        # match max_lr list to your 3 param groups: decay, no_decay, embedder(0.1x)
-        base_lr = training_settings["phase2_learning_rate"]
-        max_lrs = [base_lr, base_lr, base_lr * 0.1]
-
-        return torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=max_lrs,                         # list per group
-            epochs=total_epochs,                    # prefer epochs+steps_per_epoch to total_steps
-            steps_per_epoch=len(train_dl),
-            pct_start=pct,                          # warm-up exactly = warmup_epochs
-            anneal_strategy="cos",
-            cycle_momentum=False,                   # important for AdamW
-            div_factor=10,                          # init LR = max_lr/10
-            final_div_factor=10,                    # floor‑LR = 1e‑5 as well (cos tail reaches this)
-        )
-    
-
 # ---------------------------------------------------- forward ---- #
     def forward(self, parent_raw_ids, concept_ids, value_ids, position_ids,
             abs_ts, context_vec=None):
@@ -540,16 +502,15 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     """
     Trains a Transformer-based EMR sequence model in Phase 2 (decoder stage),
     using a pretrained embedder and structured multi-loss optimization.
-    Total Loss = λ1 * BCE + λ2 * CE + λ3 * Outcome prediction + λpen * Penalty + λt * Time Loss (τt)
+    Total Loss = λ1 * BCE + λ2 * CE + λ3 * Outcome prediction + λt * Time Loss (τt)
 
     The auxiliary losses are applied gradually to stabilize training:
     -  Next-token BCE loss encourages accurate event prediction (foundational task, start at epoch 0 with no schedule).
     -  Next-token CE loss provides a complementary signal for token prediction (foundational task, start at epoch 0 with no schedule).
     -  Time prediction MSE loss guides the model to predict event timings (foundational task, start at epoch 0 with no schedule).
-    -  Penalty loss encourages valid event sequences (mid-foundational task, start at the middle of the foundational phase with schedule).
     -  Outcome prediction BCE loss guides the model to predict clinical outcomes (post-foundational task, start after the foundational phase with schedule).
 
-    Gradually applying curriculum and CBM during `warmup_epochs`, then implements early stopping based on best total loss. 
+    Gradually applying curriculum and CBM during `scheduler.bce_only_epochs`, then implements early stopping based on best total loss, after warmup concludes. 
     Supports resume-from-checkpoint training. The CBM is applied during the foundational training phase only.
 
     Logits are masked to ensure only legal tokens are predicted, targets are masked to ensure proper loss denominator,
@@ -579,17 +540,18 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     # Allow embedder weights to update starting epoch 1
     set_embedder_frozen(model, freeze=False)
     model.to(device)
-    
+    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+
     optimizer = model.configure_optimizers(
         weight_decay=training_settings["weight_decay"],
         learning_rate=training_settings["phase2_learning_rate"],
         betas=(0.9, 0.95)
     )
 
-    scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
+    scheduler = LRScheduleController(optimizer, training_settings, train_dl)
 
     # Training Dynamics
-    cbm_ramp_epochs = training_settings["cbm_ramp_epochs"]
+    cbm_ramp_epochs = training_settings["phase2_scheduler"]["bce_only_epochs"] # Couple CBM ramp up with the foundational phase to stabilize training before introducing the full curriculum. CBM will ramp up from 0 to max_p during these epochs, then stay at max_p for the rest of training.
 
     # Get outcomes weights (from Tokenizer) for pos_weight in BCE loss
     valid_outcomes = [n for n in model.outcome_names if n in model.embedder.tokenizer.token2id]
@@ -631,7 +593,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         optimizer.load_state_dict(opt_state)
 
         # Scheduler needs to be re-initiated with the recovered optimizer before loading its state dict
-        scheduler = model.configure_scheduler(optimizer, training_settings, train_dl)
+        scheduler = LRScheduleController(optimizer, training_settings, train_dl)
         scheduler.load_state_dict(sch_state)
         start_epoch += 1
         print(f"[Phase-2]: Resumed training at epoch {start_epoch} (best val_loss so far: {best_val:.4f})")
@@ -673,14 +635,15 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                                       p=p)
 
                 # === Original logits from Model ===
-                logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
-                    parent_raw_ids=batch["parent_raw_ids"],
-                    concept_ids=batch["concept_ids"],
-                    value_ids=batch["value_ids"],
-                    position_ids=batch["position_ids"],
-                    abs_ts=batch["abs_ts"],
-                    context_vec=batch["context_vec"]
-                )
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
+                        parent_raw_ids=batch["parent_raw_ids"],
+                        concept_ids=batch["concept_ids"],
+                        value_ids=batch["value_ids"],
+                        position_ids=batch["position_ids"],
+                        abs_ts=batch["abs_ts"],
+                        context_vec=batch["context_vec"]
+                    )
 
                 # logits is [B, T, V]
                 # abs_t_pred: [B, T]
@@ -738,19 +701,14 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # abs_ts = hours / 336.
                 _ABS_TS_SCALE = 336.0
                 _BCE_WIN = training_settings.get("phase2_bce_window_hours", 12.0) / _ABS_TS_SCALE
-                with torch.no_grad():
-                    cur_ts  = batch["abs_ts"][:, :-1]   # [B, T-1]
-                    all_ts  = batch["abs_ts"]            # [B, T]
-                    dt_bce  = all_ts.unsqueeze(1) - cur_ts.unsqueeze(2)  # [B, T-1, T]
-                    in_win  = (dt_bce > 0) & (dt_bce <= _BCE_WIN)
-                    B_s, T_in, T_all = in_win.shape
-                    V = pred_logits.size(-1)
-                    pad_idx = model.embedder.padding_idx
-                    tgt_win = full_targets.unsqueeze(1).expand(B_s, T_in, T_all).masked_fill(~in_win, pad_idx)
-                    multi_hot = torch.zeros(B_s, T_in, V, device=device)
-                    multi_hot.scatter_(2, tgt_win, 1.0)
-                    multi_hot[..., pad_idx] = 0.0
-                    del dt_bce, in_win, tgt_win
+                multi_hot = get_temporal_multi_hot_targets(
+                    target_ids=full_targets,
+                    all_abs_ts=batch["abs_ts"],
+                    query_abs_ts=batch["abs_ts"][:, :-1],
+                    padding_idx=model.embedder.padding_idx,
+                    vocab_size=pred_logits.size(-1),
+                    window_size=_BCE_WIN,
+                )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 
                 # mask out illegal classes AND PAD steps from the denominator
@@ -795,15 +753,14 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 _ABS_TS_SCALE = 336.0
                 _TAU     = training_settings.get("outcome_decay_tau_hours", 12.0) / _ABS_TS_SCALE
                 _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
-                with torch.no_grad():
-                    cur_ts = batch["abs_ts"][:, :-1]  # [B, T-1]
-                    dt = batch["abs_ts"].unsqueeze(1) - cur_ts.unsqueeze(2)  # [B, T-1, T]
-                    in_horizon = (dt > 0) & (dt <= _HORIZON)
-                    decay_weights = torch.exp(-dt / _TAU).masked_fill(~in_horizon, 0.0)  # [B, T-1, T]
-                    out_ids_t = torch.tensor(outcome_token_ids, device=device, dtype=torch.long)
-                    matches = (full_targets.unsqueeze(-1) == out_ids_t.view(1, 1, -1)).float()  # [B, T, K]
-                    # [B, T-1, T] x [B, T, K] -> [B, T-1, K]
-                    outcome_targets = torch.bmm(decay_weights, matches).clamp(0.0, 1.0)  # soft [0,1]
+                outcome_targets = get_future_outcome_targets(
+                    target_ids=full_targets,
+                    outcome_ids=outcome_token_ids,
+                    all_abs_ts=batch["abs_ts"],
+                    query_abs_ts=batch["abs_ts"][:, :-1],
+                    tau=_TAU,
+                    horizon=_HORIZON,
+                )  # [B, T-1, K]
                 
                 # Only learn from valid (non-pad) time steps.
                 loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T-1, K]
@@ -819,7 +776,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
-                    scheduler.step()
+                    scheduler.update()
                 # Update loss
                 total_loss    += loss.item()
                 total_bce     += loss_bce.item()
