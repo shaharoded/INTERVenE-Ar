@@ -121,6 +121,43 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
     assert outcomes.shape == (B, T, model.num_outcomes), f"Expected outcomes shape {(B, T, model.num_outcomes)}, got {outcomes.shape}"
     assert dt_gate.shape == (B, T), f"Expected dt_gate shape {(B, T)}, got {dt_gate.shape}"
 
+
+def test_transformer_checkpoint_persists_configs(mini_transformer, mini_embedder, tmp_path):
+    model = mini_transformer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    ckpt_path = tmp_path / "transformer_ckpt.pt"
+    training_settings = {
+        "phase2_learning_rate": 1e-3,
+        "phase2_n_epochs": 3,
+        "phase2_scheduler": {"bce_only_epochs": 1},
+    }
+
+    model.save(
+        path=ckpt_path,
+        epoch=2,
+        best_val=0.11,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        lambda_schedule_state={"enabled": True},
+        training_settings=training_settings,
+        bad_epochs=1,
+    )
+
+    loaded_model, epoch, best_val, optim_state, scheduler_state, lambda_state = GPT.load(
+        ckpt_path,
+        embedder=mini_embedder,
+    )
+
+    assert isinstance(loaded_model, GPT)
+    assert epoch == 2
+    assert best_val == pytest.approx(0.11)
+    assert optim_state is not None
+    assert scheduler_state is not None
+    assert lambda_state == {"enabled": True}
+    assert loaded_model.checkpoint_model_config["embed_dim"] == model.cfg["embed_dim"]
+    assert loaded_model.checkpoint_training_settings == training_settings
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_transformer_forward_gpu(mini_transformer, mini_tokenizer):
     """

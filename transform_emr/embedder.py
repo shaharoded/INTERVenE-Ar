@@ -1,3 +1,4 @@
+import copy
 import numpy
 import torch
 import torch.nn as nn
@@ -301,7 +302,7 @@ class EMREmbedding(nn.Module):
             logits = logits[mlm_mask] # flatten to [N_masked,V]
         return logits
     
-    def save(self, epoch, best_val, optimizer, scheduler, path, lambda_schedule_state=None, bad_epochs=0):
+    def save(self, epoch, best_val, optimizer, scheduler, path, lambda_schedule_state=None, bad_epochs=0, training_settings=None):
         ckpt = {
             "epoch": epoch,
             "best_val": best_val,
@@ -316,7 +317,9 @@ class EMREmbedding(nn.Module):
                 "embed_dim": self.output_dim,
                 "dropout": self.dropout.p,
                 "vocab_size": self.position_embed.num_embeddings,
-            }
+            },
+            # Keep a copy of training settings used to produce this checkpoint.
+            "training_settings": copy.deepcopy(training_settings),
         }
         torch.save(ckpt, path)
     
@@ -338,7 +341,11 @@ class EMREmbedding(nn.Module):
             scheduler_state (dict): State dict for LR scheduler
         """
         ckpt = torch.load(path, map_location=map_location, weights_only=True)
-        config = ckpt["config"]
+        config = ckpt.get("config")
+        if config is None:
+            raise ValueError(
+                "[EMREmbedding.load] Invalid checkpoint: missing 'config'."
+            )
 
         # === Safety check: tokenizer vocab consistency ===
         expected_vocab = config["vocab_size"]
@@ -358,12 +365,16 @@ class EMREmbedding(nn.Module):
         )
         model.load_state_dict(ckpt["model_state"])
 
+        # Helpful metadata for callers that want to fully restore prior training settings.
+        model.checkpoint_model_config = copy.deepcopy(config)
+        model.checkpoint_training_settings = copy.deepcopy(ckpt.get("training_settings"))
+
         return (
             model,
-            ckpt["epoch"],
-            ckpt["best_val"],
-            ckpt["optim_state"],
-            ckpt["scheduler_state"],
+            ckpt.get("epoch", 0),
+            ckpt.get("best_val", float("inf")),
+            ckpt.get("optim_state"),
+            ckpt.get("scheduler_state"),
             ckpt.get("lambda_schedule_state"),
             ckpt.get("bad_epochs", 0),
         )
@@ -410,6 +421,12 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     ckpt_last = ckpt_path.parent / "ckpt_last.pt"
 
+    # If resuming, prefer checkpoint-saved settings to avoid config mismatch.
+    if resume and ckpt_last.exists():
+        pre_ckpt = torch.load(ckpt_last, map_location="cpu", weights_only=True)
+        if pre_ckpt.get("training_settings") is not None:
+            training_settings = pre_ckpt["training_settings"]
+
     # ----- Loss & Optimizer -----
     optimizer = torch.optim.AdamW(embedder.parameters(), lr=training_settings["phase1_learning_rate"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)
@@ -426,8 +443,14 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         print(f"[Phase-1] Resuming from checkpoint: {ckpt_last}")
         embedder, start_epoch, best_val, optim_state, scheduler_state, lambda_schedule_state, bad_epochs = EMREmbedding.load(ckpt_last, tokenizer=embedder.tokenizer, map_location=device)
         embedder.to(device)
-        optimizer.load_state_dict(optim_state)
-        scheduler.load_state_dict(scheduler_state)
+        if optim_state is not None:
+            optimizer.load_state_dict(optim_state)
+        if scheduler_state is not None:
+            scheduler.load_state_dict(scheduler_state)
+
+        # Prefer checkpoint-saved settings to avoid resume/config mismatch issues.
+        if getattr(embedder, "checkpoint_training_settings", None) is not None:
+            training_settings = embedder.checkpoint_training_settings
         start_epoch += 1
 
     schedule_controller = LambdaScheduleController(
@@ -583,14 +606,16 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             best_val = vl_tot
             bad_epochs = 0
             embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path,
-                          lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs)
+                          lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs,
+                          training_settings=training_settings)
             print("[Phase-1]: Current best model saved.")
         elif epoch >= warmup_gate:
             bad_epochs += 1
             if bad_epochs >= training_settings["early-stop-patience"]:
                 # Save last checkpoint before stopping
                 embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last,
-                              lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs)
+                              lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs,
+                              training_settings=training_settings)
                 print("[Phase-1]: Early stopping triggered.")
                 break
         else:
@@ -599,7 +624,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
 
         # Save last checkpoint (after bad_epochs is updated)
         embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last,
-                      lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs)
+                      lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs,
+                      training_settings=training_settings)
     
     plot_losses(train_losses, val_losses)
     return embedder, train_losses, val_losses

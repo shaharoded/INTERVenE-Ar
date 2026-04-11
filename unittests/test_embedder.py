@@ -137,3 +137,48 @@ def test_forward_with_decoder_logits(mini_tokenizer):
     # No [CTX] prepended, so T remains T.
     vocab_size = len(tokenizer.token2id)
     assert logits.shape == (B, T, vocab_size), f"Expected logits shape {(B,T,vocab_size)}, got {logits.shape}"
+
+
+@pytest.mark.order(5)
+def test_embedder_checkpoint_persists_configs(mini_tokenizer, tmp_path):
+    model = EMREmbedding(
+        tokenizer=mini_tokenizer,
+        ctx_dim=2,
+        time2vec_dim=2,
+        embed_dim=8,
+        dropout=0.2,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min")
+
+    ckpt_path = tmp_path / "embedder_ckpt.pt"
+    training_settings = {
+        "phase1_learning_rate": 1e-3,
+        "phase1_n_epochs": 5,
+    }
+
+    model.save(
+        epoch=3,
+        best_val=0.42,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        path=ckpt_path,
+        lambda_schedule_state={"stage": 1},
+        bad_epochs=2,
+        training_settings=training_settings,
+    )
+
+    loaded_model, epoch, best_val, optim_state, scheduler_state, lambda_state, bad_epochs = EMREmbedding.load(
+        ckpt_path,
+        tokenizer=mini_tokenizer,
+    )
+
+    assert isinstance(loaded_model, EMREmbedding)
+    assert epoch == 3
+    assert best_val == pytest.approx(0.42)
+    assert optim_state is not None
+    assert scheduler_state is not None
+    assert lambda_state == {"stage": 1}
+    assert bad_epochs == 2
+    assert loaded_model.checkpoint_model_config["embed_dim"] == 8
+    assert loaded_model.checkpoint_training_settings == training_settings

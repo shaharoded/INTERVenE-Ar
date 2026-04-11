@@ -8,6 +8,7 @@ by dataset.py.
 """
 
 import math
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -423,14 +424,18 @@ class GPT(nn.Module):
         return logits, abs_t_pred, outcome_logits, gate_logit
     
 
-    def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None, lambda_schedule_state=None):
+    def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None,
+             lambda_schedule_state=None, training_settings=None, bad_epochs=0):
         ckpt = {
             "model_state": self.state_dict(),
-            "config": self.cfg,
+            "config": copy.deepcopy(self.cfg),
             "vocab_size": self.embedder.decoder.out_features,
             "outcome_names": self.outcome_names,
             "num_outcomes": self.num_outcomes,
             "lambda_schedule_state": lambda_schedule_state,
+            # Keep a copy of training settings used to produce this checkpoint.
+            "training_settings": copy.deepcopy(training_settings),
+            "bad_epochs": bad_epochs,
         }
         if epoch is not None:
             ckpt["epoch"] = epoch
@@ -446,6 +451,9 @@ class GPT(nn.Module):
     @classmethod
     def load(cls, path, embedder, map_location="cpu"):
         ckpt = torch.load(path, map_location=map_location, weights_only=True)
+
+        if "config" not in ckpt:
+            raise ValueError("[GPT.load] Invalid checkpoint: missing 'config'.")
 
         # === Vocab safety check ===
         expected_vocab = ckpt["vocab_size"]
@@ -487,14 +495,18 @@ class GPT(nn.Module):
         
         model.load_state_dict(ckpt["model_state"])
 
+        # Helpful metadata for callers that want to fully restore prior training settings.
+        model.checkpoint_model_config = copy.deepcopy(ckpt["config"])
+        model.checkpoint_training_settings = copy.deepcopy(ckpt.get("training_settings"))
+
         # Return full training state if available
         return (
             model,
-            ckpt["epoch"],
-            ckpt["best_val"],
-            ckpt["optim_state"],
-            ckpt["scheduler_state"],
-            ckpt["lambda_schedule_state"],
+            ckpt.get("epoch", 0),
+            ckpt.get("best_val", float("inf")),
+            ckpt.get("optim_state"),
+            ckpt.get("scheduler_state"),
+            ckpt.get("lambda_schedule_state"),
         )
 
 
@@ -537,6 +549,16 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     luts = build_luts(model.embedder.tokenizer)
     luts = {k: v.to(device) if torch.is_tensor(v) else v for k,v in luts.items()}
 
+    ckpt_path = Path(checkpoint_path).resolve()
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_last = ckpt_path.parent / "ckpt_last.pt"
+
+    # If resuming, prefer checkpoint-saved settings to avoid config mismatch.
+    if resume and ckpt_last.exists():
+        pre_ckpt = torch.load(ckpt_last, map_location="cpu", weights_only=True)
+        if pre_ckpt.get("training_settings") is not None:
+            training_settings = pre_ckpt["training_settings"]
+
     # Allow embedder weights to update starting epoch 1
     set_embedder_frozen(model, freeze=False)
     model.to(device)
@@ -577,10 +599,6 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     OutcomeCriterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction='none')
 
-    ckpt_path = Path(checkpoint_path).resolve()
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    ckpt_last = ckpt_path.parent / "ckpt_last.pt"
-
     start_epoch = 0
     best_val = float("inf")
     bad_epochs = 0
@@ -589,12 +607,19 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     if resume and ckpt_last.exists():
         print(f"[GPT]: Loading model from checkpoint: {ckpt_last}")
         loaded_model, start_epoch, best_val, opt_state, sch_state, lambda_schedule_state = GPT.load(ckpt_last, embedder=model.embedder, map_location=device)
-        model.load_state_dict(loaded_model.state_dict())
-        optimizer.load_state_dict(opt_state)
+        model = loaded_model
+        model.to(device)
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+
+        # Prefer checkpoint-saved settings to avoid resume/config mismatch issues.
+        if getattr(model, "checkpoint_training_settings", None) is not None:
+            training_settings = model.checkpoint_training_settings
 
         # Scheduler needs to be re-initiated with the recovered optimizer before loading its state dict
         scheduler = LRScheduleController(optimizer, training_settings, train_dl)
-        scheduler.load_state_dict(sch_state)
+        if sch_state is not None:
+            scheduler.load_state_dict(sch_state)
         start_epoch += 1
         print(f"[Phase-2]: Resumed training at epoch {start_epoch} (best val_loss so far: {best_val:.4f})")
     else:
@@ -826,7 +851,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
         # Save latest
         model.save(ckpt_last, epoch, best_val, optimizer, scheduler,
-                   lambda_schedule_state=schedule_controller.state_dict())
+                   lambda_schedule_state=schedule_controller.state_dict(),
+                   training_settings=training_settings, bad_epochs=bad_epochs)
 
         # Save best model
         warmup_gate = schedule_controller.current_warmup_end_epoch()
@@ -834,7 +860,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         if (vl_loss < best_val - 1e-4) and (epoch >= warmup_gate):
             best_val = vl_loss
             model.save(ckpt_path, epoch, best_val, optimizer, scheduler,
-                       lambda_schedule_state=schedule_controller.state_dict())
+                       lambda_schedule_state=schedule_controller.state_dict(),
+                       training_settings=training_settings, bad_epochs=bad_epochs)
             print("[Phase-2]: Current best model saved.")
             bad_epochs = 0
         elif epoch >= warmup_gate:
