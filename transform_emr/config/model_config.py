@@ -34,7 +34,8 @@ TRAINING_SETTINGS = {
     "phase3_learning_rate":  1e-4,
     "weight_decay": 1e-3,
 
-    "batch_size": 64, # Number of patients processed concurrently
+    "batch_size": 16, # Number of patients processed concurrently (effective batch=64 via grad accumulation)
+    "grad_accumulation_steps": 4, # Accumulate gradients over N steps before optimizer.step()
     "phase1_bce_window_hours": 3.0,
     "phase2_bce_window_hours": 12.0,
 

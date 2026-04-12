@@ -485,6 +485,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             # BCE Logits + Loss
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 bce_logits = embedder.forward_with_decoder(batch)  # [B, T, V]
+            bce_logits = bce_logits.float()
 
             # build legality with teacher forcing (same LUTs as phase-2)
             illegal = compute_legality_masks_tf(
@@ -525,6 +526,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                                                     batch,
                                                     mlm_mask=mlm_mask,
                                                     masked_pos_ids=masked_pos_ids)
+            mlm_logits = mlm_logits.float()
             mlm_labels = batch["position_ids"][mlm_mask]          # ground truth
             mlm_raw = F.cross_entropy(
                 mlm_logits,
@@ -539,6 +541,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             nonpad = (batch["position_ids"] != embedder.padding_idx)  # [B,T]
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
                 pred_t = embedder.predict_time(batch["abs_ts"])            # [B,T,1]
+            pred_t = pred_t.float()
             dt_raw = F.mse_loss(
                 pred_t.squeeze(-1)[nonpad],                            # [N_real]
                 batch["abs_ts"][nonpad],                               # [N_real]

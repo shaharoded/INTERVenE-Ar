@@ -763,6 +763,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
     train_losses, val_losses = [], []
 
+    grad_accum_steps = training_settings.get("grad_accumulation_steps", 1)
+
     def run_epoch(loader, epoch, train_flag=False):
         if train_flag:
             model.train()
@@ -771,6 +773,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
         total_loss = total_bce = total_ce = total_outcome = total_dt = 0.0
         total_ce_raw = total_outcome_raw = total_dt_raw = 0.0
+        accum_step = 0
+        if train_flag:
+            optimizer.zero_grad()
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -798,6 +803,10 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                         abs_ts=batch["abs_ts"],
                         context_vec=batch["context_vec"]
                     )
+                logits = logits.float()
+                abs_t_pred = abs_t_pred.float()
+                outcome_logits = outcome_logits.float()
+                dt_gate_logit = dt_gate_logit.float()
 
                 # logits is [B, T, V]
                 # abs_t_pred: [B, T]
@@ -926,11 +935,13 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
                 # === Backprop and Log ===
                 if train_flag:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    scheduler.update()
+                    (loss / grad_accum_steps).backward()
+                    accum_step += 1
+                    if accum_step % grad_accum_steps == 0:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        scheduler.update()
+                        optimizer.zero_grad()
                 # Update loss
                 total_loss    += loss.item()
                 total_bce     += loss_bce.item()
@@ -940,7 +951,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce_raw      += loss_ce_raw.item()
                 total_outcome_raw += loss_outcome_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
-        
+
+        # Flush any remaining accumulated gradients at end of epoch
+        if train_flag and accum_step % grad_accum_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.update()
+            optimizer.zero_grad()
+
         n_batches = len(loader)
 
         return (
@@ -1117,6 +1135,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     abs_ts=batch["abs_ts"],
                     context_vec=batch["context_vec"],
                 )
+                outcome_logits = outcome_logits.float()
 
                 full_targets = batch["position_ids"]           # [B, T]
                 outcome_pred = outcome_logits[:, :-1, :]       # [B, T-1, K]
