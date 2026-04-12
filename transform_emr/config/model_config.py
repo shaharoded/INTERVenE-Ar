@@ -20,9 +20,9 @@ MODEL_CONFIG = {
     }
 
 TRAINING_SETTINGS = {
-    "phase1_n_epochs": 10,
-    "phase2_n_epochs": 10,
-    "phase3_n_epochs": 10,
+    "phase1_n_epochs": 50,
+    "phase2_n_epochs": 50,
+    "phase3_n_epochs": 50,
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.

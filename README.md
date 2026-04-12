@@ -303,7 +303,7 @@ The training flow uses warmup/curriculum scheduling (LR warmup, BCE-only phase, 
 | `_update_legality_state()` | Mutates interval open-counts and advances meal-order rank after each generated token. |
 | `_decode_token_components()` | Decodes a position-token string into `(concept_id, value_id)` for feeding back into the model. |
 
-NOTE: Inference is step-by-step (not batched), so it is significantly slower than training.
+NOTE: Inference is step-by-step (not batched), so it is significantly slower than training. With that being said, model uses batch inference (multiple patients at the same time), KV cache (reduces per-step work from O(T·d²) to O(d²)) and FP16 quantization, all together significantly helps the inference speed.
 ---
 
 ### 5. **`evaluation.ipynb`** – Risk-based complication prediction evaluation.

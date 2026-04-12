@@ -461,6 +461,8 @@ def build_luts(tokenizer):
         "base_id":  base_id,
         "meal_rank":      meal_rank,
         "meal_pred_rank": meal_pred_rank,
+        "tok2concept": tok2concept,   # Long[V], -1 if no concept mapping
+        "tok2value":   tok2value,     # Long[V], -1 if no value mapping
 
         # per-base
         "start_ids_per_base": start_ids_per_base,
@@ -474,6 +476,245 @@ def build_luts(tokenizer):
         "forbid_mask_ids": forbid_mask_ids,
         "predict_block": predict_block
     }
+
+
+def init_legality_state_batched(luts: dict, position_ids: torch.LongTensor):
+    """
+    Compute initial batched legality state from a seed sequence (may be padded).
+
+    Mirrors the per-token scalar state in the old inference helpers but fully vectorized.
+    Padding tokens (base_id == -1, meal_rank == -1) are ignored automatically.
+
+    Args:
+        luts: dict returned by build_luts(), already on the target device.
+        position_ids: [B, T_seed] — may include right-padding with pad_token_id.
+
+    Returns:
+        open_counts  : LongTensor [B, nb]  — net open count per interval base.
+        next_meal_rank: LongTensor [B]     — required next meal rank (-1 = no meal seen yet,
+                                             any meal is allowed as the first one).
+    """
+    device = position_ids.device
+    B, T  = position_ids.shape
+    nb    = luts["start_ids_per_base"].numel()
+    K     = int(luts["K_meals"].item())
+
+    # ── interval open counts ──────────────────────────────────────────────────
+    tok_base = luts["base_id"][position_ids]   # [B, T], -1 for non-interval / pad
+    tok_s    = luts["is_start"][position_ids]  # [B, T]
+    tok_e    = luts["is_end"  ][position_ids]  # [B, T]
+
+    valid        = tok_base >= 0
+    scatter_idx  = tok_base.clamp(min=0)       # avoid -1 index; gated by `valid`
+
+    start_oh = torch.zeros(B, T, nb, dtype=torch.int32, device=device)
+    end_oh   = torch.zeros(B, T, nb, dtype=torch.int32, device=device)
+    b_idx    = torch.arange(B, device=device)[:, None]
+    t_idx    = torch.arange(T, device=device)[None, :]
+    start_oh[b_idx, t_idx, scatter_idx] = (tok_s & valid).to(torch.int32)
+    end_oh  [b_idx, t_idx, scatter_idx] = (tok_e & valid).to(torch.int32)
+
+    open_counts = (start_oh.sum(dim=1) - end_oh.sum(dim=1)).clamp(min=0).long()  # [B, nb]
+
+    # ── meal cycle state ──────────────────────────────────────────────────────
+    next_meal_rank = torch.full((B,), -1, dtype=torch.long, device=device)
+    if K > 0:
+        mr      = luts["meal_rank"][position_ids]          # [B, T], -1 for non-meal
+        is_meal = mr >= 0                                   # [B, T]
+        if is_meal.any():
+            # Find the LAST meal position per batch item (vectorized argmax trick).
+            t_range  = torch.arange(T, dtype=torch.float32, device=device)
+            weighted = torch.where(is_meal, t_range.unsqueeze(0), torch.full_like(t_range, -1.0).unsqueeze(0))
+            last_t   = weighted.argmax(dim=1)              # [B]
+            has_meal = is_meal.any(dim=1)                  # [B]
+            last_rank = mr[torch.arange(B, device=device), last_t]   # [B]
+            next_meal_rank = torch.where(
+                has_meal,
+                (last_rank + 1) % K,
+                torch.full((B,), -1, dtype=torch.long, device=device)
+            )
+
+    return open_counts, next_meal_rank
+
+
+def build_illegal_mask_batched(luts: dict, open_counts: torch.LongTensor,
+                                next_meal_rank: torch.LongTensor,
+                                pad_id: int, mask_id: int) -> torch.BoolTensor:
+    """
+    Build a [B, V] illegal-token mask for the *next* generation step, given the
+    current batched legality state.
+
+    This is the batched, stateful counterpart to the scalar ``_build_illegal_mask``
+    that was previously inlined in inference.py.
+
+    Args:
+        luts           : dict from build_luts(), on the correct device.
+        open_counts    : LongTensor [B, nb] — net open-count per interval base.
+        next_meal_rank : LongTensor [B]     — required meal rank (-1 = free choice).
+        pad_id, mask_id: always-illegal special tokens.
+
+    Returns:
+        BoolTensor [B, V], True → token is illegal for that batch item.
+    """
+    device  = open_counts.device
+    B       = open_counts.shape[0]
+    V       = int(luts["is_start"].numel())
+    nb      = int(luts["start_ids_per_base"].numel())
+    K       = int(luts["K_meals"].item())
+
+    illegal = torch.zeros(B, V, dtype=torch.bool, device=device)
+
+    closed = open_counts <= 0   # [B, nb]
+    opened = open_counts  > 0   # [B, nb]
+
+    # 1) END illegal when its base is not open
+    end_ids_pb  = luts["end_ids_per_base"]    # [nb]
+    valid_end   = end_ids_pb >= 0             # [nb]
+    if valid_end.any() and closed.any():
+        mask           = closed & valid_end.unsqueeze(0)     # [B, nb]
+        b_idx, nb_idx  = mask.nonzero(as_tuple=True)
+        if b_idx.numel():
+            illegal[b_idx, end_ids_pb[nb_idx]] = True
+
+    # 2) START illegal when its base is already open (duplicate start)
+    start_ids_pb = luts["start_ids_per_base"]   # [nb]
+    valid_start  = start_ids_pb >= 0
+    if valid_start.any() and opened.any():
+        mask           = opened & valid_start.unsqueeze(0)   # [B, nb]
+        b_idx, nb_idx  = mask.nonzero(as_tuple=True)
+        if b_idx.numel():
+            illegal[b_idx, start_ids_pb[nb_idx]] = True
+
+    # 3) Conflict: START of another value of an already-open concept
+    conf_mat = luts["conflict_mat"]   # [nb, nb]
+    if valid_start.any() and opened.any() and conf_mat.any():
+        oc              = opened.to(torch.float32)             # [B, nb]
+        conflict_active = (oc @ conf_mat.to(torch.float32)) > 0   # [B, nb]
+        mask            = conflict_active & valid_start.unsqueeze(0)
+        b_idx, nb_idx   = mask.nonzero(as_tuple=True)
+        if b_idx.numel():
+            illegal[b_idx, start_ids_pb[nb_idx]] = True
+
+    # 4) Meal cycle
+    if K > 0:
+        meal_rank    = luts["meal_rank"]        # [V]
+        is_meal_tok  = meal_rank >= 0           # [V]
+        if is_meal_tok.any():
+            meal_v_ids   = is_meal_tok.nonzero(as_tuple=False).squeeze(-1)  # [n_meals]
+            meal_v_ranks = meal_rank[meal_v_ids]                             # [n_meals]
+            # Patients that have seen at least one meal must follow the cycle
+            has_seen     = next_meal_rank >= 0                               # [B]
+            if has_seen.any():
+                required     = next_meal_rank[has_seen].unsqueeze(1)         # [B_act, 1]
+                ok           = meal_v_ranks.unsqueeze(0) == required         # [B_act, n_meals]
+                b_active     = has_seen.nonzero(as_tuple=False).squeeze(-1)  # [B_act]
+                bad_b, bad_v = (~ok).nonzero(as_tuple=True)
+                if bad_b.numel():
+                    illegal[b_active[bad_b], meal_v_ids[bad_v]] = True
+
+    # 5) Always block pad / mask tokens
+    illegal[:, pad_id]  = True
+    illegal[:, mask_id] = True
+
+    return illegal
+
+
+def update_legality_state_batched(luts: dict, next_token_ids: torch.LongTensor,
+                                   open_counts: torch.LongTensor,
+                                   next_meal_rank: torch.LongTensor,
+                                   finished: torch.BoolTensor):
+    """
+    Update open_counts and next_meal_rank in-place after a batch generation step.
+
+    Finished patients are skipped so their state stays frozen.
+
+    Args:
+        luts            : dict from build_luts(), on the correct device.
+        next_token_ids  : LongTensor [B] — the token chosen for each batch item.
+        open_counts     : LongTensor [B, nb] — mutated in-place.
+        next_meal_rank  : LongTensor [B]     — mutated in-place.
+        finished        : BoolTensor [B]     — True for already-finished patients.
+
+    Returns:
+        (open_counts, next_meal_rank) — same tensors, updated in-place.
+    """
+    K      = int(luts["K_meals"].item())
+    device = next_token_ids.device
+    B      = next_token_ids.shape[0]
+
+    active     = ~finished
+    active_idx = active.nonzero(as_tuple=False).view(-1)   # [B_act]
+    if active_idx.numel() == 0:
+        return open_counts, next_meal_rank
+
+    active_toks = next_token_ids[active_idx]  # [B_act]
+
+    # ── interval state ────────────────────────────────────────────────────────
+    is_s   = luts["is_start"][active_toks]   # [B_act]
+    is_e   = luts["is_end"  ][active_toks]   # [B_act]
+    b_ids  = luts["base_id" ][active_toks]   # [B_act], -1 if not interval
+    valid  = b_ids >= 0
+
+    start_mask = is_s & valid
+    if start_mask.any():
+        bi = active_idx[start_mask]
+        ba = b_ids[start_mask]
+        open_counts.index_put_((bi, ba),
+                               torch.ones(start_mask.sum(), dtype=open_counts.dtype, device=device),
+                               accumulate=True)
+
+    end_mask = is_e & valid
+    if end_mask.any():
+        bi = active_idx[end_mask]
+        ba = b_ids[end_mask]
+        open_counts.index_put_((bi, ba),
+                               torch.full((end_mask.sum(),), -1, dtype=open_counts.dtype, device=device),
+                               accumulate=True)
+        open_counts.clamp_(min=0)
+
+    # ── meal cycle ────────────────────────────────────────────────────────────
+    if K > 0:
+        mr       = luts["meal_rank"][active_toks]   # [B_act]
+        is_meal  = mr >= 0
+        if is_meal.any():
+            meal_active = active_idx[is_meal]
+            next_meal_rank[meal_active] = (mr[is_meal] + 1) % K
+
+    return open_counts, next_meal_rank
+
+
+def build_rep_penalty_batched(last_tokens_batch: list, V: int,
+                               window: int = 5, strength: float = 0.6,
+                               device=None) -> torch.Tensor:
+    """
+    Batched repetition-penalty vector for inference.
+
+    Vectorised version of build_rep_penalty for a whole batch of patients.
+
+    Args:
+        last_tokens_batch : List[List[int]], one list per patient (newest last).
+        V                 : Vocabulary size.
+        window, strength  : Same semantics as build_rep_penalty.
+        device            : Target device.
+
+    Returns:
+        FloatTensor [B, V].
+    """
+    B   = len(last_tokens_batch)
+    rep = torch.zeros(B, V, device=device)
+    if strength <= 0 or all(not t for t in last_tokens_batch):
+        return rep
+
+    decay = torch.linspace(1.0, 0.2, steps=window, device=device)  # newest=1.0
+
+    for b, last_toks in enumerate(last_tokens_batch):
+        if not last_toks:
+            continue
+        k   = min(window, len(last_toks))
+        idx = torch.tensor(last_toks[-k:], dtype=torch.long, device=device)
+        rep[b].index_add_(0, idx.flip(0), decay[:k])
+
+    return rep * strength
 
 
 def compute_legality_masks_tf(position_ids: torch.LongTensor,

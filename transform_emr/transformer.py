@@ -55,7 +55,23 @@ class CausalSelfAttention(nn.Module):
         x1, x2 = x[..., :half], x[..., half:]
         return torch.cat([x1 * cos_t - x2 * sin_t, x2 * cos_t + x1 * sin_t], dim=-1)
 
-    def forward(self, x, key_pad_mask=None, abs_ts=None):
+    def forward(self, x, key_pad_mask=None, abs_ts=None, past_kv=None, use_cache=False):
+            """
+            Args:
+                x            : [B, T, C]
+                key_pad_mask : [B, T_kv] bool (True=keep).  For normal forward T_kv==T;
+                               for KV-cache decode it spans the full cached+new key sequence.
+                abs_ts       : [B, T] absolute timestamps for temporal RoPE.
+                past_kv      : (k_cache, v_cache) each [B, n_head, T_past, hd].
+                               When provided, x must be only the *new* tokens (T typically 1).
+                               New K/V are appended and the full sequence is used for attention.
+                use_cache    : If True, return (output, (k_full, v_full)) instead of just output.
+
+            Returns:
+                y            : [B, T, C]
+                (k_full, v_full) : only when use_cache=True — updated KV cache tensors,
+                                   each [B, n_head, T_past+T, hd].
+            """
             B, T, C = x.shape
             qkv = self.qkv(x)                      # [B, T, 3C]
             q, k, v = qkv.split(C, dim=-1)         # each [B, T, C]
@@ -66,12 +82,40 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
             v = v.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
 
-            # Apply temporal RoPE to Q and K (no extra memory, no T×T matrix)
+            # Apply temporal RoPE to Q and K.
+            # NOTE: when past_kv is provided, abs_ts contains only the NEW token timestamps.
+            # Past K values are already pre-rotated in the cache — valid because each K_i was
+            # rotated by its own timestamp when first computed.
             if abs_ts is not None:
                 q = self._apply_temporal_rope(q, abs_ts)
                 k = self._apply_temporal_rope(k, abs_ts)
 
-            if key_pad_mask is not None:
+            # ── KV-cache decode path ──────────────────────────────────────────
+            if past_kv is not None:
+                k_past, v_past = past_kv
+                k = torch.cat([k_past, k], dim=2)   # [B, h, T_past+T, hd]
+                v = torch.cat([v_past, v], dim=2)
+
+                # key_pad_mask covers the full [T_past+T] key sequence.
+                # Q [B, h, T, hd] attends to all past+new keys — no causal mask needed
+                # since T is the newest position(s) and everything in cache is older.
+                if key_pad_mask is not None:
+                    T_kv      = k.shape[2]
+                    pad_m     = (~key_pad_mask).unsqueeze(1).unsqueeze(2)    # [B,1,1,T_kv]
+                    attn_mask = torch.zeros(B, 1, T, T_kv, device=x.device, dtype=q.dtype)
+                    attn_mask.masked_fill_(pad_m, float("-inf"))
+                    attn = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, is_causal=False,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    )
+                else:
+                    attn = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=None, is_causal=False,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    )
+
+            # ── Normal (prefill / training) path ─────────────────────────────
+            elif key_pad_mask is not None:
                 # --- Manual Masking Path (Required when padding is present) ---
                 # SDPA throws RuntimeError if we pass both attn_mask and is_causal=True.
                 # We must construct a combined mask [B, 1, T, T] containing both:
@@ -81,14 +125,14 @@ class CausalSelfAttention(nn.Module):
                 # 1. Padding Mask: [B, 1, 1, T] -> Broadcast to [B, 1, T, T]
                 # key_pad_mask is True(Keep), False(Pad). ~key_pad_mask is True(Mask Out).
                 padding_mask = (~key_pad_mask).unsqueeze(1).unsqueeze(2)
-                
-                # 2. Causal Mask: [1, 1, T, T] 
+
+                # 2. Causal Mask: [1, 1, T, T]
                 # triu(1) gives upper triangle (future) as True -> Mask Out.
                 causal_mask = torch.ones((T, T), device=x.device, dtype=torch.bool).triu(1).view(1, 1, T, T)
-                
+
                 # 3. Combine: Mask out if it's Padding OR Future
                 combined_mask = padding_mask | causal_mask
-                
+
                 # 4. Convert to float mask for SDPA (-inf for mask, 0.0 for keep)
                 # Using zeros_like ensures we match dtype (e.g. float16/bfloat16)
                 attn_mask = torch.zeros_like(combined_mask, dtype=q.dtype).masked_fill(combined_mask, float("-inf"))
@@ -111,7 +155,11 @@ class CausalSelfAttention(nn.Module):
 
             y = attn.transpose(1, 2).contiguous().view(B, T, C)         # -> [B, T, C]
             y = self.proj(y)
-            return self.resid_dropout(y)
+            y = self.resid_dropout(y)
+
+            if use_cache:
+                return y, (k, v)
+            return y
 
 
 class MLP(nn.Module):
@@ -181,25 +229,36 @@ class AdaLNBlock(nn.Module):
             nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, cond_emb, key_pad_mask=None, abs_ts=None):
+    def forward(self, x, cond_emb, key_pad_mask=None, abs_ts=None, past_kv=None, use_cache=False):
         """
         Calculate modulation parameters [B, 6*D] -> 6 x [B, D] (broadcast over T)
         x: [B, T, D]
         cond_emb: [B, D] (Patient Context)
+        past_kv / use_cache: threaded through to CausalSelfAttention for KV caching.
+
+        Returns:
+            x             : [B, T, D]
+            (k_full, v_full) : only when use_cache=True.
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(cond_emb).chunk(6, dim=1)
         )
 
         # -- Attention Sub-block --
-        # modulate(ln(x))
-        norm_x = self.ln1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        x = x + gate_msa.unsqueeze(1) * self.att(norm_x, key_pad_mask=key_pad_mask, abs_ts=abs_ts)
+        norm_x   = self.ln1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        attn_out = self.att(norm_x, key_pad_mask=key_pad_mask, abs_ts=abs_ts,
+                            past_kv=past_kv, use_cache=use_cache)
+        if use_cache:
+            attn_out, new_kv = attn_out
+
+        x = x + gate_msa.unsqueeze(1) * attn_out
 
         # -- MLP Sub-block --
         norm_x = self.ln2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(norm_x)
 
+        if use_cache:
+            return x, new_kv
         return x
 
 
@@ -422,7 +481,76 @@ class GPT(nn.Module):
         abs_t_pred = abs_ts + delta_pos                # [B, T]
 
         return logits, abs_t_pred, outcome_logits, gate_logit
-    
+
+
+    @torch.no_grad()
+    def forward_with_cache(self, parent_raw_ids, concept_ids, value_ids, position_ids,
+                           abs_ts, context_vec, past_kvs=None, cache_key_pad_mask=None):
+        """
+        KV-cache-aware forward pass for efficient batched autoregressive decoding.
+
+        Two modes
+        ---------
+        **Prefill** (``past_kvs=None``) — process the full seed sequence, same as ``forward()``.
+            All inputs are [B, T_seed, …].  Returns per-layer KV caches and the full logits
+            so the caller can extract logits at the last *valid* position of each sequence.
+
+        **Decode** (``past_kvs`` provided) — process a single new token per patient.
+            All inputs are [B, 1, …].  The new token's K/V are appended to each layer's cache
+            and only the new position's logits are returned.
+
+        In both modes the return signature is identical:
+            logits          [B, T_out, V]
+            abs_t_pred      [B, T_out]        predicted time for the *next* event
+            outcome_logits  [B, T_out, K]
+            gate_logit      [B, T_out]
+            new_kvs         List[Tuple[Tensor, Tensor]]  — one (k, v) per transformer layer
+                            k/v shape [B, n_head, T_past+T_out, hd]
+
+        where T_out == T_seed during prefill, and T_out == 1 during decode.
+
+        Args:
+            parent_raw_ids     : [B, T, P]
+            concept_ids        : [B, T]
+            value_ids          : [B, T]
+            position_ids       : [B, T]
+            abs_ts             : [B, T]
+            context_vec        : [B, ctx_dim]
+            past_kvs           : None | List[Tuple[k, v]]  (one tuple per layer)
+            cache_key_pad_mask : [B, T_past+T] bool (True=valid).  Only used in decode mode.
+                                 During prefill the pad mask is derived from position_ids.
+        """
+        is_decode = past_kvs is not None
+
+        # 1. Embed
+        x, cond_emb, pad_mask = self.embedder(
+            parent_raw_ids, concept_ids, value_ids, position_ids,
+            abs_ts, context_vec, return_mask=True
+        )
+        x = self.drop(x)
+
+        # 2. Blocks — collect new KV caches from every layer
+        new_kvs = []
+        for i, blk in enumerate(self.blocks):
+            pk  = past_kvs[i] if is_decode else None
+            kpm = cache_key_pad_mask if is_decode else pad_mask
+            x, new_kv = blk(x, cond_emb, key_pad_mask=kpm, abs_ts=abs_ts,
+                            past_kv=pk, use_cache=True)
+            new_kvs.append(new_kv)
+
+        x = self.ln_f(x)
+
+        # 3. Heads
+        logits         = self.lm_head(x)
+        outcome_logits = self.outcome_head(x)
+
+        gate_logit = self.dt_gate(x).squeeze(-1)
+        mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
+        delta_pos  = torch.sigmoid(gate_logit) * mag_pos
+        abs_t_pred = abs_ts + delta_pos
+
+        return logits, abs_t_pred, outcome_logits, gate_logit, new_kvs
+
 
     def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None,
              lambda_schedule_state=None, training_settings=None, bad_epochs=0):
@@ -537,7 +665,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         training_settings (dict): A settings dictionary, imported from model_config.
 
     Returns:
-        None. Saves model checkpoints and plots training curves.
+        tuple: (model, train_losses, val_losses)
+        Saves model checkpoints and plots training curves.
 
     NOTE: Despite intention, this function currently not implementing curriculum. in order to do so, one must add after 
     pred_ids are calculated (in run_epoch) the following additions:
@@ -872,6 +1001,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             # If warmup isn't complete - do nothing.
             continue
+
+    plot_losses(train_losses, val_losses)
+    return model, train_losses, val_losses
 
 
 def finetune_transformer(model, train_dl, val_dl, resume=True,
