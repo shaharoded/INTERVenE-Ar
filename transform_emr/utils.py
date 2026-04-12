@@ -55,6 +55,8 @@ def get_temporal_multi_hot_targets(
 
     # GPU-friendly searchsorted + prefix-sum approach (O(B * T * log T) instead of O(B * T^2)).
     # Assumes timestamps are sorted; violation will produce incorrect results silently.
+    all_abs_ts = all_abs_ts.contiguous()
+    query_abs_ts = query_abs_ts.contiguous()
     left_idx = torch.searchsorted(all_abs_ts, query_abs_ts, right=True)
     right_idx = torch.searchsorted(all_abs_ts, query_abs_ts + window_size, right=True)
 
