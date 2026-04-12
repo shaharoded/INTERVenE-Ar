@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import pandas as pd
@@ -34,7 +35,8 @@ class DataProcessor:
                  tak_repo_path='transform_emr/config/tak_repo.pkl', 
                  max_input_days=None, 
                  scaler=None, 
-                 checkpoint_path=CHECKPOINT_PATH):
+                 checkpoint_path=CHECKPOINT_PATH,
+                 inclusion_exclusion_criteria=None):
         # Load TAK repository from JSON
         if not tak_repo_path.endswith('.json'):
             raise ValueError(f"TAK repo must be a JSON file, got: {tak_repo_path}")
@@ -61,9 +63,16 @@ class DataProcessor:
         self.max_input_days = max_input_days
         self.scaler = scaler
         self.checkpoint_path = checkpoint_path
+        self.inclusion_exclusion_criteria = (
+            INCLUSION_EXCLUSION_CRITERIA
+            if inclusion_exclusion_criteria is None
+            else inclusion_exclusion_criteria
+        )
 
 
     def run(self):
+        self._apply_inclusion_exclusion_criteria()
+
         # Process on temporal_df
         self._validate_and_align_inputs()
         self._fix_back_to_back_intervals()
@@ -81,6 +90,81 @@ class DataProcessor:
         self.context_df = self.context_df.set_index("PatientId").drop(columns=["PatientId"], errors="ignore").astype("float32")
         self._fit_scaler()
         return self.df, self.context_df
+
+    def _apply_inclusion_exclusion_criteria(self):
+        """
+        Apply SQL-like inclusion/exclusion filters from INCLUSION_EXCLUSION_CRITERIA.
+
+        Supported condition format:
+            WHERE <column> LIKE '<pattern>'
+            WHERE <column> NOT LIKE '<pattern>'
+
+        Notes:
+            - `WHERE` is optional.
+            - `%` is treated as wildcard (0+ chars).
+            - `_` is treated as a literal underscore.
+        """
+        criteria = self.inclusion_exclusion_criteria or {}
+        if not isinstance(criteria, dict):
+            raise ValueError("inclusion_exclusion_criteria must be a dict with 'temporal'/'context' keys")
+
+        temporal_criteria = criteria.get("temporal", [])
+        context_criteria = criteria.get("context", [])
+
+        self.df = self._apply_sql_like_filters(self.df, temporal_criteria, source_name="temporal")
+        self.context_df = self._apply_sql_like_filters(self.context_df, context_criteria, source_name="context")
+
+    @staticmethod
+    def _apply_sql_like_filters(df: pd.DataFrame, conditions: List[str], source_name: str) -> pd.DataFrame:
+        """Apply a list of SQL-like WHERE ... LIKE/NOT LIKE filters to a dataframe."""
+        if not conditions:
+            return df
+
+        if not isinstance(conditions, list):
+            raise ValueError(f"Criteria for '{source_name}' must be a list of condition strings")
+
+        out_df = df.copy()
+        pattern = re.compile(
+            r"^\s*(?:WHERE\s+)?(?P<column>[A-Za-z_]\w*)\s+(?P<op>NOT\s+LIKE|LIKE)\s+['\"](?P<like_pattern>[^'\"]+)['\"]\s*$",
+            flags=re.IGNORECASE,
+        )
+
+        for cond in conditions:
+            if not cond or not str(cond).strip():
+                continue
+
+            match = pattern.match(str(cond))
+            if not match:
+                raise ValueError(
+                    f"Invalid condition format for '{source_name}': {cond}. "
+                    "Expected: WHERE <column> LIKE '<pattern>' or WHERE <column> NOT LIKE '<pattern>'"
+                )
+
+            column = match.group("column")
+            op = match.group("op").upper().replace("  ", " ")
+            like_pattern = match.group("like_pattern")
+
+            if column not in out_df.columns:
+                raise ValueError(
+                    f"Condition references unknown column '{column}' in '{source_name}' dataframe"
+                )
+
+            regex = "^" + re.escape(like_pattern).replace("%", ".*") + "$"
+            col_as_str = out_df[column].astype(str)
+            matches = col_as_str.str.match(regex, na=False)
+
+            before_n = len(out_df)
+            if op == "LIKE":
+                out_df = out_df[matches].copy()
+            elif op == "NOT LIKE":
+                out_df = out_df[~matches].copy()
+            else:
+                raise ValueError(f"Unsupported operator '{op}' in condition: {cond}")
+
+            after_n = len(out_df)
+            print(f"[DataProcessor] Applied {source_name} filter: {cond} | rows {before_n} -> {after_n}")
+
+        return out_df
 
     def _fit_scaler(self):
         """
