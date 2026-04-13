@@ -337,7 +337,7 @@ def infer_event_stream(model,
                 v_ids_new = luts["tok2value"][next_token_ids].clamp(min=0)
                 v_ids_new[luts["tok2value"][next_token_ids] < 0] = mask_id
 
-                par_new = tok.tokenid2parent_raw_ids[next_token_ids].to(device)  # [B, P]
+                par_new = tok.tokenid2parent_raw_ids[next_token_ids.cpu()].to(device)  # [B, P]
                 # Finished patients get PAD token input (output ignored)
                 par_new[finished] = tok.tokenid2parent_raw_ids[pad_id].to(device)
                 c_ids_new[finished] = pad_id
@@ -561,7 +561,7 @@ def generate_risk_curves(model,
                 v_ids_new = luts["tok2value"][next_token_ids].clamp(min=0)
                 v_ids_new[luts["tok2value"][next_token_ids] < 0] = mask_id
 
-                par_new = tok.tokenid2parent_raw_ids[next_token_ids].to(device)
+                par_new = tok.tokenid2parent_raw_ids[next_token_ids.cpu()].to(device)
                 par_new[finished] = tok.tokenid2parent_raw_ids[pad_id].to(device)
                 c_ids_new[finished] = pad_id
                 v_ids_new[finished] = pad_id
