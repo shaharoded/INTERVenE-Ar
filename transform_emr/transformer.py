@@ -777,7 +777,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         if train_flag:
             optimizer.zero_grad()
         with torch.set_grad_enabled(train_flag):
-            for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
+            for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
                 # === Apply CBM on training batchs ===
@@ -1124,7 +1124,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         total_loss = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
-                              leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
+                              leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
                 _, _, outcome_logits, _ = model(

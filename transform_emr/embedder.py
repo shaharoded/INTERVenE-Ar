@@ -469,7 +469,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         total_loss, total_bce, total_dt, total_mlm = 0.0, 0.0, 0.0, 0.0
         total_dt_raw, total_mlm_raw = 0.0, 0.0
 
-        for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
+        for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
             batch = {k: v.to(device) for k, v in batch.items()}
             
             if train_flag:
