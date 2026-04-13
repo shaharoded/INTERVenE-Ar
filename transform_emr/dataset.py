@@ -1,15 +1,15 @@
 import os
 import re
+import random
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Sampler
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from joblib import dump
-import pickle
 import json
 import numpy as np
 from collections import Counter
-from typing import Dict, Optional, List
+from typing import List
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import *
@@ -934,6 +934,8 @@ class EMRDataset(Dataset):
 def collate_emr(batch, pad_token_id=0):
     """
     Collates a batch of patient EMR sequences into padded tensors.
+    All patient's trajectories in the batch are padded to the same length (max_len) and max parent count (max_p).
+    This makes the common 'block_size' concept from NLP less meaningful, as we want to preserve as much temporal information as possible.
 
     ASSUMES: Each patient sequence in the batch is already SORTED by TimePoint (ascending).
     This sorting is performed in DataProcessor._expand_tokens() and is maintained by EMRDataset.__getitem__().
@@ -986,15 +988,57 @@ def collate_emr(batch, pad_token_id=0):
     }
 
 
+class BucketBatchSampler(Sampler):
+    """
+    Groups patients by sequence length into buckets, then yields batches
+    from within the same bucket. This minimises padding waste inside each
+    batch without changing which patients are seen per epoch.
+
+    Patients are sorted into `n_buckets` equal-width length buckets. Within
+    each bucket the order is shuffled every epoch so the model never sees
+    the same batch composition twice.
+    """
+    def __init__(self, dataset: "EMRDataset", batch_size: int, n_buckets: int = 20, drop_last: bool = False):
+        self.batch_size = batch_size
+        self.drop_last  = drop_last
+
+        lengths = [len(dataset.patient_groups[pid]) for pid in dataset.patient_ids]
+        indices = list(range(len(lengths)))
+
+        # sort indices by length, then split into n_buckets
+        indices.sort(key=lambda i: lengths[i])
+        bucket_size = max(1, len(indices) // n_buckets)
+        self.buckets = [indices[i: i + bucket_size] for i in range(0, len(indices), bucket_size)]
+
+    def __iter__(self):
+        # shuffle within each bucket, then collect all batches and shuffle batch order
+        all_batches = []
+        for bucket in self.buckets:
+            shuffled = bucket.copy()
+            random.shuffle(shuffled)
+            for i in range(0, len(shuffled), self.batch_size):
+                batch = shuffled[i: i + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                all_batches.append(batch)
+        random.shuffle(all_batches)
+        yield from all_batches
+
+    def __len__(self):
+        if self.drop_last:
+            return sum(len(b) // self.batch_size for b in self.buckets)
+        return sum((len(b) + self.batch_size - 1) // self.batch_size for b in self.buckets)
+
+
 def get_dataloader(
         dataset,
         batch_size: int,
         collate_fn,
         *,
         oversample: bool = False,
+        bucket_batching: bool = False,
         num_workers: int = None,
         replacement: bool = True,
-        class_weights: Optional[Dict] = None,
 ):
     """
     Build a DataLoader for an EMRDataset.
@@ -1004,32 +1048,15 @@ def get_dataloader(
     if num_workers is None:
         num_workers = min(os.cpu_count(), 4) if torch.cuda.is_available() else 0
 
-    # ---------- helper ----------
-    def _label_visit(token_df, tokenizer):
-        """
-        Return an int label per patient trajectory:
-
-            0 = DEATH present
-            1 = ≥1 COMPLICATION present (no DEATH)
-            2 = RELEASE present only
-            3 = OTHER / still-in-hospital (no terminal/outcome token)
-
-        These labels feed a WeightedRandomSampler so that DEATH and COMPLICATION
-        patients are drawn more often without duplicating rows.
-        """
-        ids = set(token_df["PositionID"].tolist())
-        tid = tokenizer.token2id
-
-        if tid[DEATH_TOKEN] in ids:
-            return 0
-        if any(tid.get(c) in ids for c in OUTCOMES if c in tid):
-            return 1 
-        if tid[RELEASE_TOKEN] in ids:
-            return 2
-        return 3          # no terminal/outcome yet
-
     # ---------- no oversampling ----------
     if not oversample:
+        if bucket_batching:
+            sampler = BucketBatchSampler(dataset, batch_size=batch_size)
+            return DataLoader(dataset,
+                              batch_sampler=sampler,
+                              collate_fn=collate_fn,
+                              num_workers=num_workers,
+                              pin_memory=torch.cuda.is_available())
         return DataLoader(dataset,
                           batch_size=batch_size,
                           shuffle=True,
@@ -1038,15 +1065,28 @@ def get_dataloader(
                           pin_memory=torch.cuda.is_available())
 
     # ---------- build sample weights ----------
-    labels = [_label_visit(dataset.patient_groups[pid], dataset.tokenizer)
-              for pid in dataset.patient_ids]
+    # Each patient weight = sum of (n_patients / outcome_count) for each outcome
+    # they have. Patients with multiple rare outcomes get higher weights.
+    # DEATH also contributes as a terminal outcome.
+    tid = dataset.tokenizer.token2id
+    all_outcome_tokens = [o for o in OUTCOMES + [DEATH_TOKEN] if o in tid]
 
-    if class_weights is None:
-        counts = Counter(labels)
-        class_weights = {c: 1.0 / max(1, n) for c, n in counts.items()}
+    outcome_counts: Counter = Counter()
+    patient_outcome_sets = []
+    for pid in dataset.patient_ids:
+        ids = set(dataset.patient_groups[pid]["PositionID"].tolist())
+        present = frozenset(o for o in all_outcome_tokens if tid[o] in ids)
+        patient_outcome_sets.append(present)
+        outcome_counts.update(present)
 
-    sample_w = torch.tensor([class_weights[l] for l in labels],
-                            dtype=torch.float32)
+    n_patients = len(dataset.patient_ids)
+    outcome_inv_freq = {o: n_patients / max(1, outcome_counts[o]) for o in all_outcome_tokens}
+
+    sample_w = torch.tensor(
+        [max(1.0, sum(outcome_inv_freq[o] for o in present))
+         for present in patient_outcome_sets],
+        dtype=torch.float32,
+    )
 
     sampler = WeightedRandomSampler(sample_w,
                                     num_samples=len(sample_w),

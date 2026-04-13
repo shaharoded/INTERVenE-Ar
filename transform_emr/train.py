@@ -108,9 +108,9 @@ def prepare_data(sample=False):
     MODEL_CONFIG["ctx_dim"] = int(train_ds.context_df.shape[1])
     print(f"[Pre-processing]: Auto-set MODEL_CONFIG['ctx_dim'] = {MODEL_CONFIG['ctx_dim']}")
 
-    embedder_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False) # Regular, no shuffle
+    embedder_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False, bucket_batching=True)
     transformer_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=True) # Balanced batches
-    val_dl = get_dataloader(val_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False) # Regular, no shuffle
+    val_dl = get_dataloader(val_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False, bucket_batching=True)
     return embedder_train_dl, transformer_train_dl, val_dl, tokenizer
 
 def phase_one(embedder, train_dl, val_dl, resume=True):

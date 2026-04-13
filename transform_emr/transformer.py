@@ -273,7 +273,7 @@ class GPT(nn.Module):
 
     Parameters
     ----------
-    cfg            : dict - hyper-parameters (block_size, n_layer, n_head, dropout, ...)
+    cfg            : dict - hyper-parameters (n_layer, n_head, dropout, ...)
     embedder       : EMREmbedding - fully initialised shared embedding module
     use_checkpoint : bool - continue training from last checkpoint
     """
