@@ -429,7 +429,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
 
     # ----- Loss & Optimizer -----
     optimizer = torch.optim.AdamW(embedder.parameters(), lr=training_settings["phase1_learning_rate"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, min_lr=1e-6)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=4, min_lr=1e-6)
     loss_fn = nn.BCEWithLogitsLoss(pos_weight=embedder.tokenizer.token_weights.to(device), reduction="none")
 
     # ----- Resume logic -----
