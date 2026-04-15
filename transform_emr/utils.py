@@ -4,6 +4,11 @@ utils.py
 
 General util functions for the package
 """
+import sys
+import os
+import datetime
+import functools
+import inspect
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
@@ -15,6 +20,82 @@ from transform_emr.config.dataset_config import (
     ADMISSION_TOKEN, TERMINAL_OUTCOMES, OUTCOMES, MEAL_TOKENS
 )
 from transform_emr.schedulers import linear_schedule
+
+
+class _TeeStream:
+    """Wraps sys.stdout so every write goes to both the terminal and a log file."""
+
+    def __init__(self, log_path, original_stream):
+        self._original = original_stream
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._file = open(log_path, "a", encoding="utf-8", buffering=1)  # line-buffered
+
+    def write(self, text):
+        self._original.write(text)
+        self._file.write(text)
+
+    def flush(self):
+        self._original.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+    # Proxy everything else (isatty, fileno, etc.) to the real stream so tqdm
+    # and other tools that inspect stdout continue to work correctly.
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+_active_tee: Optional[_TeeStream] = None  # shared across all decorated training functions
+
+
+def _ensure_tee_active():
+    global _active_tee
+    if _active_tee is not None:
+        return
+    from transform_emr.config.model_config import CHECKPOINT_PATH
+    log_path = os.path.join(CHECKPOINT_PATH, "logs", "training.log")
+    _active_tee = _TeeStream(log_path, sys.stdout)
+    sys.stdout = _active_tee
+    print(f"[Logger] Logging to: {log_path}")
+
+
+def logger(func):
+    """
+    Decorator for training functions.  On first call it activates the stdout
+    tee (append mode).  Every call prints a timestamped header containing the
+    function name, model config, and training settings so the log is
+    self-contained and searchable across runs.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        _ensure_tee_active()
+
+        # Pull training_settings out of the call if present
+        try:
+            bound = inspect.signature(func).bind(*args, **kwargs)
+            bound.apply_defaults()
+            ts = bound.arguments.get("training_settings")
+        except Exception:
+            ts = None
+
+        try:
+            from transform_emr.config.model_config import MODEL_CONFIG
+        except Exception:
+            MODEL_CONFIG = None
+
+        sep = "=" * 70
+        print(f"\n{sep}")
+        print(f"  {func.__name__}  |  {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if MODEL_CONFIG:
+            print(f"  model config      : {MODEL_CONFIG}")
+        if ts:
+            print(f"  training settings : {ts}")
+        print(sep)
+
+        return func(*args, **kwargs)
+    return wrapper
 
 
 @torch.no_grad()

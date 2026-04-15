@@ -11,6 +11,7 @@ teacher-forced data (same DataLoaders as Phase 2), analogous to fine-tuning
 a BERT classification head. Checkpoints are full GPT models, so GPT.load()
 works identically for Phase 2 and Phase 3 checkpoints.
 """
+import os
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split

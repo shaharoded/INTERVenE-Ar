@@ -11,7 +11,7 @@ from tqdm.auto import tqdm
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
 from transform_emr.config.model_config import *
-from transform_emr.utils import compute_legality_masks_tf, get_temporal_multi_hot_targets, build_mlm, plot_losses, build_luts
+from transform_emr.utils import compute_legality_masks_tf, get_temporal_multi_hot_targets, build_mlm, plot_losses, build_luts, logger
 from transform_emr.schedulers import LambdaScheduleController
 
 torch.serialization.add_safe_globals([
@@ -380,6 +380,7 @@ class EMREmbedding(nn.Module):
         )
 
 
+@logger
 def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_path=PHASE1_CHECKPOINT,
                    training_settings=TRAINING_SETTINGS):
     """

@@ -638,6 +638,7 @@ class GPT(nn.Module):
         )
 
 
+@logger
 def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=PHASE2_CHECKPOINT, training_settings=TRAINING_SETTINGS):
     """
     Trains a Transformer-based EMR sequence model in Phase 2 (decoder stage),
@@ -1024,6 +1025,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
     return model, train_losses, val_losses
 
 
+@logger
 def finetune_transformer(model, train_dl, val_dl, resume=True,
                          checkpoint_path=PHASE3_CHECKPOINT, training_settings=TRAINING_SETTINGS):
     """
