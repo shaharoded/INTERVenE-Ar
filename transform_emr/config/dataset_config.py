@@ -36,6 +36,9 @@ RELEASE_TOKEN = "RELEASE_EVENT"
 
 TERMINAL_OUTCOMES = [RELEASE_TOKEN, DEATH_TOKEN]
 
+# Outcomes with prevalence below this threshold (% of patients) are excluded from the outcome head.
+OUTCOME_RARE_THRESHOLD_PCT = 2.0
+
 MEAL_TOKENS = ["MEAL_CONTEXT_Breakfast", "MEAL_CONTEXT_Lunch", "MEAL_CONTEXT_Dinner", "MEAL_CONTEXT_Night-Snack"] # Keep ordered! concept_value tokens
 
 # inclusion/exclusion criteria to filter all datasets

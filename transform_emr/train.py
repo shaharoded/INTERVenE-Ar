@@ -6,10 +6,15 @@ Phase-1 : train_embedder()        →  checkpoints/phase1/ckpt_best.pt
 Phase-2 : pretrain_transformer()  →  checkpoints/phase2/ckpt_best.pt
 Phase-3 : finetune_transformer()  →  checkpoints/phase3/ckpt_best.pt
 
-Phase 3 freezes the backbone and fine-tunes only the outcome head on
-teacher-forced data (same DataLoaders as Phase 2), analogous to fine-tuning
-a BERT classification head. Checkpoints are full GPT models, so GPT.load()
-works identically for Phase 2 and Phase 3 checkpoints.
+Responsibilities:
+  prepare_data()  — loads CSVs, runs DataProcessor, builds/loads tokenizer,
+                    performs stratified patient split, returns (train_ds, val_ds, tokenizer).
+  run_training()  — owns all DataLoader creation (one per phase with correct oversample
+                    settings), then calls phase_one / phase_two / phase_three in sequence.
+
+Phase-2 uses oversample=True (WeightedRandomSampler) for balanced rare-outcome batches.
+Phase-3 uses oversample=False (natural distribution) so pos_weight in BCEWithLogitsLoss
+correctly compensates for class imbalance without double-counting.
 """
 import os
 import numpy as np
@@ -23,7 +28,9 @@ from transform_emr.embedder import EMREmbedding, train_embedder
 from transform_emr.transformer import GPT, pretrain_transformer, finetune_transformer
 from transform_emr.utils import *
 from transform_emr.config.model_config import *
-from transform_emr.config.dataset_config import TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE, TAK_REPO_PATH
+from transform_emr.config.dataset_config import (
+    TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE, TAK_REPO_PATH, OUTCOMES, OUTCOME_RARE_THRESHOLD_PCT
+)
 
 def summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer):
     """
@@ -96,23 +103,35 @@ def prepare_data(sample=False):
 
     print(f"[Pre-processing]: Building dataset...")
     pids = temporal_df["PatientID"].unique()
-    train_ids, val_ids = train_test_split(pids, test_size=0.2, random_state=42)
 
-    train_df, val_df = temporal_df[temporal_df.PatientID.isin(train_ids)].copy(), temporal_df[temporal_df.PatientID.isin(val_ids)].copy()
-    train_ctx, val_ctx = ctx_df.loc[ctx_df.index.isin(train_ids)], ctx_df.loc[ctx_df.index.isin(val_ids)]
+    # Stratified split: each patient's stratum = their rarest outcome by prevalence.
+    # Guarantees at least 1 representative of each kept outcome in both train and val.
+    patient_tokens = temporal_df.groupby("PatientID")["PositionToken"].apply(set)
+    strat_labels = []
+    for pid in pids:
+        patient_outcomes = [n for n in OUTCOMES if n in patient_tokens.get(pid, set())]
+        if patient_outcomes and tokenizer.outcome_patient_ratios:
+            rarest = min(patient_outcomes,
+                         key=lambda n: tokenizer.outcome_patient_ratios.get(n, 1.0))
+            strat_labels.append(rarest)
+        else:
+            strat_labels.append("__common__")
+    train_ids, val_ids = train_test_split(pids, test_size=0.2, random_state=42, stratify=strat_labels)
+
+    train_df  = temporal_df[temporal_df.PatientID.isin(train_ids)].copy()
+    val_df    = temporal_df[temporal_df.PatientID.isin(val_ids)].copy()
+    train_ctx = ctx_df.loc[ctx_df.index.isin(train_ids)]
+    val_ctx   = ctx_df.loc[ctx_df.index.isin(val_ids)]
 
     train_ds = EMRDataset(train_df, train_ctx, tokenizer=tokenizer)
     val_ds   = EMRDataset(val_df, val_ctx, tokenizer=tokenizer)
-    
-    summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer)   
+
+    summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer)
 
     MODEL_CONFIG["ctx_dim"] = int(train_ds.context_df.shape[1])
     print(f"[Pre-processing]: Auto-set MODEL_CONFIG['ctx_dim'] = {MODEL_CONFIG['ctx_dim']}")
 
-    embedder_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False, bucket_batching=True)
-    transformer_train_dl = get_dataloader(train_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=True) # Balanced batches
-    val_dl = get_dataloader(val_ds, batch_size=TRAINING_SETTINGS["batch_size"], collate_fn=collate_emr, oversample=False, bucket_batching=True)
-    return embedder_train_dl, transformer_train_dl, val_dl, tokenizer
+    return train_ds, val_ds, tokenizer
 
 def phase_one(embedder, train_dl, val_dl, resume=True):
     return train_embedder(
@@ -135,10 +154,10 @@ def phase_two(model, train_dl, val_dl, resume=True):
                     )
 
 
-def phase_three(model, train_dl, val_dl, resume=True):
+def phase_three(model, phase3_train_dl, val_dl, resume=True):
     return finetune_transformer(
         model=model,
-        train_dl=train_dl,
+        train_dl=phase3_train_dl,
         val_dl=val_dl,
         resume=resume,
         checkpoint_path=PHASE3_CHECKPOINT,
@@ -171,18 +190,23 @@ def _build_or_load_transformer(embedder):
 
 def run_training():
     """Run the full three-phase training pipeline."""
-    embedder_train_dl, transformer_train_dl, val_dl, tokenizer = prepare_data()
+    train_ds, val_ds, tokenizer = prepare_data()
+
+    bs = TRAINING_SETTINGS["batch_size"]
+    train_dl    = get_dataloader(train_ds, batch_size=bs, collate_fn=collate_emr, oversample=False, bucket_batching=True)
+    oversampled_train_dl = get_dataloader(train_ds, batch_size=bs, collate_fn=collate_emr, oversample=True, bucket_batching=True)
+    val_dl               = get_dataloader(val_ds,   batch_size=bs, collate_fn=collate_emr, oversample=False, bucket_batching=True)
 
     # Phase 1 — embedder
     embedder = _build_or_load_embedder(tokenizer)
-    embedder, _, _ = phase_one(embedder=embedder, train_dl=embedder_train_dl, val_dl=val_dl, resume=True)
+    embedder, _, _ = phase_one(embedder=embedder, train_dl=train_dl, val_dl=val_dl, resume=True)
 
-    # Phase 2 — transformer
+    # Phase 2 — transformer (oversampled batches for rare-outcome balance)
     model = _build_or_load_transformer(embedder)
-    model, _, _ = phase_two(model=model, train_dl=transformer_train_dl, val_dl=val_dl, resume=True)
+    model, _, _ = phase_two(model=model, train_dl=oversampled_train_dl, val_dl=val_dl, resume=True)
 
-    # Phase 3 — outcome head fine-tuning (uses same DataLoaders as Phase 2)
-    model, _, _ = phase_three(model=model, train_dl=transformer_train_dl, val_dl=val_dl, resume=True)
+    # Phase 3 — outcome head (natural distribution; pos_weight handles class imbalance)
+    model, _, _ = phase_three(model=model, phase3_train_dl=train_dl, val_dl=val_dl, resume=True)
 
 
 if __name__ == "__main__":

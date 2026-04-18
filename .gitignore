@@ -5,6 +5,7 @@ CLAUDE.md
 # Ignore an entire folder
 venv/
 .venv/
+tmp-docs/
 __pycache__/
 checkpoints/
 transform_emr_temp/

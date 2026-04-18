@@ -92,7 +92,9 @@ run_training()
 
 Model checkpoints are saved under `checkpoints/phase1/`, `checkpoints/phase2/`, and `checkpoints/phase3/`.
 You can also run each phase individually by calling `prepare_data()`, `phase_one()`, `phase_two()`, and
-`phase_three()` separately. All three phases use the same DataLoaders. See `train.py` for reference.
+`phase_three()` separately. `prepare_data()` returns `(train_ds, val_ds, tokenizer)`; `run_training()`
+owns all DataLoader creation. Phase 2 uses a weighted oversampled loader; phases 1 and 3 share a
+bucket-batched natural-distribution loader. See `train.py` for reference.
 
 ### 3. Inference and Complication Risk Prediction
 
@@ -218,7 +220,7 @@ Per-patient Event Tokenization (with normalized absolute timestamps)
 │
 ▼
 🎯 Phase 3 – Outcome Head Fine-tuning: freeze backbone, fine-tune only the outcome head on
-             teacher-forced data (same DataLoaders as Phase 2), analogous to BERT head fine-tuning.
+             natural-distribution batches (oversample=False + pos_weight), analogous to BERT head fine-tuning.
 │
 ▼
 → Predict next medical events (token + time) and read complication risk curves from the outcome head (in `evaluation.ipynb`)
@@ -232,7 +234,7 @@ Per-patient Event Tokenization (with normalized absolute timestamps)
 | Component            | Role                                                                                             |
 |---------------------|--------------------------------------------------------------------------------------------------|
 | `DataProcessor`        | Performs all necessary data processing, from input data to tokens_df.  |
-| `EMRTokenizer`        | Transforming a processed temporal_df into a tokenizer that can be saved and passed between objects for compatability.                     |
+| `EMRTokenizer`        | Builds vocabulary and per-outcome prevalence ratios from a processed temporal_df; filters outcomes below `OUTCOME_RARE_THRESHOLD_PCT`; saves/loads with `BucketBatchSampler` / `WeightedBucketBatchSampler` support. |
 | `EMRDataset`        | Converts raw EMR tables into per-patient token sequences with relative time.                     |
 
 | `collate_emr()`     | Pads sequences and returns tensors|
@@ -277,7 +279,7 @@ MLM will avoid masking tokens which will damage the broader meaning like ADMISSI
 | `MLP` | SwiGLU MLP (SiLU Gating), based on common LLM optimizations.                                 |
 | `AdaLNBlock` | Transformer block with AdaLN-Zero conditioning (adaptive layer norm), to bias prediction based on the patient context.                                 |
 | `pretrain_transformer()` | Complete Phase-2 training logic using legality-masked temporal multi-hot BCE (focal), masked set-CE, Δt loss, and outcome BCE auxiliary losses.                         |
-| `finetune_transformer()` | Phase-3 outcome head fine-tuning: freezes the backbone and fine-tunes only the outcome head on teacher-forced data (same DataLoaders as Phase 2), analogous to fine-tuning a BERT classification head. Uses the same soft-label targets as Phase 2 but with gradient isolation on the head only. Saves full-model checkpoints loadable with `GPT.load()`. |
+| `finetune_transformer()` | Phase-3 outcome head fine-tuning: freezes the backbone and fine-tunes only the outcome head on natural-distribution batches (`oversample=False`), so `pos_weight` in `BCEWithLogitsLoss` correctly compensates for class imbalance without double-counting. Uses the same soft-label targets as Phase 2 but with gradient isolation on the head only. Saves full-model checkpoints loadable with `GPT.load()`. |
 
 ⚙️ **Phase 2: Learning Sequence Dependencies**  
 Once the EMR structure is captured, the transformer learns to model sequential dependencies in event progression:  

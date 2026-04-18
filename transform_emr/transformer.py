@@ -315,15 +315,22 @@ class GPT(nn.Module):
         # Outcome Head (designed to propogate signal to the hidden state that there is an expected outcome soon)
         # This head maps the embedding dimension to the unique outcome classes (e.g., Death, Sepsis, Hypoglycemia, Release)
         all_config_outcomes = sorted(list(set(OUTCOMES + TERMINAL_OUTCOMES)))
-        valid_outcomes, missing_outcomes = [], []
-        for n in all_config_outcomes:
-            if n in self.embedder.tokenizer.token2id:
-                valid_outcomes.append(n)
-            else:
-                missing_outcomes.append(n)
+
+        # Filter by tokenizer vocabulary, then by tokenizer's pre-computed rarity filter.
+        # The tokenizer decides which outcomes are valid (applied once at build time).
+        tok = self.embedder.tokenizer
+        in_vocab = [n for n in all_config_outcomes if n in tok.token2id]
+        missing_outcomes = [n for n in all_config_outcomes if n not in tok.token2id]
         if missing_outcomes:
-            print(f"[GPT] The following configured outcomes were NOT found in the tokenizer and will be ignored: {missing_outcomes}")
-            
+            print(f"[GPT] Outcomes not in tokenizer vocab (ignored): {missing_outcomes}")
+
+        # outcome_patient_ratios keys are the valid outcomes; empty dict = old tokenizer, use all
+        if getattr(tok, 'outcome_patient_ratios', None):
+            valid_set = set(tok.outcome_patient_ratios.keys())
+            valid_outcomes = [n for n in in_vocab if n in valid_set]
+        else:
+            valid_outcomes = in_vocab
+
         # Hard Error if nothing is left (Training cannot proceed)
         if not valid_outcomes:
             raise ValueError(
@@ -705,11 +712,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
     # Training Dynamics
     cbm_ramp_epochs = training_settings["phase2_scheduler"]["bce_only_epochs"] # Couple CBM ramp up with the foundational phase to stabilize training before introducing the full curriculum. CBM will ramp up from 0 to max_p during these epochs, then stay at max_p for the rest of training.
 
-    # Get outcomes weights (from Tokenizer) for pos_weight in BCE loss
     valid_outcomes = [n for n in model.outcome_names if n in model.embedder.tokenizer.token2id]
     outcome_token_ids = [model.embedder.tokenizer.token2id[n] for n in valid_outcomes]
-    full_weights = model.embedder.tokenizer.outcome_weights.to(device)
-    pos_weights  = full_weights[outcome_token_ids].to(device)
     
     # Build criterions once (for next token BCE and CE losses + aux outcome BCE)
     BCEcriterion = MaskedFocalBCE.from_counts(
@@ -727,7 +731,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         label_smoothing=0.0,     # optional
     ).to(device)
 
-    OutcomeCriterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction='none')
+    # No pos_weight: oversampling already rebalances rare outcomes in Phase-2.
+    # Combining pos_weight with oversampling would double-count, causing gradient explosion.
+    OutcomeCriterion = nn.BCEWithLogitsLoss(reduction='none')
 
     start_epoch = 0
     best_val = float("inf")
