@@ -100,7 +100,7 @@ bucket-batched natural-distribution loader. See `train.py` for reference.
 
 The primary inference task is **complication risk prediction**: for each patient, generate a single
 free-running trajectory and read the outcome head at every step to produce a probability curve per
-complication over time. Use `generate_risk_curves` for this purpose.
+complication over time. Use `generate` with `collect_risk_scores=True` for this purpose.
 
 ```python
 import joblib
@@ -108,7 +108,7 @@ from pathlib import Path
 from transform_emr.embedder import EMREmbedding
 from transform_emr.transformer import GPT
 from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset
-from transform_emr.inference import generate_risk_curves
+from transform_emr.inference import generate
 from transform_emr.config.model_config import *
 
 # Load tokenizer and scaler
@@ -129,14 +129,19 @@ model, *_ = GPT.load(ckpt_path, embedder=embedder_model)
 model.eval()
 
 # Generate risk curves — one row per generated step, P_<outcome> columns per complication
-risk_df = generate_risk_curves(model, dataset_input, max_len=500, temperature=1.0, rep_decay=0.6)
+risk_df = generate(model, dataset_input, max_len=500, temperature=1.0, rep_decay=0.6,
+                   collect_risk_scores=True)
+
+# Raw event stream only (no risk scores, faster)
+event_df = generate(model, dataset_input, max_len=500, temperature=1.0, rep_decay=0.6)
 ```
 
-The returned `risk_df` has columns `{PatientId, Step, Token, IsInput, TimePoint, P_<outcome_name>, ...}`.
+The returned `risk_df` has columns `{PatientId, Step, Token, IsInput, IsOutcome, IsTerminal, TimePoint, P_<outcome_name>, ...}`.
 Rows with `IsInput == 0` are generated steps; the `P_*` columns hold sigmoid outcome-head probabilities
 at that step. Evaluate using time-stratified AUC (see `evaluation.ipynb`).
 
-`infer_event_stream` is also available for raw event generation (returns token stream without risk scores).
+Patients that exhaust `max_len` without generating a terminal token receive a forced DEATH or RELEASE
+token (chosen by highest logit), clamped to <= 336 h. The fallback rate is printed after generation.
 
 
 ### 4. Using as a module
@@ -298,14 +303,10 @@ The training flow uses warmup/curriculum scheduling (LR warmup, BCE-only phase, 
 
 | Component           | Role                                                                                              |
 |--------------------|---------------------------------------------------------------------------------------------------|
-| `generate_risk_curves()` | **Primary inference function.** Generates one autoregressive trajectory per patient and reads the outcome head at every step, returning a DataFrame of per-step complication probabilities. |
-| `infer_event_stream()` | Generates a predicted stream of tokens without risk scores. Useful for inspecting which events the model predicts, independent of outcome probabilities. |
+| `generate()` | **Primary inference function.** Generates one autoregressive trajectory per patient. With `collect_risk_scores=True`, reads the outcome head at every step and returns per-step complication probabilities (`P_*` columns). Patients that reach `max_len` receive a forced terminal token (DEATH or RELEASE by highest logit), clamped to <= 336 h. |
 | `get_token_embedding()` | Returns the embedding vector of a specific token from a trained embedder. |
-| `_build_illegal_mask()` | Builds a Boolean `[V]` mask of token ids that are structurally illegal to generate next, given the current interval and meal-order state. |
-| `_update_legality_state()` | Mutates interval open-counts and advances meal-order rank after each generated token. |
-| `_decode_token_components()` | Decodes a position-token string into `(concept_id, value_id)` for feeding back into the model. |
 
-NOTE: Inference is step-by-step (not batched), so it is significantly slower than training. With that being said, model uses batch inference (multiple patients at the same time), KV cache (reduces per-step work from O(T·d²) to O(d²)) and FP16 quantization, all together significantly helps the inference speed.
+NOTE: Inference is step-by-step (autoregressive), so it is significantly slower than training. With that being said, model uses batch inference (multiple patients at the same time), KV cache (reduces per-step work from O(T·d²) to O(d²)) and FP16 quantization, all together significantly helps the inference speed.
 ---
 
 ### 5. **`evaluation.ipynb`** – Risk-based complication prediction evaluation.

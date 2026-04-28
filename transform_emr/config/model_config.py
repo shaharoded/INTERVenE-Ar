@@ -51,8 +51,8 @@ TRAINING_SETTINGS = {
         },
         "order": [["mlm", "dt"]],  # Single stage: both active together after bce_only_epochs
         "ramp_epochs": {
-            "mlm": 1,  # No ramp (immediate full lambda after calibration)
-            "dt":  1,
+            "mlm": 0,  # No ramp (immediate full lambda after calibration)
+            "dt":  0,
         },
     },
 
@@ -75,9 +75,9 @@ TRAINING_SETTINGS = {
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
-            "ce":      1,  # No ramp
-            "dt":      1,  # No ramp
-            "outcome": 3,  # Gradual ramp after unlocking
+            "ce":      0,  # No ramp (immediate full lambda after calibration)
+            "dt":      0,  # No ramp
+            "outcome": 3,  # Gradual ramp over 3 epochs after unlocking
         },
         # Plateau detection settings (applied per stage transition, in order)
         "plateau_min_delta": 1e-4,

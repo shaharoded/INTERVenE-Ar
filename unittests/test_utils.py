@@ -12,18 +12,19 @@ from transform_emr.utils import (
     mix_with_predictions,
     penalty_interval_structure,
     penalty_meal_order,
-    soft_interval_penalty, 
+    soft_interval_penalty,
     soft_meal_order_penalty,
     build_luts,
     compute_legality_masks_tf,
     apply_masks_to_logits,
     build_rep_penalty,
-    soft_unclosed_interval_penalty
+    soft_unclosed_interval_penalty,
+    build_illegal_mask_batched,
+    update_legality_state_batched,
 )
 from transform_emr.schedulers import LambdaScheduleController, linear_schedule as sched_linear_schedule
 from transform_emr.dataset import EMRTokenizer
 from transform_emr.utils import compute_soft_outcome_labels
-from transform_emr.inference import _build_illegal_mask, _update_legality_state
 
 
 def test_linear_schedule_import_is_from_schedulers():
@@ -44,11 +45,11 @@ def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activatio
         "bce_only_epochs": 1,
         "aux_fraction_caps": {"mlm": 0.20, "dt": 0.20},
         "order": [["mlm", "dt"]],
-        "ramp_epochs": {"mlm": 1, "dt": 1},
+        "ramp_epochs": {"mlm": 0, "dt": 0},  # 0 = immediate
     }
     controller = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
     assert controller.has_dynamic is False
-    # For single-stage, warmup_end_epoch returns the epoch after ramp completes
+    # For single-stage with ramp_epochs=0, warmup_end_epoch == start_epoch of stage 0
     warmup_epoch = controller.current_warmup_end_epoch()
     assert warmup_epoch == 1, f"Expected warmup to end at epoch 1, got {warmup_epoch}"
 
@@ -128,13 +129,13 @@ def test_scheduler_stage_transitions_and_warmup():
         "bce_only_epochs": 1,
         "aux_fraction_caps": {"ce": 0.20, "dt": 0.20, "penalty": 0.20, "outcome": 0.20},
         "order": [["ce", "dt"], ["penalty"], ["outcome"]],
-        "ramp_epochs": {"ce": 1, "dt": 1, "penalty": 3, "outcome": 3},
+        "ramp_epochs": {"ce": 0, "dt": 0, "penalty": 3, "outcome": 3},  # 0 = immediate
         "plateau_min_delta": 1e-4,
         "plateau_patience": [2, 2],
     }
     sc = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
 
-    # Epoch 1: first active epoch. Calibrates + plateau check starts.
+    # Epoch 1: first active epoch. Calibrates + plateau check starts (ramp_end=1, so epoch>=1).
     # vl_total=1.8 is improvement over inf → bad=0.
     sc.update(epoch=1, vl_total=1.8, tr_main=1.0, ce=0.5, dt=0.3)
     assert sc._auxiliaries["penalty"]["start_epoch"] is None
@@ -184,7 +185,7 @@ def test_scheduler_state_dict_roundtrip():
         "bce_only_epochs": 1,
         "aux_fraction_caps": {"ce": 0.20, "dt": 0.20, "penalty": 0.20, "outcome": 0.20},
         "order": [["ce", "dt"], ["penalty"], ["outcome"]],
-        "ramp_epochs": {"ce": 1, "dt": 1, "penalty": 3, "outcome": 3},
+        "ramp_epochs": {"ce": 0, "dt": 0, "penalty": 3, "outcome": 3},
         "plateau_min_delta": 1e-4,
         "plateau_patience": [2, 2],
     }
@@ -211,7 +212,7 @@ def test_scheduler_missing_cap_raises():
     cfg = {
         "aux_fraction_caps": {"ce": 0.20},  # dt missing
         "order": [["ce", "dt"]],
-        "ramp_epochs": {"ce": 1, "dt": 1},
+        "ramp_epochs": {"ce": 0, "dt": 0},
     }
     with pytest.raises(KeyError, match="dt"):
         LambdaScheduleController(schedule_config=cfg, start_epoch=0)
@@ -1217,8 +1218,25 @@ def test_compute_soft_outcome_labels_absent_outcome():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _build_illegal_mask  and  _update_legality_state
+# build_illegal_mask_batched  and  update_legality_state_batched  (B=1 tests)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _b1_mask(luts, open_counts_1d, next_meal_rank, pad_id, mask_id):
+    """Call build_illegal_mask_batched with B=1 and return the [V] result."""
+    oc  = open_counts_1d.unsqueeze(0).long()
+    nmr = torch.tensor([-1 if next_meal_rank is None else next_meal_rank], dtype=torch.long)
+    return build_illegal_mask_batched(luts, oc, nmr, pad_id, mask_id)[0]
+
+
+def _b1_update(luts, tid, open_counts_1d, next_meal_rank):
+    """Call update_legality_state_batched with B=1; mutates open_counts_1d, returns new rank."""
+    tok_ids = torch.tensor([tid], dtype=torch.long)
+    oc      = open_counts_1d.unsqueeze(0).long()
+    nmr     = torch.tensor([-1 if next_meal_rank is None else next_meal_rank], dtype=torch.long)
+    fin     = torch.zeros(1, dtype=torch.bool)
+    update_legality_state_batched(luts, tok_ids, oc, nmr, fin)
+    open_counts_1d.copy_(oc[0].to(open_counts_1d.dtype))
+    return nmr[0].item() if nmr[0].item() >= 0 else next_meal_rank
 
 def test_build_illegal_mask_always_blocks_pad_and_mask(mini_tokenizer):
     """PAD and MASK must always appear in the illegal mask regardless of state."""
@@ -1230,7 +1248,7 @@ def test_build_illegal_mask_always_blocks_pad_and_mask(mini_tokenizer):
     open_counts = torch.zeros(n_b, dtype=torch.int32)
     K           = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
 
-    illegal = _build_illegal_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id, "cpu")
+    illegal = _b1_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id)
 
     assert illegal[tk.pad_token_id],  "PAD must always be illegal"
     assert illegal[tk.mask_token_id], "MASK must always be illegal"
@@ -1247,7 +1265,7 @@ def test_build_illegal_mask_end_blocked_when_no_start(mini_tokenizer):
     open_counts = torch.zeros(n_b, dtype=torch.int32)  # nothing open
 
     low_e = tk.token2id["A_STATE_Low_END"]
-    illegal = _build_illegal_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id, "cpu")
+    illegal = _b1_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id)
 
     assert illegal[low_e], "END should be illegal when interval is not open"
     print("test_build_illegal_mask_end_blocked_when_no_start passed.")
@@ -1267,7 +1285,7 @@ def test_build_illegal_mask_start_blocked_when_open(mini_tokenizer):
     open_counts = open_counts.clone()
     open_counts[luts["base_id"][low_s]] = 1
 
-    illegal = _build_illegal_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id, "cpu")
+    illegal = _b1_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id)
 
     assert illegal[low_s], "Duplicate START should be illegal when interval is already open"
     print("test_build_illegal_mask_start_blocked_when_open passed.")
@@ -1287,7 +1305,7 @@ def test_build_illegal_mask_conflict_blocked(mini_tokenizer):
     # Open Low; High is a conflict
     open_counts[luts["base_id"][low_s]] = 1
 
-    illegal = _build_illegal_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id, "cpu")
+    illegal = _b1_mask(luts, open_counts, None, tk.pad_token_id, tk.mask_token_id)
 
     assert illegal[high_s], "Conflicting START (High while Low open) should be illegal"
     print("test_build_illegal_mask_conflict_blocked passed.")
@@ -1313,7 +1331,7 @@ def test_build_illegal_mask_meal_order(mini_tokenizer):
                   n: luts["meal_rank"][n].item()}
     # Find which rank Lunch has, then set next_meal_rank to that
     lunch_rank = meal_ranks[l_id]
-    illegal = _build_illegal_mask(luts, open_counts, lunch_rank, tk.pad_token_id, tk.mask_token_id, "cpu")
+    illegal = _b1_mask(luts, open_counts, lunch_rank, tk.pad_token_id, tk.mask_token_id)
 
     # Lunch should be legal; all other meals should be illegal
     assert not illegal[l_id], "Expected meal (Lunch) should be legal"
@@ -1336,7 +1354,7 @@ def test_update_legality_state_start_increments_open(mini_tokenizer):
     low_s = tk.token2id["A_STATE_Low_START"]
     base  = luts["base_id"][low_s].item()
 
-    _update_legality_state(luts, low_s, open_counts, None, K)
+    _b1_update(luts, low_s, open_counts, None)
 
     assert open_counts[base].item() == 1, f"Expected open_counts[{base}]=1, got {open_counts[base].item()}"
     print("test_update_legality_state_start_increments_open passed.")
@@ -1356,9 +1374,9 @@ def test_update_legality_state_end_decrements_open(mini_tokenizer):
     low_e = tk.token2id["A_STATE_Low_END"]
     base  = luts["base_id"][low_s].item()
 
-    _update_legality_state(luts, low_s, open_counts, None, K)
+    _b1_update(luts, low_s, open_counts, None)
     assert open_counts[base].item() == 1
-    _update_legality_state(luts, low_e, open_counts, None, K)
+    _b1_update(luts, low_e, open_counts, None)
     assert open_counts[base].item() == 0, "END should bring open_counts back to 0"
     print("test_update_legality_state_end_decrements_open passed.")
 
@@ -1374,7 +1392,7 @@ def test_update_legality_state_end_does_not_go_negative(mini_tokenizer):
     K           = int((luts["meal_rank"] >= 0).any()) and int(luts["meal_rank"].max().item()) + 1 or 0
 
     low_e = tk.token2id["A_STATE_Low_END"]
-    _update_legality_state(luts, low_e, open_counts, None, K)
+    _b1_update(luts, low_e, open_counts, None)
     base = luts["base_id"][low_e].item()
     assert open_counts[base].item() >= 0, "open_counts must never go negative"
     print("test_update_legality_state_end_does_not_go_negative passed.")
@@ -1393,7 +1411,7 @@ def test_update_legality_state_meal_advances_rank(mini_tokenizer):
     l_id = tk.token2id["MEAL_CONTEXT_Lunch"]
     lunch_rank = luts["meal_rank"][l_id].item()
 
-    next_rank = _update_legality_state(luts, l_id, open_counts, None, K)
+    next_rank = _b1_update(luts, l_id, open_counts, None)
 
     assert next_rank == (lunch_rank + 1) % K, \
         f"Expected rank {(lunch_rank+1)%K}, got {next_rank}"

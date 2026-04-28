@@ -19,7 +19,7 @@ LambdaScheduleController:
         loss plateaus — but only after the current stage's ramp has completed.
   - Frozen-fraction calibration: lambda_max = fraction_cap * tr_main / tr_aux
     (computed from TRAINING losses once, then fixed).
-  - Linear ramp from 0 to lambda_max over ramp_epochs (ramp_epochs=1 means immediate).
+  - Linear ramp from 0 to lambda_max over ramp_epochs (ramp_epochs=0 means immediate).
   - Warmup tracking: reports the epoch after which early stopping may begin.
 
 Config expected shape (phase-specific dict):
@@ -179,7 +179,7 @@ class LambdaScheduleController:
                 self._register_aux(
                     name=name,
                     start_epoch=s_epoch,
-                    ramp_epochs=max(1, int(ramp_cfg.get(name, 1))),
+                    ramp_epochs=max(0, int(ramp_cfg.get(name, 0))),
                     fraction=caps[name],
                 )
 
@@ -218,7 +218,7 @@ class LambdaScheduleController:
         self._auxiliaries[name] = {
             "name": name,
             "start_epoch": start_epoch,
-            "ramp_epochs": max(1, int(ramp_epochs)),
+            "ramp_epochs": max(0, int(ramp_epochs)),
             "fraction": float(fraction),
             "lambda_max": None,
             "anchor_main_loss": None,
@@ -226,15 +226,16 @@ class LambdaScheduleController:
         }
 
     def _ramp_end(self, name: str) -> int:
-        """Epoch at which the named aux task reaches its full lambda_max."""
+        """Epoch at which the named aux task reaches its full lambda_max.
+
+        ramp_epochs=0 → immediate (lambda at full value from start_epoch).
+        ramp_epochs=N → linear ramp; reaches max at start_epoch + N.
+        """
         spec = self._auxiliaries[name]
         s = spec["start_epoch"]
         if s is None:
             return float("inf")
-        # Calibration happens in update() which runs AFTER run_epoch().
-        # The first epoch that actually uses the calibrated lambda is start_epoch+1.
-        # Using max(1, ramp_epochs) ensures the gate never opens before that epoch.
-        return s + max(1, spec["ramp_epochs"])
+        return s + spec["ramp_epochs"]
 
     @staticmethod
     def _check_plateau(metric_val, best_val, bad_epochs, min_delta, patience):

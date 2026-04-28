@@ -24,12 +24,7 @@ from transform_emr.utils import (
     update_legality_state_batched,
     build_rep_penalty_batched,
 )
-from transform_emr.inference import (
-    infer_event_stream,
-    generate_risk_curves,
-    _build_illegal_mask,      # scalar compat wrapper
-    _update_legality_state,   # scalar compat wrapper
-)
+from transform_emr.inference import generate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -366,39 +361,6 @@ def test_init_legality_state_batched_meal_rank(mini_tokenizer, luts):
     print("test_init_legality_state_batched_meal_rank passed.")
 
 
-def test_build_illegal_mask_batched_matches_scalar(mini_tokenizer, luts):
-    """
-    For B=1, build_illegal_mask_batched must match _build_illegal_mask (scalar wrapper).
-    Tests both zero and nonzero open_counts.
-    """
-    tk  = mini_tokenizer
-    pad = tk.pad_token_id
-    msk = tk.mask_token_id
-    nb  = luts["start_ids_per_base"].numel()
-
-    low_s = tk.token2id["A_STATE_Low_START"]
-    base  = luts["base_id"][low_s].item()
-
-    for open_val in [0, 1]:
-        open_counts_1d = torch.zeros(nb, dtype=torch.int32)
-        open_counts_1d[base] = open_val
-
-        # Scalar path (via wrapper)
-        scalar_mask = _build_illegal_mask(luts, open_counts_1d, None, pad, msk, "cpu")
-
-        # Batched path (B=1)
-        oc_2d  = open_counts_1d.unsqueeze(0).long()     # [1, nb]
-        nmr    = torch.tensor([-1], dtype=torch.long)   # no meal seen
-        batch_mask = build_illegal_mask_batched(luts, oc_2d, nmr, pad, msk)
-
-        assert batch_mask.shape[0] == 1
-        diff = (scalar_mask != batch_mask[0])
-        assert not diff.any(), \
-            f"Mismatch for open_val={open_val} at positions {diff.nonzero().squeeze().tolist()}"
-
-    print("test_build_illegal_mask_batched_matches_scalar passed.")
-
-
 def test_build_illegal_mask_batched_pad_always_blocked(mini_tokenizer, luts):
     """PAD and MASK tokens must always be in the illegal mask for every batch item."""
     tk  = mini_tokenizer
@@ -531,7 +493,7 @@ def test_build_rep_penalty_batched_penalises_recent(mini_tokenizer):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# infer_event_stream — end-to-end
+# generate (event stream mode, collect_risk_scores=False)
 # ─────────────────────────────────────────────────────────────────────────────
 
 EXPECTED_INFER_COLS = {"PatientId", "Step", "Token", "TimePoint",
@@ -539,9 +501,9 @@ EXPECTED_INFER_COLS = {"PatientId", "Step", "Token", "TimePoint",
 
 
 def test_infer_event_stream_returns_dataframe(mini_model, mini_tokenizer):
-    """infer_event_stream returns a non-empty DataFrame with required columns."""
+    """generate returns a non-empty DataFrame with required columns."""
     dataset = FakeDataset(mini_tokenizer)
-    df = infer_event_stream(mini_model, dataset, max_len=5, batch_size=2)
+    df = generate(mini_model, dataset, max_len=5, batch_size=2)
 
     assert isinstance(df, pd.DataFrame), "Should return a DataFrame"
     assert not df.empty, "DataFrame should not be empty"
@@ -553,7 +515,7 @@ def test_infer_event_stream_returns_dataframe(mini_model, mini_tokenizer):
 def test_infer_event_stream_all_patients_present(mini_model, mini_tokenizer):
     """Every patient in the dataset must appear in the output."""
     dataset = FakeDataset(mini_tokenizer, n_patients=4)
-    df = infer_event_stream(mini_model, dataset, max_len=3, batch_size=2)
+    df = generate(mini_model, dataset, max_len=3, batch_size=2)
 
     output_pids = set(df["PatientId"].unique())
     for pid in dataset.patient_ids:
@@ -567,7 +529,7 @@ def test_infer_event_stream_has_terminal_token(mini_model, mini_tokenizer):
     If the model doesn't generate one within max_len, the fallback injector fires.
     """
     dataset = FakeDataset(mini_tokenizer, n_patients=2)
-    df = infer_event_stream(mini_model, dataset, max_len=5, batch_size=2)
+    df = generate(mini_model, dataset, max_len=5, batch_size=2)
 
     for pid in dataset.patient_ids:
         patient_df = df[df["PatientId"] == pid]
@@ -579,7 +541,7 @@ def test_infer_event_stream_has_terminal_token(mini_model, mini_tokenizer):
 def test_infer_event_stream_input_rows_before_generated(mini_model, mini_tokenizer):
     """Input rows (IsInput=1) must all come before generated rows (IsInput=0) per patient."""
     dataset = FakeDataset(mini_tokenizer, n_patients=2)
-    df = infer_event_stream(mini_model, dataset, max_len=5, batch_size=2)
+    df = generate(mini_model, dataset, max_len=5, batch_size=2)
 
     for pid in dataset.patient_ids:
         p = df[df["PatientId"] == pid]
@@ -598,8 +560,8 @@ def test_infer_event_stream_batch_sizes_consistent(mini_model, mini_tokenizer):
     """
     dataset = FakeDataset(mini_tokenizer, n_patients=3)
 
-    df1 = infer_event_stream(mini_model, dataset, max_len=3, batch_size=1)
-    df4 = infer_event_stream(mini_model, dataset, max_len=3, batch_size=4)
+    df1 = generate(mini_model, dataset, max_len=3, batch_size=1)
+    df4 = generate(mini_model, dataset, max_len=3, batch_size=4)
 
     for pid in dataset.patient_ids:
         rows1 = df1[(df1["PatientId"] == pid) & (df1["IsInput"] == 1)].sort_values("Step")
@@ -614,7 +576,7 @@ def test_infer_event_stream_batch_sizes_consistent(mini_model, mini_tokenizer):
 def test_infer_event_stream_token_strings_are_valid(mini_model, mini_tokenizer):
     """Generated token strings should appear in the vocabulary (no <UNK_*> tokens)."""
     dataset = FakeDataset(mini_tokenizer, n_patients=2)
-    df = infer_event_stream(mini_model, dataset, max_len=5, batch_size=2)
+    df = generate(mini_model, dataset, max_len=5, batch_size=2)
 
     vocab = set(mini_tokenizer.token2id.keys())
     bad   = df[~df["Token"].isin(vocab)]
@@ -623,16 +585,16 @@ def test_infer_event_stream_token_strings_are_valid(mini_model, mini_tokenizer):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# generate_risk_curves — end-to-end
+# generate (risk score mode, collect_risk_scores=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_generate_risk_curves_returns_dataframe(mini_model, mini_tokenizer):
-    """generate_risk_curves returns a DataFrame with required columns including P_* cols."""
+    """generate with collect_risk_scores=True returns required columns including P_* cols."""
     dataset     = FakeDataset(mini_tokenizer)
     outcome_cols = {f"P_{n}" for n in mini_model.outcome_names}
     required     = {"PatientId", "Step", "Token", "TimePoint", "IsInput", "IsTerminal"} | outcome_cols
 
-    df = generate_risk_curves(mini_model, dataset, max_len=5, batch_size=2)
+    df = generate(mini_model, dataset, max_len=5, batch_size=2, collect_risk_scores=True)
 
     assert isinstance(df, pd.DataFrame)
     assert not df.empty
@@ -644,7 +606,7 @@ def test_generate_risk_curves_returns_dataframe(mini_model, mini_tokenizer):
 def test_generate_risk_curves_probabilities_in_range(mini_model, mini_tokenizer):
     """All P_* columns must contain values strictly in [0, 1]."""
     dataset = FakeDataset(mini_tokenizer, n_patients=2)
-    df = generate_risk_curves(mini_model, dataset, max_len=5, batch_size=2)
+    df = generate(mini_model, dataset, max_len=5, batch_size=2, collect_risk_scores=True)
 
     for col in [f"P_{n}" for n in mini_model.outcome_names]:
         vals = df[col]
@@ -656,7 +618,7 @@ def test_generate_risk_curves_probabilities_in_range(mini_model, mini_tokenizer)
 def test_generate_risk_curves_input_rows_have_outcome_scores(mini_model, mini_tokenizer):
     """Input rows (IsInput=1) must have outcome probabilities filled in (not 0.0 always)."""
     dataset = FakeDataset(mini_tokenizer, n_patients=2, seed_len=4)
-    df = generate_risk_curves(mini_model, dataset, max_len=3, batch_size=2)
+    df = generate(mini_model, dataset, max_len=3, batch_size=2, collect_risk_scores=True)
 
     input_rows = df[df["IsInput"] == 1]
     assert not input_rows.empty, "Should have input rows"
@@ -670,7 +632,7 @@ def test_generate_risk_curves_input_rows_have_outcome_scores(mini_model, mini_to
 def test_generate_risk_curves_all_patients_present(mini_model, mini_tokenizer):
     """Every patient must appear in the risk-curve output."""
     dataset = FakeDataset(mini_tokenizer, n_patients=3)
-    df = generate_risk_curves(mini_model, dataset, max_len=3, batch_size=2)
+    df = generate(mini_model, dataset, max_len=3, batch_size=2, collect_risk_scores=True)
 
     output_pids = set(df["PatientId"].unique())
     for pid in dataset.patient_ids:
