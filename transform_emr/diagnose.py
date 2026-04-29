@@ -660,7 +660,26 @@ def diagnose_generation_time(df: pd.DataFrame, max_duration_hours: float = 336.0
         print("  ⚠ Mean-regression suspected: per-patient mean Δt barely varies vs within-patient Δt.")
     return stats
 
-
+def probe_dt_components(model, val_dl, n_batches: int = 1):
+    """Inspect dt_gate sigmoid distribution and dt_magnitude separately."""
+    device = next(model.parameters()).device
+    model.eval()
+    gates, mags = [], []
+    with torch.no_grad():
+        for i, batch in enumerate(val_dl):
+            if i >= n_batches: break
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            _, _, _, gate_logit = model(
+                parent_raw_ids=batch["parent_raw_ids"], concept_ids=batch["concept_ids"],
+                value_ids=batch["value_ids"], position_ids=batch["position_ids"],
+                abs_ts=batch["abs_ts"], context_vec=batch["context_vec"],
+            )
+            gp = torch.sigmoid(gate_logit).cpu().numpy().ravel()
+            gates.append(gp)
+    gp = np.concatenate(gates)
+    print(f"gate_prob: mean={gp.mean():.3f} std={gp.std():.3f} "
+          f"frac>0.99={(gp>0.99).mean():.3f} frac<0.01={(gp<0.01).mean():.3f}")
+    
 def _collect_val_batches(model, val_dl, n_batches: int = 1):
     """
     Purpose: Cache a small validation slice so probes share one forward pass.

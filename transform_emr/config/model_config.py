@@ -70,7 +70,7 @@ TRAINING_SETTINGS = {
         "bce_only_epochs": 5,
         "aux_fraction_caps": {
             "ce":      2.00,    # Next-token CE nudge cap
-            "dt":      0.20,    # Time regression cap
+            "dt":      1.00,    # Time regression cap
             "outcome": 0.20,    # Future-outcome auxiliary cap
         },
         "order": [["ce", "dt"], ["outcome"]],
