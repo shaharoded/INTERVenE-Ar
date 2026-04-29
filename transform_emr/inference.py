@@ -124,7 +124,8 @@ def _sample_tokens(next_logits, temperature, top_k):
 @torch.no_grad()
 def generate(model,
              dataset,
-             max_len=500,
+             max_duration_hours=336.0,
+             max_len=2000,
              temperature=1.0,
              top_k=None,
              rep_decay=0.6,
@@ -136,15 +137,22 @@ def generate(model,
     Unified autoregressive generation for all patients in *dataset*.
 
     Generates token-by-token using a batched KV-cached decode loop with FP16 autocast.
-    Patients run until they emit a terminal token or reach *max_len* steps.
-    Patients that exhaust *max_len* receive a forced terminal token chosen by the
-    highest generation logit among TERMINAL_OUTCOMES (DEATH vs RELEASE), clamped to
-    <= 336 h absolute time (14 days from admission).
+    A patient stops when ANY of these is true:
+      1. It emits a terminal token (DEATH / RELEASE).
+      2. Its current absolute time ≥ max_duration_hours (training horizon).
+      3. The decode loop has produced max_len new tokens (safety cap).
+    Patients that stop on (2) or (3) without a natural terminal receive a forced
+    terminal token chosen by the highest generation logit among TERMINAL_OUTCOMES,
+    clamped to ≤ max_duration_hours.
 
     Args:
         model: Trained GPT model.
         dataset: EMRDataset providing patient seeds.
-        max_len (int): Maximum new tokens to generate per patient.
+        max_duration_hours (float): Primary stop condition — generation horizon
+            in hours from admission. Should match the training horizon (336 h /
+            14 days by default) so Time2Vec stays in-distribution. Going past
+            this point produces meaningless extrapolated embeddings.
+        max_len (int): Hard ceiling on new tokens per patient (safety only).
         temperature (float): Softmax temperature (1.0 = neutral).
         top_k (int | None): Top-k sampling; argmax if None.
         rep_decay (float): Repetition penalty strength (0 = disabled).
@@ -160,6 +168,7 @@ def generate(model,
         IsOutcome, IsTerminal, and (if collect_risk_scores=True) one P_<outcome>
         column per outcome in model.outcome_names.
     """
+    max_abs_ts_norm = float(max_duration_hours) / 336.0  # comparison threshold in normalised units
     autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
     device    = next(model.parameters()).device
     tok       = model.embedder.tokenizer
@@ -248,6 +257,10 @@ def generate(model,
             current_abs_ts = abs_t_pre[torch.arange(B, device=device), last_valid_idx]
             last_seed_ts   = abs_ts[torch.arange(B, device=device), last_valid_idx]
             current_abs_ts = torch.maximum(current_abs_ts, last_seed_ts)
+
+            # Stop any patient whose seed already exceeds the training horizon.
+            time_exceeded = current_abs_ts >= max_abs_ts_norm
+            finished      = finished | time_exceeded
 
             cache_mask        = (pos_ids != pad_id)
             open_counts, next_meal_rank = init_legality_state_batched(luts, pos_ids)
@@ -354,6 +367,10 @@ def generate(model,
                 new_abs_t      = abs_t_dec[:, 0]
                 current_abs_ts = torch.maximum(new_abs_t, current_abs_ts)
 
+                # Time-based stop: patients whose absolute time hits the horizon are done.
+                time_exceeded = current_abs_ts >= max_abs_ts_norm
+                finished      = finished | time_exceeded
+
                 # Fill outcome probs for this step — 1 bulk sync for the whole batch.
                 if collect_risk_scores and step_row_idx:
                     step_probs_cpu = torch.sigmoid(outcome_logits_dec[:, 0, :]).cpu().numpy()
@@ -361,18 +378,24 @@ def generate(model,
                         for j, col in enumerate(outcome_cols):
                             rows[row_idx][col] = float(step_probs_cpu[bi, j])
 
-            # ── terminal fallback for patients that exhausted max_len ─────
+            # ── terminal fallback for patients that exited without natural terminal ─────
+            # Triggers when a patient hit max_duration_hours OR max_len.
             # Picks DEATH or RELEASE by highest generation logit at the last step.
-            # TimePoint clamped to <= 336 h so it stays within the training window.
-            if steps == max_len and len(terminal_ids) > 0:
+            # TimePoint clamped to ≤ max_duration_hours so it stays within training window.
+            if len(terminal_ids) > 0:
                 term_list = list(terminal_ids)
+                # A patient is in the fallback set if its last emitted token was NOT terminal.
+                # `finished` may have been set by terminal emission, time, or max_len exit.
+                last_tok_per_patient = {bi: (last_tokens_batch[bi][-1] if last_tokens_batch[bi]
+                                              else int(last_toks[bi]))
+                                        for bi in range(B)}
                 for bi in range(B):
-                    if finished[bi]:
+                    if last_tok_per_patient[bi] in terminal_ids:
                         continue
                     fallback_pids.append(batch_pids[bi])
                     best_logit  = next_logits[bi, term_list]
                     best_tid    = term_list[int(torch.argmax(best_logit))]
-                    forced_time = min(current_abs_ts[bi].item() * 336.0, 336.0)
+                    forced_time = min(current_abs_ts[bi].item() * 336.0, float(max_duration_hours))
                     row = {
                         "PatientId":  batch_pids[bi],
                         "Step":       sl_cpu[bi] + steps + 1,

@@ -1,4 +1,4 @@
-"""Standalone diagnostics for EMR autoresearch.
+"""Standalone diagnostics for model research.
 
 Run:
     python -m transform_emr.diagnose
@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -20,24 +20,25 @@ from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.model_selection import cross_val_score
 
-from transform_emr.config.dataset_config import (  # noqa: E402
+from transform_emr.config.dataset_config import (
     OUTCOMES,
     TAK_REPO_PATH,
+    TERMINAL_OUTCOMES,
     TRAIN_CTX_DATA_FILE,
     TRAIN_TEMPORAL_DATA_FILE,
 )
-from transform_emr.config.model_config import (  # noqa: E402
+from transform_emr.config.model_config import (  
     CHECKPOINT_PATH,
     PHASE1_CHECKPOINT,
     PHASE2_CHECKPOINT,
     PHASE3_CHECKPOINT,
     TRAINING_SETTINGS,
 )
-from transform_emr.dataset import DataProcessor, EMRDataset, EMRTokenizer, collate_emr, get_dataloader  # noqa: E402
-from transform_emr.embedder import EMREmbedding  # noqa: E402
-from transform_emr.loss import MaskedFocalBCE  # noqa: E402
-from transform_emr.transformer import GPT  # noqa: E402
-from transform_emr.utils import (  # noqa: E402
+from transform_emr.dataset import DataProcessor, EMRDataset, EMRTokenizer, collate_emr, get_dataloader  
+from transform_emr.embedder import EMREmbedding  
+from transform_emr.loss import MaskedFocalBCE  
+from transform_emr.transformer import GPT  
+from transform_emr.utils import (  
     apply_masks_to_logits,
     build_luts,
     compute_legality_masks_tf,
@@ -587,6 +588,538 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     _vocab_health_report(model, val_dl, tokenizer, pad_idx, device=device, max_batches=3, k_window=12)
 
     print("\n[Diag] Done.")
+
+
+def diagnose_generation_time(df: pd.DataFrame, max_duration_hours: float = 336.0) -> dict:
+    """
+    Purpose: Audit the temporal behaviour of a generated event stream to detect
+        Δt mean-collapse and verify the generator respected the training horizon.
+    Method: Restrict to generated rows (IsInput == 0), compute per-patient Δt,
+        and compare across-patient variance of mean-Δt to within-patient Δt
+        variance. A small ratio means every patient ticks at the same rate
+        regardless of context — i.e. the time head has collapsed to the dataset
+        mean. Also reports the fraction of patients that ran past the horizon.
+
+    Args:
+        df (pd.DataFrame): Output of `transform_emr.inference.generate()`.
+        max_duration_hours (float): Training horizon (default 336 h = 14 days).
+
+    Returns:
+        dict: Summary stats — global Δt percentiles, per-patient mean-Δt spread,
+            horizon-overrun fraction, and a `mean_regression_warning` flag.
+    """
+    gen = df[df["IsInput"] == 0].copy()
+    if len(gen) == 0:
+        print("[diagnose-time] No generated rows — nothing to analyse.")
+        return {}
+
+    gen = gen.sort_values(["PatientId", "Step"])
+    gen["dt"] = gen.groupby("PatientId")["TimePoint"].diff()
+    dts = gen["dt"].dropna().to_numpy()
+
+    per_pid_mean_dt = gen.groupby("PatientId")["dt"].mean().dropna().to_numpy()
+    per_pid_max_t = gen.groupby("PatientId")["TimePoint"].max()
+
+    within_std = float(np.std(dts)) if len(dts) else float("nan")
+    across_std = float(np.std(per_pid_mean_dt)) if len(per_pid_mean_dt) else float("nan")
+    ratio = (across_std / within_std) if within_std > 1e-6 else float("nan")
+
+    stats = {
+        "n_patients":                  int(gen["PatientId"].nunique()),
+        "n_gen_rows":                  int(len(gen)),
+        "dt_mean":                     float(np.mean(dts)) if len(dts) else float("nan"),
+        "dt_std":                      within_std,
+        "dt_p50":                      float(np.percentile(dts, 50)) if len(dts) else float("nan"),
+        "dt_p90":                      float(np.percentile(dts, 90)) if len(dts) else float("nan"),
+        "dt_p99":                      float(np.percentile(dts, 99)) if len(dts) else float("nan"),
+        "per_patient_mean_dt_std":     across_std,
+        "across_over_within_std_ratio": ratio,
+        "frac_patients_past_horizon":  float((per_pid_max_t > max_duration_hours).mean()),
+        "max_timepoint":               float(per_pid_max_t.max()),
+        "mean_regression_warning":     bool(ratio < 0.1) if ratio == ratio else False,
+    }
+
+    print("\n" + "=" * 90)
+    print("GENERATION TIME DIAGNOSTICS")
+    print("=" * 90)
+    print(f"patients={stats['n_patients']}  gen_rows={stats['n_gen_rows']}")
+    print(
+        f"  Δt (h):  mean={stats['dt_mean']:.2f}  std={stats['dt_std']:.2f}  "
+        f"p50={stats['dt_p50']:.2f}  p90={stats['dt_p90']:.2f}  p99={stats['dt_p99']:.2f}"
+    )
+    print(
+        f"  Per-patient mean-Δt: across-std={stats['per_patient_mean_dt_std']:.3f}  "
+        f"(across/within ratio={stats['across_over_within_std_ratio']:.3f})"
+    )
+    print(
+        f"  Max TimePoint observed: {stats['max_timepoint']:.1f} h  "
+        f"(horizon={max_duration_hours}); "
+        f"{100 * stats['frac_patients_past_horizon']:.1f}% of patients ran past horizon."
+    )
+    if stats["mean_regression_warning"]:
+        print("  ⚠ Mean-regression suspected: per-patient mean Δt barely varies vs within-patient Δt.")
+    return stats
+
+
+def _collect_val_batches(model, val_dl, n_batches: int = 1):
+    """
+    Purpose: Cache a small validation slice so probes share one forward pass.
+    Method: Run the model in eval mode (no autocast), keep float32 outputs on CPU.
+
+    Args:
+        model: GPT, already on device, in eval mode.
+        val_dl (DataLoader): Validation dataloader.
+        n_batches (int): Batches to consume.
+
+    Returns:
+        dict: logits, outcome_logits, abs_t_pred, abs_ts, targets, pad_idx.
+    """
+    device = next(model.parameters()).device
+    pad_idx = model.embedder.padding_idx
+    model.eval()
+
+    logits_list, oh_list, dt_pred_list, abs_ts_list, tgt_list = [], [], [], [], []
+    with torch.no_grad():
+        for i, batch in enumerate(val_dl):
+            if i >= n_batches:
+                break
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            logits, abs_t_pred, outcome_logits, _ = model(
+                parent_raw_ids=batch["parent_raw_ids"],
+                concept_ids=batch["concept_ids"],
+                value_ids=batch["value_ids"],
+                position_ids=batch["position_ids"],
+                abs_ts=batch["abs_ts"],
+                context_vec=batch["context_vec"],
+            )
+            logits_list.append(logits.float().cpu())
+            oh_list.append(outcome_logits.float().cpu())
+            dt_pred_list.append(abs_t_pred.float().cpu())
+            abs_ts_list.append(batch["abs_ts"].float().cpu())
+            tgt_list.append(batch["targets"].cpu())
+
+    # Different batches may have different T_max — pad each batch to a common
+    # T before concat. Pad with `pad_idx` for targets and 0.0 elsewhere so the
+    # `nonpad = (targets != pad_idx)` mask filters them out in every probe.
+    T_max = max(x.size(1) for x in tgt_list)
+
+    def _pad_T(t, fill):
+        if t.size(1) == T_max:
+            return t
+        pad_shape = list(t.shape)
+        pad_shape[1] = T_max - t.size(1)
+        pad = torch.full(pad_shape, fill, dtype=t.dtype)
+        return torch.cat([t, pad], dim=1)
+
+    return {
+        "logits":         torch.cat([_pad_T(x, 0.0)     for x in logits_list],  dim=0),
+        "outcome_logits": torch.cat([_pad_T(x, 0.0)     for x in oh_list],      dim=0),
+        "abs_t_pred":     torch.cat([_pad_T(x, 0.0)     for x in dt_pred_list], dim=0),
+        "abs_ts":         torch.cat([_pad_T(x, 0.0)     for x in abs_ts_list],  dim=0),
+        "targets":        torch.cat([_pad_T(x, pad_idx) for x in tgt_list],     dim=0),
+        "pad_idx":        pad_idx,
+    }
+
+
+def probe_dt_head(model, val_dl, n_batches: int = 1) -> dict:
+    """
+    Purpose: Detect whether the Δt head has collapsed to a constant or roughly
+        tracks ground-truth deltas.
+    Method: Compute predicted Δt = abs_t_pred[t] - abs_ts[t] vs true Δt =
+        abs_ts[t+1] - abs_ts[t] over non-pad positions. Report Pearson r, R²,
+        and per-patient std of predicted Δt.
+
+    Args:
+        model: GPT in eval mode.
+        val_dl (DataLoader): Validation dataloader.
+        n_batches (int): Batches to consume.
+
+    Returns:
+        dict: pearson_r, r2, pred_std_h, true_std_h, pred_mean_h, true_mean_h.
+    """
+    cache = _collect_val_batches(model, val_dl, n_batches=n_batches)
+    abs_ts     = cache["abs_ts"]
+    abs_t_pred = cache["abs_t_pred"]
+    pad_idx    = cache["pad_idx"]
+    tgt        = cache["targets"]
+
+    true_dt = (abs_ts[:, 1:] - abs_ts[:, :-1])
+    pred_dt = (abs_t_pred[:, :-1] - abs_ts[:, :-1])
+    valid   = (tgt[:, 1:] != pad_idx) & (tgt[:, :-1] != pad_idx)
+
+    p = pred_dt[valid].numpy() * 336.0
+    t = true_dt[valid].numpy() * 336.0
+
+    if len(p) < 5:
+        print("[probe-dt] not enough valid positions")
+        return {}
+
+    pm, tm = float(p.mean()), float(t.mean())
+    cov = float(((p - pm) * (t - tm)).mean())
+    r   = cov / (p.std() * t.std() + 1e-12)
+    r2  = 1.0 - ((p - t) ** 2).sum() / (((t - tm) ** 2).sum() + 1e-12)
+
+    B = abs_ts.size(0)
+    per_b_std = []
+    for b in range(B):
+        v = (tgt[b, 1:] != pad_idx) & (tgt[b, :-1] != pad_idx)
+        if v.sum() >= 3:
+            per_b_std.append(float((pred_dt[b, :v.size(0)][v].numpy() * 336.0).std()))
+
+    print("\n" + "=" * 90)
+    print("PROBE - Δt HEAD")
+    print("=" * 90)
+    print(f"  positions   : {len(p):,}")
+    print(f"  pred Δt (h) : mean={pm:.3f}  std={p.std():.3f}")
+    print(f"  true Δt (h) : mean={tm:.3f}  std={t.std():.3f}")
+    print(f"  Pearson r   : {r:.4f}")
+    print(f"  R²          : {r2:.4f}")
+    if per_b_std:
+        print(
+            f"  per-patient pred Δt std (h): "
+            f"mean={np.mean(per_b_std):.3f}  p10={np.percentile(per_b_std, 10):.3f}"
+        )
+    if abs(p.std()) < 0.05 or r < 0.1:
+        print("  ⚠ Δt head looks collapsed (low std and/or near-zero correlation).")
+
+    return {
+        "pearson_r": float(r),
+        "r2":        float(r2),
+        "pred_std_h":  float(p.std()),
+        "true_std_h":  float(t.std()),
+        "pred_mean_h": pm,
+        "true_mean_h": tm,
+    }
+
+
+def probe_terminal_logits(model, val_dl, tokenizer, n_batches: int = 1, top_k_show: int = 5) -> dict:
+    """
+    Purpose: Diagnose why generation never emits DEATH/RELEASE — inspect LM-head
+        rank, probability, and logit gap of terminal tokens at non-pad positions.
+    Method: Softmax over full vocab (no legality mask). Per terminal: median
+        rank, p10 rank, mean prob, and (logit − mean non-terminal logit). Also
+        print top-k logits at the last non-pad position per patient.
+
+    Args:
+        model: GPT in eval mode.
+        val_dl (DataLoader): Validation dataloader.
+        tokenizer (EMRTokenizer): For token2id lookup.
+        n_batches (int): Batches to consume.
+        top_k_show (int): Top-k tokens to print at end-of-sequence positions.
+
+    Returns:
+        dict: per-terminal {median_rank, p10_rank, mean_prob, mean_logit_gap}.
+    """
+    cache = _collect_val_batches(model, val_dl, n_batches=n_batches)
+    logits  = cache["logits"]
+    tgt     = cache["targets"]
+    pad_idx = cache["pad_idx"]
+    nonpad  = (tgt != pad_idx)
+
+    term_ids = [tokenizer.token2id[t] for t in TERMINAL_OUTCOMES if t in tokenizer.token2id]
+    if not term_ids:
+        print("[probe-terminal] No terminal tokens in vocab.")
+        return {}
+
+    probs = torch.softmax(logits, dim=-1)
+    sorted_idx = torch.argsort(logits, dim=-1, descending=True)
+    V = logits.size(-1)
+    ranks = torch.empty_like(sorted_idx)
+    ranks.scatter_(2, sorted_idx, torch.arange(V).expand_as(sorted_idx))
+
+    print("\n" + "=" * 90)
+    print("PROBE - TERMINAL TOKEN LM-HEAD HEALTH")
+    print("=" * 90)
+    print(f"{'token':<20} {'median_rank':>12} {'p10_rank':>10} {'mean_prob':>12} {'logit_gap':>12}")
+
+    out = {}
+    mask_terms = torch.zeros(V, dtype=torch.bool)
+    mask_terms[term_ids] = True
+    nonterm_logit_mean = logits[..., ~mask_terms].mean(dim=-1)
+    for tid in term_ids:
+        tok_name = tokenizer.id2token[tid]
+        gap = (logits[..., tid] - nonterm_logit_mean)[nonpad].numpy()
+        rk  = ranks[..., tid][nonpad].float().numpy()
+        pr  = probs[..., tid][nonpad].numpy()
+        print(
+            f"{tok_name:<20} {np.median(rk):>12.1f} {np.percentile(rk, 10):>10.1f} "
+            f"{pr.mean():>12.6f} {gap.mean():>12.4f}"
+        )
+        out[tok_name] = {
+            "median_rank":    float(np.median(rk)),
+            "p10_rank":       float(np.percentile(rk, 10)),
+            "mean_prob":      float(pr.mean()),
+            "mean_logit_gap": float(gap.mean()),
+        }
+
+    last_idx = nonpad.sum(dim=1) - 1
+    B = logits.size(0)
+    eos_logits = logits[torch.arange(B), last_idx, :]
+    print(f"\nEnd-of-sequence top-{top_k_show} predictions (first 3 patients):")
+    for b in range(min(3, B)):
+        top_v, top_i = torch.topk(eos_logits[b], top_k_show)
+        toks = [tokenizer.id2token[int(i)] for i in top_i]
+        print(f"  pid#{b}: " + ", ".join(f"{t}={v:.2f}" for t, v in zip(toks, top_v.tolist())))
+    return out
+
+
+def probe_outcome_label_alignment(model, val_dl, tokenizer, n_batches: int = 1,
+                                  eval_window_h: float = 48.0) -> pd.DataFrame:
+    """
+    Purpose: Detect outcome-head sign/label flips. Compare head logits where the
+        outcome occurs within eval_window_h vs where it does not.
+    Method: Build positives = "outcome token appears in (now, now+eval_window_h]".
+        Compute mean-logit gap (pos − neg) and AUROC. Flip = gap < 0 or AUROC < 0.5.
+
+    Args:
+        model: GPT in eval mode.
+        val_dl (DataLoader): Validation dataloader.
+        tokenizer (EMRTokenizer): For token2id lookup.
+        n_batches (int): Batches to consume.
+        eval_window_h (float): Future window in hours.
+
+    Returns:
+        pd.DataFrame: per-outcome rows with mean_logit_pos, mean_logit_neg, gap,
+            n_pos, n_neg, auroc, flip flag.
+    """
+    cache = _collect_val_batches(model, val_dl, n_batches=n_batches)
+    oh    = cache["outcome_logits"]
+    abs_ts = cache["abs_ts"]
+    tgt    = cache["targets"]
+    pad    = cache["pad_idx"]
+
+    eval_norm = float(eval_window_h) / 336.0
+    cur = abs_ts.unsqueeze(2)
+    fut = abs_ts.unsqueeze(1)
+    dt  = fut - cur
+    in_win = (dt > 0) & (dt <= eval_norm)
+    nonpad_cur = (tgt != pad)
+
+    rows = []
+    for k, name in enumerate(model.outcome_names):
+        if name not in tokenizer.token2id:
+            continue
+        tid = tokenizer.token2id[name]
+        fut_is_o = (tgt == tid).unsqueeze(1)
+        label = (in_win & fut_is_o).any(dim=2)
+
+        head_logit = oh[..., k]
+        pos = head_logit[label & nonpad_cur].numpy()
+        neg = head_logit[(~label) & nonpad_cur].numpy()
+
+        if len(pos) == 0 or len(neg) == 0:
+            rows.append({
+                "outcome": name, "n_pos": int(len(pos)), "n_neg": int(len(neg)),
+                "mean_logit_pos": float("nan"), "mean_logit_neg": float("nan"),
+                "gap": float("nan"), "auroc": float("nan"), "flip": False,
+            })
+            continue
+
+        gap = float(pos.mean() - neg.mean())
+        try:
+            auc = float(roc_auc_score(
+                np.r_[np.ones_like(pos), np.zeros_like(neg)],
+                np.r_[pos, neg],
+            ))
+        except ValueError:
+            auc = float("nan")
+        rows.append({
+            "outcome": name,
+            "n_pos":   int(len(pos)),
+            "n_neg":   int(len(neg)),
+            "mean_logit_pos": float(pos.mean()),
+            "mean_logit_neg": float(neg.mean()),
+            "gap":   gap,
+            "auroc": auc,
+            "flip":  bool(gap < 0 or (auc == auc and auc < 0.5)),
+        })
+
+    df = pd.DataFrame(rows).sort_values("gap")
+    print("\n" + "=" * 90)
+    print(f"PROBE - OUTCOME HEAD LABEL ALIGNMENT (eval window={eval_window_h}h)")
+    print("=" * 90)
+    print(df.round(4).to_string(index=False))
+    flipped = df[df["flip"]]["outcome"].tolist()
+    if flipped:
+        print(f"\n⚠ Possible label flips: {flipped}")
+    return df
+
+
+def probe_calibration_by_abs_time(model, val_dl, tokenizer, n_batches: int = 1,
+                                  bins_h=(0, 24, 48, 96, 168, 336, 672)) -> pd.DataFrame:
+    """
+    Purpose: Detect Time2Vec OOD behaviour. AUROC drop at high absolute times
+        (especially past 336h) means time encoding extrapolates poorly.
+    Method: Bin positions by hours-from-admission, compute per-bin mean outcome
+        logit and AUROC averaged across all outcomes (48h forward window).
+
+    Args:
+        model: GPT in eval mode.
+        val_dl (DataLoader): Validation dataloader.
+        tokenizer (EMRTokenizer): For outcome token ids.
+        n_batches (int): Batches to consume.
+        bins_h (tuple): Bin edges in hours.
+
+    Returns:
+        pd.DataFrame: per-bin {n_positions, mean_logit, mean_auroc}.
+    """
+    cache = _collect_val_batches(model, val_dl, n_batches=n_batches)
+    oh    = cache["outcome_logits"]
+    abs_ts = cache["abs_ts"]
+    tgt    = cache["targets"]
+    pad    = cache["pad_idx"]
+    nonpad = (tgt != pad)
+
+    eval_norm = 48.0 / 336.0
+    cur = abs_ts.unsqueeze(2)
+    fut = abs_ts.unsqueeze(1)
+    dt  = fut - cur
+    in_win = (dt > 0) & (dt <= eval_norm)
+
+    abs_h = (abs_ts * 336.0).numpy()
+    rows = []
+    for lo, hi in zip(bins_h[:-1], bins_h[1:]):
+        bin_mask = (abs_h >= lo) & (abs_h < hi) & nonpad.numpy()
+        if bin_mask.sum() == 0:
+            continue
+        aurocs, mean_logits = [], []
+        for k, name in enumerate(model.outcome_names):
+            if name not in tokenizer.token2id:
+                continue
+            tid = tokenizer.token2id[name]
+            label = (in_win & (tgt == tid).unsqueeze(1)).any(dim=2).numpy()
+            sc = oh[..., k].numpy()
+            lb_b = label[bin_mask].astype(bool)
+            sc_b = sc[bin_mask]
+            mean_logits.append(float(sc_b.mean()))
+            if lb_b.sum() > 0 and (~lb_b).sum() > 0:
+                try:
+                    aurocs.append(float(roc_auc_score(lb_b, sc_b)))
+                except ValueError:
+                    pass
+        rows.append({
+            "bin": f"[{lo}, {hi})h",
+            "n_positions": int(bin_mask.sum()),
+            "mean_logit":  float(np.mean(mean_logits)) if mean_logits else float("nan"),
+            "mean_auroc":  float(np.mean(aurocs))      if aurocs       else float("nan"),
+        })
+
+    df = pd.DataFrame(rows)
+    print("\n" + "=" * 90)
+    print("PROBE - CALIBRATION BY ABSOLUTE TIME (mean over outcomes)")
+    print("=" * 90)
+    print(df.round(4).to_string(index=False))
+    return df
+
+
+def probe_legality_starvation(model, val_dl, tokenizer, n_batches: int = 1) -> dict:
+    """
+    Purpose: Confirm DEATH/RELEASE are not blocked by the legality mask at the
+        positions where they are GT next token. A non-zero blocked fraction is
+        a bug in the legality LUT.
+    Method: For each non-pad position with terminal target, query
+        compute_legality_masks_tf and check whether the terminal id is illegal.
+
+    Args:
+        model: GPT (uses its tokenizer/luts/device).
+        val_dl (DataLoader): Validation dataloader.
+        tokenizer (EMRTokenizer): For token ids.
+        n_batches (int): Batches to consume.
+
+    Returns:
+        dict: per-terminal {n_target_positions, n_marked_illegal, frac_blocked}.
+    """
+    device = next(model.parameters()).device
+    pad_idx = model.embedder.padding_idx
+    luts = build_luts(tokenizer)
+    for k, v in list(luts.items()):
+        if torch.is_tensor(v):
+            luts[k] = v.to(device)
+
+    term_ids = [tokenizer.token2id[t] for t in TERMINAL_OUTCOMES if t in tokenizer.token2id]
+    counts = {tokenizer.id2token[tid]: {"target": 0, "blocked": 0} for tid in term_ids}
+
+    with torch.no_grad():
+        for i, batch in enumerate(val_dl):
+            if i >= n_batches:
+                break
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            tgt = batch["targets"]
+            target_next = tgt[:, 1:]
+            illegal = compute_legality_masks_tf(
+                target_next,
+                luts["is_start"], luts["is_end"],
+                luts["base_id"],
+                luts["start_ids_per_base"], luts["end_ids_per_base"],
+                luts["meal_rank"], luts["meal_pred_rank"], luts["K_meals"],
+                luts["conflict_mat"], luts["predict_block"],
+            )
+            nonpad = (target_next != pad_idx)
+            for tid in term_ids:
+                tok_name = tokenizer.id2token[tid]
+                is_target = (target_next == tid) & nonpad
+                if is_target.sum() == 0:
+                    continue
+                blocked = illegal[..., tid] & is_target
+                counts[tok_name]["target"]  += int(is_target.sum().item())
+                counts[tok_name]["blocked"] += int(blocked.sum().item())
+
+    print("\n" + "=" * 90)
+    print("PROBE - LEGALITY MASK STARVATION (terminal targets blocked)")
+    print("=" * 90)
+    out = {}
+    for name, c in counts.items():
+        frac = (c["blocked"] / c["target"]) if c["target"] else float("nan")
+        print(
+            f"  {name:<20} target_positions={c['target']:>6}  blocked={c['blocked']:>6}  "
+            f"frac_blocked={frac:.4f}"
+        )
+        out[name] = {
+            "n_target_positions": c["target"],
+            "n_marked_illegal":   c["blocked"],
+            "frac_blocked":       float(frac) if frac == frac else float("nan"),
+        }
+    return out
+
+
+def probe_outcome_logit_distribution(model, val_dl, n_batches: int = 1) -> pd.DataFrame:
+    """
+    Purpose: Inspect per-outcome head logit spread to corroborate extreme
+        calibration temperatures (Hyperglycemia T=74, RELEASE T=86 ⇒ logits
+        ~2 OOM too sharp).
+    Method: Forward a val slice, collect outcome head logits at non-pad
+        positions, report mean / std / p99 / abs-max per outcome.
+
+    Args:
+        model: GPT in eval mode.
+        val_dl (DataLoader): Validation dataloader.
+        n_batches (int): Batches to consume.
+
+    Returns:
+        pd.DataFrame: per-outcome distributional stats sorted by std desc.
+    """
+    cache = _collect_val_batches(model, val_dl, n_batches=n_batches)
+    oh   = cache["outcome_logits"]
+    tgt  = cache["targets"]
+    nonpad = (tgt != cache["pad_idx"])
+
+    rows = []
+    for k, name in enumerate(model.outcome_names):
+        v = oh[..., k][nonpad].numpy()
+        rows.append({
+            "outcome": name,
+            "mean":    float(v.mean()),
+            "std":     float(v.std()),
+            "p50":     float(np.percentile(v, 50)),
+            "p99":     float(np.percentile(v, 99)),
+            "abs_max": float(np.abs(v).max()),
+        })
+    df = pd.DataFrame(rows).sort_values("std", ascending=False)
+    print("\n" + "=" * 90)
+    print("PROBE - OUTCOME HEAD LOGIT DISTRIBUTION")
+    print("=" * 90)
+    print(df.round(3).to_string(index=False))
+    return df
 
 
 def main() -> None:
