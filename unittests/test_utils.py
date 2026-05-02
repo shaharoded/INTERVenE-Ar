@@ -36,41 +36,95 @@ def test_linear_schedule_import_is_from_schedulers():
 def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activation():
     """
     Phase-1 scheduling contract:
-      - bce_only_epochs=1 means aux activates at epoch 1, not 0.
-      - Calibration uses tr_main (training BCE) not validation.
-      - update() uses vl_total for plateau, tr_main+aux names for calibration.
+      - bce_only_epochs=1, start_epoch=0 → aux start_epoch=1.
+      - Pre-calibration fires at the last BCE-only epoch (start_epoch-1=0) so the
+        first active epoch (1) already has a known lambda_max and contributes to loss.
+      - get_lambdas returns 0 before start_epoch even after pre-calibration.
+      - Warmup gate == start_epoch (epoch 1), not start_epoch+1.
       - Single-stage: has_dynamic=False, current_warmup_end_epoch() returns concrete epoch.
     """
     cfg = {
         "bce_only_epochs": 1,
         "aux_fraction_caps": {"mlm": 0.20, "dt": 0.20},
         "order": [["mlm", "dt"]],
-        "ramp_epochs": {"mlm": 0, "dt": 0},  # 0 = immediate
+        "ramp_epochs": {"mlm": 0, "dt": 0},
     }
     controller = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
     assert controller.has_dynamic is False
-    # For single-stage with ramp_epochs=0, warmup_end_epoch == start_epoch of stage 0
-    warmup_epoch = controller.current_warmup_end_epoch()
-    assert warmup_epoch == 1, f"Expected warmup to end at epoch 1, got {warmup_epoch}"
+    # Warmup gate == start_epoch (1), not start_epoch+1
+    assert controller.current_warmup_end_epoch() == 1
 
-    # Before bce_only_epochs passes, lambdas = 0.
-    assert controller.get_lambdas(epoch=0)["mlm"] == 0.0
-
-    # First active epoch (1): calibrate using training losses.
-    events = controller.update(epoch=1, vl_total=1.8, tr_main=2.0, mlm=1.0, dt=0.5)
-    assert len(events) >= 2  # one calibration message per aux
+    # Pre-calibration fires at last BCE-only epoch (epoch 0 = start_epoch-1).
+    events = controller.update(epoch=0, vl_total=2.5, tr_main=2.0, mlm=1.0, dt=0.5)
+    assert len(events) >= 2, "Expected calibration messages at pre-calibration epoch"
 
     # lambda_max = fraction * tr_main / tr_aux
     # mlm: 0.20 * 2.0 / 1.0 = 0.40;  dt: 0.20 * 2.0 / 0.5 = 0.80
+    # But get_lambdas at epoch 0 is still 0 (epoch < start_epoch=1).
+    assert controller.get_lambdas(epoch=0)["mlm"] == 0.0
+    assert controller.get_lambdas(epoch=0)["dt"] == 0.0
+
+    # First active epoch (1): lambda_max already known → full lambda immediately.
     l1 = controller.get_lambdas(epoch=1)
     assert l1["mlm"] == pytest.approx(0.40)
     assert l1["dt"] == pytest.approx(0.80)
 
-    # Calibration is frozen — second update must not change lambda_max.
+    # update at epoch 1 must NOT re-calibrate (already done).
+    events2 = controller.update(epoch=1, vl_total=1.8, tr_main=10.0, mlm=10.0, dt=10.0)
+    assert len(events2) == 0, "Must not re-calibrate on second update"
+    assert controller.get_lambdas(epoch=1)["mlm"] == pytest.approx(0.40)
+
+    # Calibration remains frozen at subsequent epochs.
     controller.update(epoch=2, vl_total=1.0, tr_main=10.0, mlm=10.0, dt=10.0)
-    l2 = controller.get_lambdas(epoch=2)
-    assert l2["mlm"] == pytest.approx(l1["mlm"])
-    assert l2["dt"] == pytest.approx(l1["dt"])
+    assert controller.get_lambdas(epoch=2)["mlm"] == pytest.approx(0.40)
+
+
+def test_precalibration_warmup_gate_at_start_epoch_not_plus_one():
+    """
+    With bce_only_epochs=3 (matching real Phase-1 config) and ramp_epochs=0:
+      - aux start_epoch = training_start + 3 = 4 (using start_epoch=1).
+      - Pre-calibration fires at epoch 3 (start_epoch-1).
+      - get_lambdas(3) == 0 (not yet active).
+      - get_lambdas(4) == lambda_max (active, no ramp).
+      - Warmup gate == 4, not 5.
+
+    This guards against the regression where the best model was saved at epoch 4
+    (BCE-only) before aux losses ever contributed to the val loss.
+    """
+    cfg = {
+        "bce_only_epochs": 3,
+        "aux_fraction_caps": {"mlm": 0.20, "dt": 0.20},
+        "order": [["mlm", "dt"]],
+        "ramp_epochs": {"mlm": 0, "dt": 0},
+    }
+    controller = LambdaScheduleController(schedule_config=cfg, start_epoch=1)
+    # aux start_epoch = 1 + 3 = 4; warmup gate = 4
+    assert controller.current_warmup_end_epoch() == 4
+
+    # Epochs 1-2: too early for pre-calibration (need epoch >= 3 = start_epoch-1)
+    controller.update(epoch=1, vl_total=2.0, tr_main=1.0, mlm=0.8, dt=0.3)
+    assert controller._auxiliaries["mlm"]["lambda_max"] is None
+
+    controller.update(epoch=2, vl_total=1.9, tr_main=1.0, mlm=0.8, dt=0.3)
+    assert controller._auxiliaries["mlm"]["lambda_max"] is None
+
+    # Epoch 3 (last BCE-only = start_epoch-1): pre-calibration fires.
+    events = controller.update(epoch=3, vl_total=1.8, tr_main=1.0, mlm=0.5, dt=0.25)
+    assert len(events) >= 2, "Pre-calibration must fire at epoch 3"
+    assert controller._auxiliaries["mlm"]["lambda_max"] is not None
+
+    # Still 0 at epoch 3 (epoch < start_epoch=4).
+    assert controller.get_lambdas(epoch=3)["mlm"] == 0.0
+    assert controller.get_lambdas(epoch=3)["dt"] == 0.0
+
+    # Full lambda at epoch 4 (first active epoch, no ramp).
+    # mlm: 0.20 * 1.0 / 0.5 = 0.40; dt: 0.20 * 1.0 / 0.25 = 0.80
+    l4 = controller.get_lambdas(epoch=4)
+    assert l4["mlm"] == pytest.approx(0.40)
+    assert l4["dt"] == pytest.approx(0.80)
+
+    # Warmup gate is 4, not 5 — checkpointing valid from first aux-active epoch.
+    assert controller.current_warmup_end_epoch() == 4
 
 
 def test_unified_lambda_schedule_controller_phase2_ramp_progression():

@@ -283,9 +283,11 @@ class LambdaScheduleController:
             messages.extend(self._check_stage_transitions(epoch, vl_total))
 
         # Step 2: Calibrate each auxiliary once using training losses.
+        # Pre-calibrate one epoch before start_epoch so the first active epoch already
+        # has a known lambda_max (get_lambdas still returns 0 when epoch < start_epoch).
         for name, spec in self._auxiliaries.items():
-            if spec["start_epoch"] is None or epoch < spec["start_epoch"]:
-                continue  # Not yet active
+            if spec["start_epoch"] is None or epoch < spec["start_epoch"] - 1:
+                continue  # Not yet time to calibrate
             if spec["lambda_max"] is not None:
                 continue  # Already calibrated
             if name not in tr_aux_losses:
