@@ -622,7 +622,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
         # Save best model only after aux-scheduler warmup is complete.
         warmup_gate = schedule_controller.current_warmup_end_epoch()
 
-        if (vl_tot < best_val - 1e-4) and (epoch >= warmup_gate):
+        min_delta_rel = training_settings.get("early-stop-min-delta-rel", 1e-3)
+        if (vl_tot < best_val * (1.0 - min_delta_rel)) and (epoch >= warmup_gate):
             best_val = vl_tot
             bad_epochs = 0
             embedder.save(epoch, best_val, optimizer, scheduler, ckpt_path,

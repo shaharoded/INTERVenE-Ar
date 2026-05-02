@@ -1043,7 +1043,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         # Save best model
         warmup_gate = schedule_controller.current_warmup_end_epoch()
 
-        if (vl_loss < best_val - 1e-4) and (epoch >= warmup_gate):
+        min_delta_rel = training_settings.get("early-stop-min-delta-rel", 1e-3)
+        if (vl_loss < best_val * (1.0 - min_delta_rel)) and (epoch >= warmup_gate):
             best_val = vl_loss
             model.save(ckpt_path, epoch, best_val, optimizer, scheduler,
                        lambda_schedule_state=schedule_controller.state_dict(),
@@ -1245,7 +1246,8 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)
 
-        if vl_loss < best_val - 1e-4:
+        min_delta_rel = training_settings.get("early-stop-min-delta-rel", 1e-3)
+        if vl_loss < best_val * (1.0 - min_delta_rel):
             best_val = vl_loss
             bad_epochs = 0
             model.save(ckpt_path, epoch=epoch, best_val=best_val, optimizer=optimizer,

@@ -239,8 +239,8 @@ class LambdaScheduleController:
 
     @staticmethod
     def _check_plateau(metric_val, best_val, bad_epochs, min_delta, patience):
-        """Returns (new_best, new_bad_epochs, is_plateau)."""
-        if metric_val < (best_val - min_delta):
+        """Returns (new_best, new_bad_epochs, is_plateau). min_delta is relative (e.g. 1e-4 = 0.01%)."""
+        if metric_val < best_val * (1.0 - min_delta):
             return metric_val, 0, False
         bad_epochs += 1
         return best_val, bad_epochs, bad_epochs >= patience

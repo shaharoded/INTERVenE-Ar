@@ -27,6 +27,7 @@ TRAINING_SETTINGS = {
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
     "lr_warmup_epochs": 5,
     "early-stop-patience": 5,
+    "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 5e-4,
@@ -80,7 +81,7 @@ TRAINING_SETTINGS = {
             "outcome": 3,  # Gradual ramp over 3 epochs after unlocking
         },
         # Plateau detection settings (applied per stage transition, in order)
-        "plateau_min_delta": 1e-4,
+        "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
     },
 
