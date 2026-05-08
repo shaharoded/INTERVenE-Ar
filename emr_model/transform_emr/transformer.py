@@ -646,6 +646,12 @@ class GPT(nn.Module):
 
         model.load_state_dict(ckpt["model_state"])
 
+        # Align device: the caller's embedder may already be on GPU while the checkpoint
+        # was saved on CPU. Move the whole model to match the embedder's device so all
+        # parameters and inputs are on the same device during forward passes.
+        embedder_device = next(embedder.parameters()).device
+        model.to(embedder_device)
+
         # Helpful metadata for callers that want to fully restore prior training settings.
         model.checkpoint_model_config = copy.deepcopy(ckpt["config"])
         model.checkpoint_training_settings = copy.deepcopy(ckpt.get("training_settings"))

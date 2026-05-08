@@ -831,10 +831,12 @@ class EMRDataset(Dataset):
             mapped = self.tokens_df[column].map(vocab)
             unknown = self.tokens_df.loc[mapped.isna(), column].unique()
             if len(unknown) > 0:
-                print(f"[Warning][EMRDataset] Unknown {label} values found (count={len(unknown)}):")
-                for tok in unknown[:10]:  # only print a sample
+                print(f"[Warning][EMRDataset] Unknown {label} values found (count={len(unknown)}) — mapping to [MASK]:")
+                for tok in unknown[:10]:
                     print(f"  - {tok}")
-                raise ValueError(f"[Dataset Error] Found unknown {label} entries. Tokenizer or parsing may be out of sync.")
+                # Map unknowns to [MASK] so they are treated as masked/unknown without crashing.
+                # This gracefully handles val-only concepts when the tokenizer was built from train only.
+                mapped = mapped.fillna(self.tokenizer.mask_token_id)
             return mapped.astype(int)
 
         # --- Map with validation ---
@@ -853,8 +855,10 @@ class EMRDataset(Dataset):
         ids = []
         for p in parents:
             if p not in self.tokenizer.rawconcept2id:
-                raise ValueError(f"Raw parent concept '{p}' missing from tokenizer vocabulary.")
-            ids.append(self.tokenizer.rawconcept2id[p])
+                # Unknown raw concept — map to [MASK] id so it is ignored by the embedder.
+                ids.append(self.tokenizer.mask_token_id)
+            else:
+                ids.append(self.tokenizer.rawconcept2id[p])
         return ids
 
 

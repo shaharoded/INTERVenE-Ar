@@ -38,6 +38,10 @@ TERMINAL_OUTCOMES = [RELEASE_TOKEN, DEATH_TOKEN]
 
 MEAL_TOKENS = ["MEAL_CONTEXT_Breakfast", "MEAL_CONTEXT_Lunch", "MEAL_CONTEXT_Dinner", "MEAL_CONTEXT_Night-Snack"] # Keep ordered! concept_value tokens
 
+# Minimum patient prevalence (%) for an outcome to be included in the outcome head.
+# Outcomes below this threshold are dropped — they have too few positive examples to learn from.
+OUTCOME_RARE_THRESHOLD_PCT = 1.0
+
 # inclusion/exclusion criteria to filter all datasets
 INCLUSION_EXCLUSION_CRITERIA = {
     "temporal": [
