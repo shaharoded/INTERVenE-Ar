@@ -4,12 +4,13 @@ Autonomous hyperparameter and architecture search for a clinical EMR sequence mo
 
 ## What this is
 
-An AI agent autonomously experiments on an EMR (Electronic Medical Record) next-event prediction model overnight. Each experiment modifies `train.py`, trains for a fixed epoch budget, checks if the validation metric improved, keeps or discards, and repeats — logging every result in `results.tsv`.
+An AI agent autonomously experiments on an EMR (Electronic Medical Record) complication-prediction model overnight. Each experiment modifies files under `emr_model/transform_emr/`, trains for a fixed epoch budget, checks if the held-out evaluation metric improved, keeps or discards, and repeats — logging every result in `results.tsv`.
 
-The architecture is a two-phase pipeline (`emr_model/`):
+The architecture is a three-phase pipeline (`emr_model/`):
 
 - **Phase 1 — EMREmbedding** — learns compact, time-aware representations of clinical events using hierarchical token embeddings, Time2Vec, and static patient context.
-- **Phase 2 — GPT Transformer** — a causal decoder over Phase-1 embeddings, predicting the next clinical event in a patient's timeline.
+- **Phase 2 — GPT Transformer** — a causal decoder over Phase-1 embeddings; predicts the next clinical event and learns outcome timing via a curriculum of auxiliary losses.
+- **Phase 3 — Outcome Fine-tuning** — backbone frozen; outcome head fine-tuned on natural-distribution data to sharpen complication risk scores.
 
 The training data is derived from MIMIC-III and contains diabetes patients' longitudinal event sequences including lab results, vitals, diagnoses, medications, meals, and outcome events (complications, death, release).
 
@@ -17,48 +18,60 @@ The training data is derived from MIMIC-III and contains diabetes patients' long
 
 | File | Role |
 |------|------|
-| `prepare.py` | **Fixed.** Data loading and fixed evaluation metric. Do NOT modify. |
-| `train.py` | **Agent edits this.** Model config, training settings, training loop. |
-| `program.md` | **Human edits this.** Instructions for the autonomous agent. |
-| `emr_model/transform_emr/` | Model source code (agent may modify for architecture changes). |
+| `api.py` | **Fixed.** Data loading, training orchestration, final evaluation. Do NOT modify. |
+| `evaluation.py` | **Fixed.** Post-training evaluation metrics (AUROC/AUPRC/MAE). Do NOT modify. |
+| `emr_model/transform_emr/config/model_config.py` | **Agent edits this.** `MODEL_CONFIG` (architecture dims) and `TRAINING_SETTINGS` (hyperparameters, schedulers). |
+| `emr_model/transform_emr/` | Model source — agent may modify for architecture changes. |
+| `program.md` | **Human edits this.** Instructions and research context for the autonomous agent. |
 | `emr_model/data/source/` | Training data (fixed). |
-| `results.tsv` | Experiment log (untracked by git). |
+| `results.tsv` | Experiment log (gitignored, untracked by git). |
 
-## Metric
+## Metrics
 
-**Primary — `outcome_f1` (higher is better)**
-Time-tolerant F1 for clinical outcome prediction. At each position, the model is considered to have "predicted an outcome" if any outcome token (complication, e.g. `KIDNEY_COMPLICATION_EVENT`) appears in its top-15 predictions. A prediction matches a true outcome if they fall within ±48 hours of each other in the patient timeline. Precision and recall are computed from this matching, then combined into F1. This penalises both missed complications (low recall) and false alarms during quiet periods (low precision).
+All metrics are computed by `evaluation.py::evaluate_on_test_set` on the held-out validation set via autoregressive generation — never modified by the agent.
 
-**Secondary — `val_bce_loss` (lower is better)**
-Mean BCE over all token positions (multi-hot, fixed k=5 look-ahead window). Used as a sanity signal to detect model collapse; not the autoresearch keep/discard criterion.
+**Primary — `outcome_auroc` (higher is better)**
+Mean per-complication AUROC from pooled episode-level AUC. For each generated trajectory, time is divided into 24-hour non-overlapping windows; a window is labelled positive if any ground-truth episode of that complication falls within ±24h of the window edges. AUROC is computed from (window, score) pairs pooled across all patients, then averaged across complications with at least 3 positive windows. Random = 0.5, perfect = 1.0.
 
-Both are computed in `prepare.py::evaluate_val_metrics` — never modified by the agent.
+**Secondary — `outcome_auprc` (higher is better)**
+Mean per-complication average precision (AUPRC) from the same pooled window evaluation. Reflects precision across recall thresholds — more sensitive to false alarms than AUROC.
+
+**Tertiary — `onset_mae_hrs` (lower is better)**
+Mean absolute error between the predicted onset time (generated step with peak `P_outcome`) and the ground-truth first occurrence of that complication, in hours. Averaged across patients where the complication occurred.
 
 ## Design choices
 
-- **Two-file split.** `prepare.py` is fixed ground truth; `train.py` is fully editable.
-- **Embedder caching.** Phase-1 is skipped automatically when `embed_dim`, `time2vec_dim`, and `ctx_dim` are unchanged — saving ~30 min per experiment.
-- **Fresh Phase-2 per experiment.** Phase-2 checkpoints are cleared before each run so experiments are independent.
-- **Epoch budget with early stopping.** Training terminates when validation stops improving (patience = 10 epochs), bounded by a maximum epoch count.
-- **Data sampling.** `TRAINING_SETTINGS["sample"]` controls how many patients to use. Set to `None` for full training runs.
+- **Immutable contract.** `api.py` and `evaluation.py` are the fixed ground truth. The agent edits `model_config.py` (hyperparameters) and files under `emr_model/transform_emr/` (architecture).
+- **Embedder caching.** Phase 1 is skipped automatically when `(embed_dim, time2vec_dim, ctx_dim)` are unchanged — saving ~30 min per experiment.
+- **Fresh Phase 2 and Phase 3 per experiment.** Those checkpoints are cleared before each run so experiments are independent.
+- **Phase 3 for outcome alignment.** The backbone is frozen and only the outcome head is fine-tuned on natural-distribution data — prevents oversampling bias from contaminating risk scores.
+- **Generation-based evaluation.** The final metrics are computed from autoregressive generation (not teacher-forced logits), matching real clinical deployment: the model generates a trajectory from 2 days of seed data and its outcome-head risk scores are evaluated against ground-truth future episodes.
+- **Epoch budget with early stopping.** Training terminates when validation stops improving (patience configurable), bounded by a maximum epoch count.
+- **Data sampling.** `TRAINING_SETTINGS["sample"]` controls how many patients to use. Set to `None` for full training runs; set to a small integer (e.g. `50`) for quick smoke-tests.
 
 ## Project structure
 
 ```
-prepare.py              fixed data utilities + evaluation metric
-train.py                model config + training (agent modifies)
+api.py                  fixed: training orchestration (do not modify)
+evaluation.py           fixed: evaluation metrics (do not modify)
 program.md              agent instructions (human modifies)
+analysis.ipynb          experiment analysis / visualisation
 pyproject.toml          dependencies
 results.tsv             experiment log (gitignored, untracked)
 run.log                 last experiment output (gitignored)
 emr_model/
-  transform_emr/        core model source (agent may modify)
+  transform_emr/
+    config/
+      model_config.py   MODEL_CONFIG + TRAINING_SETTINGS (agent modifies)
+      dataset_config.py data paths and special tokens (fixed)
     embedder.py         Phase-1 EMREmbedding
-    transformer.py      Phase-2 GPT
+    transformer.py      Phase-2/3 GPT + finetune_transformer
     dataset.py          tokenizer and dataloader
     loss.py             loss functions
-    schedulers.py       auxiliary loss scheduling
-    utils.py            utilities
+    schedulers.py       auxiliary loss curriculum scheduling
+    inference.py        autoregressive generation (used by evaluation.py)
+    utils.py            masking, targets, penalties
+    diagnose.py         model health checks
   data/
     source/
       temporal_data.csv      patient event sequences
@@ -184,8 +197,7 @@ To permanently delete: **Terminate** (irreversible — all container data is los
 Start a Claude Code session in this directory and say:
 
 ```
-Read program.md and all files listed in the Setup section.
-The baseline is already logged in results.tsv.
+Read program.md and all files listed in its Setup section.
 Begin the experiment loop now.
 ```
 

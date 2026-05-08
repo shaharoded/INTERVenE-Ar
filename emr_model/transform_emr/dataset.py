@@ -1,14 +1,15 @@
 import os
+import re
+import random
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Sampler
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from joblib import dump
-import pickle
 import json
 import numpy as np
 from collections import Counter
-from typing import Dict, Optional, List
+from typing import List
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.config.dataset_config import *
@@ -34,7 +35,8 @@ class DataProcessor:
                  tak_repo_path='transform_emr/config/tak_repo.pkl', 
                  max_input_days=None, 
                  scaler=None, 
-                 checkpoint_path=CHECKPOINT_PATH):
+                 checkpoint_path=CHECKPOINT_PATH,
+                 inclusion_exclusion_criteria=None):
         # Load TAK repository from JSON
         if not tak_repo_path.endswith('.json'):
             raise ValueError(f"TAK repo must be a JSON file, got: {tak_repo_path}")
@@ -61,9 +63,16 @@ class DataProcessor:
         self.max_input_days = max_input_days
         self.scaler = scaler
         self.checkpoint_path = checkpoint_path
+        self.inclusion_exclusion_criteria = (
+            INCLUSION_EXCLUSION_CRITERIA
+            if inclusion_exclusion_criteria is None
+            else inclusion_exclusion_criteria
+        )
 
 
     def run(self):
+        self._apply_inclusion_exclusion_criteria()
+
         # Process on temporal_df
         self._validate_and_align_inputs()
         self._fix_back_to_back_intervals()
@@ -81,6 +90,81 @@ class DataProcessor:
         self.context_df = self.context_df.set_index("PatientId").drop(columns=["PatientId"], errors="ignore").astype("float32")
         self._fit_scaler()
         return self.df, self.context_df
+
+    def _apply_inclusion_exclusion_criteria(self):
+        """
+        Apply SQL-like inclusion/exclusion filters from INCLUSION_EXCLUSION_CRITERIA.
+
+        Supported condition format:
+            WHERE <column> LIKE '<pattern>'
+            WHERE <column> NOT LIKE '<pattern>'
+
+        Notes:
+            - `WHERE` is optional.
+            - `%` is treated as wildcard (0+ chars).
+            - `_` is treated as a literal underscore.
+        """
+        criteria = self.inclusion_exclusion_criteria or {}
+        if not isinstance(criteria, dict):
+            raise ValueError("inclusion_exclusion_criteria must be a dict with 'temporal'/'context' keys")
+
+        temporal_criteria = criteria.get("temporal", [])
+        context_criteria = criteria.get("context", [])
+
+        self.df = self._apply_sql_like_filters(self.df, temporal_criteria, source_name="temporal")
+        self.context_df = self._apply_sql_like_filters(self.context_df, context_criteria, source_name="context")
+
+    @staticmethod
+    def _apply_sql_like_filters(df: pd.DataFrame, conditions: List[str], source_name: str) -> pd.DataFrame:
+        """Apply a list of SQL-like WHERE ... LIKE/NOT LIKE filters to a dataframe."""
+        if not conditions:
+            return df
+
+        if not isinstance(conditions, list):
+            raise ValueError(f"Criteria for '{source_name}' must be a list of condition strings")
+
+        out_df = df.copy()
+        pattern = re.compile(
+            r"^\s*(?:WHERE\s+)?(?P<column>[A-Za-z_]\w*)\s+(?P<op>NOT\s+LIKE|LIKE)\s+['\"](?P<like_pattern>[^'\"]+)['\"]\s*$",
+            flags=re.IGNORECASE,
+        )
+
+        for cond in conditions:
+            if not cond or not str(cond).strip():
+                continue
+
+            match = pattern.match(str(cond))
+            if not match:
+                raise ValueError(
+                    f"Invalid condition format for '{source_name}': {cond}. "
+                    "Expected: WHERE <column> LIKE '<pattern>' or WHERE <column> NOT LIKE '<pattern>'"
+                )
+
+            column = match.group("column")
+            op = match.group("op").upper().replace("  ", " ")
+            like_pattern = match.group("like_pattern")
+
+            if column not in out_df.columns:
+                raise ValueError(
+                    f"Condition references unknown column '{column}' in '{source_name}' dataframe"
+                )
+
+            regex = "^" + re.escape(like_pattern).replace("%", ".*") + "$"
+            col_as_str = out_df[column].astype(str)
+            matches = col_as_str.str.match(regex, na=False)
+
+            before_n = len(out_df)
+            if op == "LIKE":
+                out_df = out_df[matches].copy()
+            elif op == "NOT LIKE":
+                out_df = out_df[~matches].copy()
+            else:
+                raise ValueError(f"Unsupported operator '{op}' in condition: {cond}")
+
+            after_n = len(out_df)
+            print(f"[DataProcessor] Applied {source_name} filter: {cond} | rows {before_n} -> {after_n}")
+
+        return out_df
 
     def _fit_scaler(self):
         """
@@ -382,7 +466,7 @@ class DataProcessor:
         # If you need to change this sorting for any reason, you MUST also update:
         #   - emr_model/transform_emr/utils.py::get_temporal_multi_hot_targets()
         #   - emr_model/transform_emr/embedder.py::train_embedder() BCE loss computation
-        #   - emr_model/transform_emr/transformer.py::train_transformer() BCE loss computation
+        #   - emr_model/transform_emr/transformer.py::pretrain_transformer() BCE loss computation
         #
         self.df = df.sort_values(['PatientId', 'TimePoint']).reset_index(drop=True)
     
@@ -488,7 +572,8 @@ class EMRTokenizer:
     """
     def __init__(self, token2id, rawconcept2id, concept2id, value2id, special_tokens,
                  token_weights, outcome_weights, token_counts,
-                 tokenid2parent_raw_ids, parent_pad_len):
+                 tokenid2parent_raw_ids, parent_pad_len,
+                 outcome_patient_ratios=None):
         self.token2id = token2id
         self.id2token = {i: tok for tok, i in token2id.items()}
         self.rawconcept2id = rawconcept2id
@@ -500,7 +585,9 @@ class EMRTokenizer:
         self.token_counts = token_counts
         self.tokenid2parent_raw_ids = tokenid2parent_raw_ids
         self.parent_pad_len = parent_pad_len
-        
+        # Keys = valid (non-rare) outcome names; values = patient prevalence ratio.
+        self.outcome_patient_ratios = outcome_patient_ratios or {}
+
         # Validate presence of mandatory special tokens
         required_specials = ["[PAD]", "[MASK]", "[NULL]"]
         for tok in required_specials:
@@ -573,26 +660,36 @@ class EMRTokenizer:
         
         outcome_weights = torch.ones(len(token2id), dtype=torch.float32)
         all_outcomes = list(set(OUTCOMES + TERMINAL_OUTCOMES))
-        
+
         total_patients = df['PatientId'].nunique()
         patient_tokens = df.groupby("PatientId")["PositionToken"].apply(set)
-        
+
+        # outcome_patient_ratios: name → prevalence ratio for outcomes that meet the threshold.
+        # Keys of this dict are the canonical valid outcome list used by the GPT outcome head.
+        # Outcomes below the threshold are dropped here, printed, and excluded from the head.
+        outcome_patient_ratios = {}
+        dropped_outcomes = []
         for out_tok in all_outcomes:
             if out_tok not in token2id:
                 continue
-            
+
             tid = token2id[out_tok]
-            
-            # Count positives
-            n_pos = patient_tokens.apply(lambda s: out_tok in s).sum()
+            n_pos = int(patient_tokens.apply(lambda s: out_tok in s).sum())
             n_neg = total_patients - n_pos
-            
-            if n_pos > 0:
-                w = n_neg / n_pos
+            ratio = n_pos / max(total_patients, 1)
+
+            outcome_weights[tid] = float(n_neg / n_pos) if n_pos > 0 else 1.0
+
+            if ratio * 100.0 >= OUTCOME_RARE_THRESHOLD_PCT:
+                outcome_patient_ratios[out_tok] = round(ratio, 6)
             else:
-                w = 1.0
-            
-            outcome_weights[tid] = float(w)
+                dropped_outcomes.append((out_tok, n_pos, ratio * 100.0))
+
+        if dropped_outcomes:
+            print(f"[Tokenizer] Dropping {len(dropped_outcomes)} rare outcomes "
+                  f"(threshold={OUTCOME_RARE_THRESHOLD_PCT}% of {total_patients} patients):")
+            for name, n_pos, pct in sorted(dropped_outcomes, key=lambda x: x[1]):
+                print(f"  - {name}: {n_pos} patients ({pct:.2f}%)")
         
         # Add token distribution
         count_series = df["PositionToken"].value_counts()
@@ -653,7 +750,8 @@ class EMRTokenizer:
             lut[tid, :len(ids)] = torch.tensor(ids, dtype=torch.long)
 
         return cls(token2id, rawconcept2id, concept2id, value2id, special_tokens, token_weights, outcome_weights,
-                   counts_vec, lut, Pmax)
+                   counts_vec, lut, Pmax,
+                   outcome_patient_ratios=outcome_patient_ratios)
 
     def save(self, path=os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
         torch.save({
@@ -667,6 +765,7 @@ class EMRTokenizer:
             'token_counts': self.token_counts,
             'tokenid2parent_raw_ids': self.tokenid2parent_raw_ids,
             'parent_pad_len': self.parent_pad_len,
+            'outcome_patient_ratios': self.outcome_patient_ratios,
             'fingerprint': self.fingerprint()
         }, path)
 
@@ -687,6 +786,7 @@ class EMRTokenizer:
             token_counts=obj['token_counts'].to(device),
             tokenid2parent_raw_ids=obj['tokenid2parent_raw_ids'].to(device),
             parent_pad_len=obj['parent_pad_len'],
+            outcome_patient_ratios=obj.get('outcome_patient_ratios', {}),
         )
         tokenizer._loaded_fingerprint = obj.get('fingerprint')
         return tokenizer
@@ -694,6 +794,17 @@ class EMRTokenizer:
 
     def fingerprint(self):
         return hash(frozenset(self.token2id.items()))
+
+    def get_valid_outcomes(self) -> list:
+        """
+        Purpose: Return valid (non-rare) outcome names as decided at tokenizer build time.
+        Method: Keys of outcome_patient_ratios are the outcomes that passed the prevalence
+                threshold (OUTCOME_RARE_THRESHOLD_PCT) when the tokenizer was built.
+
+        Returns:
+            list[str]: Valid outcome names.
+        """
+        return list(self.outcome_patient_ratios.keys())
 
 
 class EMRDataset(Dataset):
@@ -850,6 +961,8 @@ class EMRDataset(Dataset):
 def collate_emr(batch, pad_token_id=0):
     """
     Collates a batch of patient EMR sequences into padded tensors.
+    All patient's trajectories in the batch are padded to the same length (max_len) and max parent count (max_p).
+    This makes the common 'block_size' concept from NLP less meaningful, as we want to preserve as much temporal information as possible.
 
     ASSUMES: Each patient sequence in the batch is already SORTED by TimePoint (ascending).
     This sorting is performed in DataProcessor._expand_tokens() and is maintained by EMRDataset.__getitem__().
@@ -902,15 +1015,107 @@ def collate_emr(batch, pad_token_id=0):
     }
 
 
+class BucketBatchSampler(Sampler):
+    """
+    Groups patients by sequence length into buckets, then yields batches
+    from within the same bucket. This minimises padding waste inside each
+    batch without changing which patients are seen per epoch.
+
+    Patients are sorted into `n_buckets` equal-width length buckets. Within
+    each bucket the order is shuffled every epoch so the model never sees
+    the same batch composition twice.
+    """
+    def __init__(self, dataset: "EMRDataset", batch_size: int, n_buckets: int = 20, drop_last: bool = False):
+        self.batch_size = batch_size
+        self.drop_last  = drop_last
+
+        lengths = [len(dataset.patient_groups[pid]) for pid in dataset.patient_ids]
+        indices = list(range(len(lengths)))
+
+        # sort indices by length, then split into n_buckets
+        indices.sort(key=lambda i: lengths[i])
+        bucket_size = max(1, len(indices) // n_buckets)
+        self.buckets = [indices[i: i + bucket_size] for i in range(0, len(indices), bucket_size)]
+
+    def __iter__(self):
+        # shuffle within each bucket, then collect all batches and shuffle batch order
+        all_batches = []
+        for bucket in self.buckets:
+            shuffled = bucket.copy()
+            random.shuffle(shuffled)
+            for i in range(0, len(shuffled), self.batch_size):
+                batch = shuffled[i: i + self.batch_size]
+                if self.drop_last and len(batch) < self.batch_size:
+                    continue
+                all_batches.append(batch)
+        random.shuffle(all_batches)
+        yield from all_batches
+
+    def __len__(self):
+        if self.drop_last:
+            return sum(len(b) // self.batch_size for b in self.buckets)
+        return sum((len(b) + self.batch_size - 1) // self.batch_size for b in self.buckets)
+
+
+class WeightedBucketBatchSampler(Sampler):
+    """
+    Combines weighted oversampling with length-aware batching.
+
+    Draws indices globally with replacement according to per-sample weights
+    (same as WeightedRandomSampler), then sorts the drawn pool by sequence
+    length before grouping into batches. This minimises padding waste while
+    preserving the rare-outcome rebalancing effect of oversampling.
+
+    PyTorch's DataLoader does not allow a sampler and batch_sampler
+    simultaneously, so this class acts as a batch_sampler that internalises
+    the weighted draw.
+    """
+    def __init__(self, dataset: "EMRDataset", batch_size: int,
+                 weights: torch.Tensor, drop_last: bool = False):
+        """
+        Purpose: Initialise sampler with per-patient weights and sequence lengths.
+
+        Args:
+            dataset (EMRDataset): Source dataset.
+            batch_size (int): Number of patients per batch.
+            weights (torch.Tensor): 1-D float tensor of per-patient sampling weights.
+            drop_last (bool): Drop the final incomplete batch if True.
+        """
+        self.batch_size = batch_size
+        self.drop_last  = drop_last
+        self.weights    = weights
+        self.n          = len(dataset.patient_ids)
+        self.lengths    = [len(dataset.patient_groups[pid]) for pid in dataset.patient_ids]
+
+    def __iter__(self):
+        # weighted draw with replacement (one full epoch worth of samples)
+        drawn = torch.multinomial(self.weights, num_samples=self.n, replacement=True).tolist()
+        # sort by sequence length to minimise padding within each batch
+        drawn.sort(key=lambda i: self.lengths[i])
+        batches = []
+        for i in range(0, len(drawn), self.batch_size):
+            batch = drawn[i: i + self.batch_size]
+            if self.drop_last and len(batch) < self.batch_size:
+                continue
+            batches.append(batch)
+        random.shuffle(batches)
+        yield from batches
+
+    def __len__(self):
+        if self.drop_last:
+            return self.n // self.batch_size
+        return (self.n + self.batch_size - 1) // self.batch_size
+
+
 def get_dataloader(
         dataset,
         batch_size: int,
         collate_fn,
         *,
         oversample: bool = False,
+        bucket_batching: bool = False,
         num_workers: int = None,
         replacement: bool = True,
-        class_weights: Optional[Dict] = None,
 ):
     """
     Build a DataLoader for an EMRDataset.
@@ -920,49 +1125,61 @@ def get_dataloader(
     if num_workers is None:
         num_workers = min(os.cpu_count(), 4) if torch.cuda.is_available() else 0
 
-    # ---------- helper ----------
-    def _label_visit(token_df, tokenizer):
-        """
-        Return an int label per patient trajectory:
-
-            0 = DEATH present
-            1 = ≥1 COMPLICATION present (no DEATH)
-            2 = RELEASE present only
-            3 = OTHER / still-in-hospital (no terminal/outcome token)
-
-        These labels feed a WeightedRandomSampler so that DEATH and COMPLICATION
-        patients are drawn more often without duplicating rows.
-        """
-        ids = set(token_df["PositionID"].tolist())
-        tid = tokenizer.token2id
-
-        if tid[DEATH_TOKEN] in ids:
-            return 0
-        if any(tid.get(c) in ids for c in OUTCOMES if c in tid):
-            return 1 
-        if tid[RELEASE_TOKEN] in ids:
-            return 2
-        return 3          # no terminal/outcome yet
+    # Keep workers alive across epochs to avoid Python 3.11 multiprocessing teardown
+    # crashes (AssertionError: can only test a child process) and tqdm rendering errors
+    # that fire when DataLoader iterators are garbage-collected between epochs.
+    persistent = num_workers > 0
 
     # ---------- no oversampling ----------
     if not oversample:
+        if bucket_batching:
+            sampler = BucketBatchSampler(dataset, batch_size=batch_size)
+            return DataLoader(dataset,
+                              batch_sampler=sampler,
+                              collate_fn=collate_fn,
+                              num_workers=num_workers,
+                              persistent_workers=persistent,
+                              pin_memory=torch.cuda.is_available())
         return DataLoader(dataset,
                           batch_size=batch_size,
                           shuffle=True,
                           collate_fn=collate_fn,
                           num_workers=num_workers,
+                          persistent_workers=persistent,
                           pin_memory=torch.cuda.is_available())
 
     # ---------- build sample weights ----------
-    labels = [_label_visit(dataset.patient_groups[pid], dataset.tokenizer)
-              for pid in dataset.patient_ids]
+    # Each patient weight = sum of (n_patients / outcome_count) for each outcome
+    # they have. Patients with multiple rare outcomes get higher weights.
+    # DEATH also contributes as a terminal outcome.
+    tid = dataset.tokenizer.token2id
+    all_outcome_tokens = [o for o in OUTCOMES + [DEATH_TOKEN] if o in tid]
 
-    if class_weights is None:
-        counts = Counter(labels)
-        class_weights = {c: 1.0 / max(1, n) for c, n in counts.items()}
+    outcome_counts: Counter = Counter()
+    patient_outcome_sets = []
+    for pid in dataset.patient_ids:
+        ids = set(dataset.patient_groups[pid]["PositionID"].tolist())
+        present = frozenset(o for o in all_outcome_tokens if tid[o] in ids)
+        patient_outcome_sets.append(present)
+        outcome_counts.update(present)
 
-    sample_w = torch.tensor([class_weights[l] for l in labels],
-                            dtype=torch.float32)
+    n_patients = len(dataset.patient_ids)
+    outcome_inv_freq = {o: n_patients / max(1, outcome_counts[o]) for o in all_outcome_tokens}
+
+    sample_w = torch.tensor(
+        [max(1.0, sum(outcome_inv_freq[o] for o in present))
+         for present in patient_outcome_sets],
+        dtype=torch.float32,
+    )
+
+    if bucket_batching:
+        batch_sampler = WeightedBucketBatchSampler(dataset, batch_size=batch_size, weights=sample_w)
+        return DataLoader(dataset,
+                          batch_sampler=batch_sampler,
+                          collate_fn=collate_fn,
+                          num_workers=num_workers,
+                          persistent_workers=persistent,
+                          pin_memory=torch.cuda.is_available())
 
     sampler = WeightedRandomSampler(sample_w,
                                     num_samples=len(sample_w),
@@ -973,4 +1190,5 @@ def get_dataloader(
                       sampler=sampler,
                       collate_fn=collate_fn,
                       num_workers=num_workers,
+                      persistent_workers=persistent,
                       pin_memory=torch.cuda.is_available())

@@ -8,6 +8,7 @@ by dataset.py.
 """
 
 import math
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,7 +55,23 @@ class CausalSelfAttention(nn.Module):
         x1, x2 = x[..., :half], x[..., half:]
         return torch.cat([x1 * cos_t - x2 * sin_t, x2 * cos_t + x1 * sin_t], dim=-1)
 
-    def forward(self, x, key_pad_mask=None, abs_ts=None):
+    def forward(self, x, key_pad_mask=None, abs_ts=None, past_kv=None, use_cache=False):
+            """
+            Args:
+                x            : [B, T, C]
+                key_pad_mask : [B, T_kv] bool (True=keep).  For normal forward T_kv==T;
+                               for KV-cache decode it spans the full cached+new key sequence.
+                abs_ts       : [B, T] absolute timestamps for temporal RoPE.
+                past_kv      : (k_cache, v_cache) each [B, n_head, T_past, hd].
+                               When provided, x must be only the *new* tokens (T typically 1).
+                               New K/V are appended and the full sequence is used for attention.
+                use_cache    : If True, return (output, (k_full, v_full)) instead of just output.
+
+            Returns:
+                y            : [B, T, C]
+                (k_full, v_full) : only when use_cache=True — updated KV cache tensors,
+                                   each [B, n_head, T_past+T, hd].
+            """
             B, T, C = x.shape
             qkv = self.qkv(x)                      # [B, T, 3C]
             q, k, v = qkv.split(C, dim=-1)         # each [B, T, C]
@@ -65,12 +82,40 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
             v = v.view(B, T, self.n_head, hd).permute(0, 2, 1, 3)
 
-            # Apply temporal RoPE to Q and K (no extra memory, no T×T matrix)
+            # Apply temporal RoPE to Q and K.
+            # NOTE: when past_kv is provided, abs_ts contains only the NEW token timestamps.
+            # Past K values are already pre-rotated in the cache — valid because each K_i was
+            # rotated by its own timestamp when first computed.
             if abs_ts is not None:
                 q = self._apply_temporal_rope(q, abs_ts)
                 k = self._apply_temporal_rope(k, abs_ts)
 
-            if key_pad_mask is not None:
+            # ── KV-cache decode path ──────────────────────────────────────────
+            if past_kv is not None:
+                k_past, v_past = past_kv
+                k = torch.cat([k_past, k], dim=2)   # [B, h, T_past+T, hd]
+                v = torch.cat([v_past, v], dim=2)
+
+                # key_pad_mask covers the full [T_past+T] key sequence.
+                # Q [B, h, T, hd] attends to all past+new keys — no causal mask needed
+                # since T is the newest position(s) and everything in cache is older.
+                if key_pad_mask is not None:
+                    T_kv      = k.shape[2]
+                    pad_m     = (~key_pad_mask).unsqueeze(1).unsqueeze(2)    # [B,1,1,T_kv]
+                    attn_mask = torch.zeros(B, 1, T, T_kv, device=x.device, dtype=q.dtype)
+                    attn_mask.masked_fill_(pad_m, float("-inf"))
+                    attn = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, is_causal=False,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    )
+                else:
+                    attn = F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=None, is_causal=False,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                    )
+
+            # ── Normal (prefill / training) path ─────────────────────────────
+            elif key_pad_mask is not None:
                 # --- Manual Masking Path (Required when padding is present) ---
                 # SDPA throws RuntimeError if we pass both attn_mask and is_causal=True.
                 # We must construct a combined mask [B, 1, T, T] containing both:
@@ -80,14 +125,14 @@ class CausalSelfAttention(nn.Module):
                 # 1. Padding Mask: [B, 1, 1, T] -> Broadcast to [B, 1, T, T]
                 # key_pad_mask is True(Keep), False(Pad). ~key_pad_mask is True(Mask Out).
                 padding_mask = (~key_pad_mask).unsqueeze(1).unsqueeze(2)
-                
-                # 2. Causal Mask: [1, 1, T, T] 
+
+                # 2. Causal Mask: [1, 1, T, T]
                 # triu(1) gives upper triangle (future) as True -> Mask Out.
                 causal_mask = torch.ones((T, T), device=x.device, dtype=torch.bool).triu(1).view(1, 1, T, T)
-                
+
                 # 3. Combine: Mask out if it's Padding OR Future
                 combined_mask = padding_mask | causal_mask
-                
+
                 # 4. Convert to float mask for SDPA (-inf for mask, 0.0 for keep)
                 # Using zeros_like ensures we match dtype (e.g. float16/bfloat16)
                 attn_mask = torch.zeros_like(combined_mask, dtype=q.dtype).masked_fill(combined_mask, float("-inf"))
@@ -110,7 +155,11 @@ class CausalSelfAttention(nn.Module):
 
             y = attn.transpose(1, 2).contiguous().view(B, T, C)         # -> [B, T, C]
             y = self.proj(y)
-            return self.resid_dropout(y)
+            y = self.resid_dropout(y)
+
+            if use_cache:
+                return y, (k, v)
+            return y
 
 
 class MLP(nn.Module):
@@ -121,10 +170,10 @@ class MLP(nn.Module):
     """
     def __init__(self, cfg):
         super().__init__()
-        # Standard GPT uses 4x expansion. 
+        # Standard GPT uses 4x expansion.
         # For SwiGLU, we project to 2 * (4 * dim) so we can split it into two 4x vectors.
         hidden_dim = 4 * cfg["embed_dim"]
-        
+
         self.w1 = nn.Linear(cfg["embed_dim"], 2 * hidden_dim, bias=cfg["bias"])
         self.w2 = nn.Linear(hidden_dim, cfg["embed_dim"], bias=cfg["bias"])
         self.drop = nn.Dropout(cfg["dropout"])
@@ -132,13 +181,13 @@ class MLP(nn.Module):
     def forward(self, x):
         # 1. Project to double width
         projected = self.w1(x)
-        
+
         # 2. Split into x (content) and g (gate)
         x_val, x_gate = projected.chunk(2, dim=-1)
-        
+
         # 3. Gating: Val * SiLU(Gate)
         out = x_val * F.silu(x_gate)
-        
+
         # 4. Project back
         return self.drop(self.w2(out))
 
@@ -146,17 +195,17 @@ class MLP(nn.Module):
 class AdaLNBlock(nn.Module):
     """
     Transformer block with AdaLN-Zero conditioning.
-    
+
     Instead of adding [CTX] to the sequence, we inject patient context into
     the normalization layers of *every* block.
-    
+
     Mechanism:
         1. Project context_emb -> (scale, shift, gate)
         2. Norm(x) = (x - mu)/sigma * (1 + scale) + shift
         3. Output = x + gate * Block(Norm(x))
-    
+
     Zero Initialization:
-        We initialize the modulation projection to 0. This ensures that at the 
+        We initialize the modulation projection to 0. This ensures that at the
         start of training, the block acts as an identity function (ignoring context),
         which stabilizes deep training.
     """
@@ -180,25 +229,36 @@ class AdaLNBlock(nn.Module):
             nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, cond_emb, key_pad_mask=None, abs_ts=None):
+    def forward(self, x, cond_emb, key_pad_mask=None, abs_ts=None, past_kv=None, use_cache=False):
         """
         Calculate modulation parameters [B, 6*D] -> 6 x [B, D] (broadcast over T)
         x: [B, T, D]
         cond_emb: [B, D] (Patient Context)
+        past_kv / use_cache: threaded through to CausalSelfAttention for KV caching.
+
+        Returns:
+            x             : [B, T, D]
+            (k_full, v_full) : only when use_cache=True.
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(cond_emb).chunk(6, dim=1)
         )
 
         # -- Attention Sub-block --
-        # modulate(ln(x))
-        norm_x = self.ln1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        x = x + gate_msa.unsqueeze(1) * self.att(norm_x, key_pad_mask=key_pad_mask, abs_ts=abs_ts)
+        norm_x   = self.ln1(x) * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        attn_out = self.att(norm_x, key_pad_mask=key_pad_mask, abs_ts=abs_ts,
+                            past_kv=past_kv, use_cache=use_cache)
+        if use_cache:
+            attn_out, new_kv = attn_out
+
+        x = x + gate_msa.unsqueeze(1) * attn_out
 
         # -- MLP Sub-block --
         norm_x = self.ln2(x) * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(norm_x)
 
+        if use_cache:
+            return x, new_kv
         return x
 
 
@@ -213,7 +273,7 @@ class GPT(nn.Module):
 
     Parameters
     ----------
-    cfg            : dict - hyper-parameters (block_size, n_layer, n_head, dropout, ...)
+    cfg            : dict - hyper-parameters (n_layer, n_head, dropout, ...)
     embedder       : EMREmbedding - fully initialised shared embedding module
     use_checkpoint : bool - continue training from last checkpoint
     """
@@ -255,15 +315,22 @@ class GPT(nn.Module):
         # Outcome Head (designed to propogate signal to the hidden state that there is an expected outcome soon)
         # This head maps the embedding dimension to the unique outcome classes (e.g., Death, Sepsis, Hypoglycemia, Release)
         all_config_outcomes = sorted(list(set(OUTCOMES + TERMINAL_OUTCOMES)))
-        valid_outcomes, missing_outcomes = [], []
-        for n in all_config_outcomes:
-            if n in self.embedder.tokenizer.token2id:
-                valid_outcomes.append(n)
-            else:
-                missing_outcomes.append(n)
+
+        # Filter by tokenizer vocabulary, then by tokenizer's pre-computed rarity filter.
+        # The tokenizer decides which outcomes are valid (applied once at build time).
+        tok = self.embedder.tokenizer
+        in_vocab = [n for n in all_config_outcomes if n in tok.token2id]
+        missing_outcomes = [n for n in all_config_outcomes if n not in tok.token2id]
         if missing_outcomes:
-            print(f"[GPT] The following configured outcomes were NOT found in the tokenizer and will be ignored: {missing_outcomes}")
-            
+            print(f"[GPT] Outcomes not in tokenizer vocab (ignored): {missing_outcomes}")
+
+        # outcome_patient_ratios keys are the valid outcomes; empty dict = old tokenizer, use all
+        if getattr(tok, 'outcome_patient_ratios', None):
+            valid_set = set(tok.outcome_patient_ratios.keys())
+            valid_outcomes = [n for n in in_vocab if n in valid_set]
+        else:
+            valid_outcomes = in_vocab
+
         # Hard Error if nothing is left (Training cannot proceed)
         if not valid_outcomes:
             raise ValueError(
@@ -272,14 +339,23 @@ class GPT(nn.Module):
             )
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
-        
+
         # A simple MLP classifier
         self.outcome_head = nn.Sequential(
             nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
             nn.Dropout(cfg["dropout"]),
-            nn.Linear(cfg["embed_dim"], self.num_outcomes) 
+            nn.Linear(cfg["embed_dim"], self.num_outcomes)
             # Note: No Sigmoid here if using BCEWithLogitsLoss later
+        )
+
+        # Vocab positions for ALL OUTCOMES+TERMINAL_OUTCOMES that exist in vocab.
+        # Broader than outcome_names (includes outcomes filtered by rarity); used
+        # for the 1-hot override in multi-hot BCE targets during phase-2 training.
+        self.register_buffer(
+            "_outcome_ids",
+            torch.tensor([tok.token2id[n] for n in in_vocab], dtype=torch.long),
+            persistent=True,
         )
 
         # Δt prediction: two-head gate + magnitude design
@@ -353,7 +429,7 @@ class GPT(nn.Module):
         ]
 
         return torch.optim.AdamW(optim_groups, betas=betas)
-    
+
 # ---------------------------------------------------- forward ---- #
     def forward(self, parent_raw_ids, concept_ids, value_ids, position_ids,
             abs_ts, context_vec=None):
@@ -365,7 +441,7 @@ class GPT(nn.Module):
             position_ids (torch.Tensor)      - padded token ids, (B, T)
             abs_ts (torch.Tensor)            - relative start times from ADMISSION (hours), (B, T)
             context_vec (torch.Tensor)       - age/gender or [] if not used, (B, C)
-        
+
         Returns:
             logits (FloatTensor): [B, T, V]
                 - Next-token logits for the sequence.
@@ -390,16 +466,23 @@ class GPT(nn.Module):
         # We pass cond_emb to every block to modulate the normalization layers
         for blk in self.blocks:
             if self.training and self.use_checkpoint:
-                x = checkpoint.checkpoint(
-                    lambda x, c, m, t: blk(x, c, key_pad_mask=m, abs_ts=t),
-                    x, cond_emb, pad_mask, abs_ts,
-                    use_reentrant=False
-                )
+                # use_reentrant=True: reentrant checkpoint, no tensor-count consistency check.
+                # use_reentrant=False triggers CheckpointError on this model regardless of AMP
+                # state (confirmed: amp=True for all 8 forward+recomp calls, counts still differ).
+                # Default-arg capture (_blk=blk) fixes the closure bug where lambdas all closed
+                # over the last block; reentrant recomputation runs correctly with each block's
+                # own weights. Inner autocast ensures BF16 ops during recomputation.
+                def _ckpt(_x, _c, _m, _t, _blk=blk):
+                    _dev = _x.device.type
+                    _amp = _dev == "cuda" and torch.cuda.is_bf16_supported()
+                    with torch.autocast(device_type=_dev, dtype=torch.bfloat16, enabled=_amp):
+                        return _blk(_x, _c, key_pad_mask=_m, abs_ts=_t)
+                x = checkpoint.checkpoint(_ckpt, x, cond_emb, pad_mask, abs_ts, use_reentrant=True)
             else:
                 x = blk(x, cond_emb, key_pad_mask=pad_mask, abs_ts=abs_ts)
-        
+
         x = self.ln_f(x)                     # [B, T, D]
-        
+
         # 3. Main next-token prediction head
         logits = self.lm_head(x)             # [B, T, V]
 
@@ -421,16 +504,89 @@ class GPT(nn.Module):
         abs_t_pred = abs_ts + delta_pos                # [B, T]
 
         return logits, abs_t_pred, outcome_logits, gate_logit
-    
 
-    def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None, lambda_schedule_state=None):
+
+    @torch.no_grad()
+    def forward_with_cache(self, parent_raw_ids, concept_ids, value_ids, position_ids,
+                           abs_ts, context_vec, past_kvs=None, cache_key_pad_mask=None):
+        """
+        KV-cache-aware forward pass for efficient batched autoregressive decoding.
+
+        Two modes
+        ---------
+        **Prefill** (``past_kvs=None``) — process the full seed sequence, same as ``forward()``.
+            All inputs are [B, T_seed, …].  Returns per-layer KV caches and the full logits
+            so the caller can extract logits at the last *valid* position of each sequence.
+
+        **Decode** (``past_kvs`` provided) — process a single new token per patient.
+            All inputs are [B, 1, …].  The new token's K/V are appended to each layer's cache
+            and only the new position's logits are returned.
+
+        In both modes the return signature is identical:
+            logits          [B, T_out, V]
+            abs_t_pred      [B, T_out]        predicted time for the *next* event
+            outcome_logits  [B, T_out, K]
+            gate_logit      [B, T_out]
+            new_kvs         List[Tuple[Tensor, Tensor]]  — one (k, v) per transformer layer
+                            k/v shape [B, n_head, T_past+T_out, hd]
+
+        where T_out == T_seed during prefill, and T_out == 1 during decode.
+
+        Args:
+            parent_raw_ids     : [B, T, P]
+            concept_ids        : [B, T]
+            value_ids          : [B, T]
+            position_ids       : [B, T]
+            abs_ts             : [B, T]
+            context_vec        : [B, ctx_dim]
+            past_kvs           : None | List[Tuple[k, v]]  (one tuple per layer)
+            cache_key_pad_mask : [B, T_past+T] bool (True=valid).  Only used in decode mode.
+                                 During prefill the pad mask is derived from position_ids.
+        """
+        is_decode = past_kvs is not None
+
+        # 1. Embed
+        x, cond_emb, pad_mask = self.embedder(
+            parent_raw_ids, concept_ids, value_ids, position_ids,
+            abs_ts, context_vec, return_mask=True
+        )
+        x = self.drop(x)
+
+        # 2. Blocks — collect new KV caches from every layer
+        new_kvs = []
+        for i, blk in enumerate(self.blocks):
+            pk  = past_kvs[i] if is_decode else None
+            kpm = cache_key_pad_mask if is_decode else pad_mask
+            x, new_kv = blk(x, cond_emb, key_pad_mask=kpm, abs_ts=abs_ts,
+                            past_kv=pk, use_cache=True)
+            new_kvs.append(new_kv)
+
+        x = self.ln_f(x)
+
+        # 3. Heads
+        logits         = self.lm_head(x)
+        outcome_logits = self.outcome_head(x)
+
+        gate_logit = self.dt_gate(x).squeeze(-1)
+        mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
+        delta_pos  = torch.sigmoid(gate_logit) * mag_pos
+        abs_t_pred = abs_ts + delta_pos
+
+        return logits, abs_t_pred, outcome_logits, gate_logit, new_kvs
+
+
+    def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None,
+             lambda_schedule_state=None, training_settings=None, bad_epochs=0):
         ckpt = {
             "model_state": self.state_dict(),
-            "config": self.cfg,
+            "config": copy.deepcopy(self.cfg),
             "vocab_size": self.embedder.decoder.out_features,
             "outcome_names": self.outcome_names,
             "num_outcomes": self.num_outcomes,
             "lambda_schedule_state": lambda_schedule_state,
+            # Keep a copy of training settings used to produce this checkpoint.
+            "training_settings": copy.deepcopy(training_settings),
+            "bad_epochs": bad_epochs,
         }
         if epoch is not None:
             ckpt["epoch"] = epoch
@@ -442,10 +598,13 @@ class GPT(nn.Module):
             ckpt["scheduler_state"] = scheduler.state_dict()
         torch.save(ckpt, path)
 
-    
+
     @classmethod
     def load(cls, path, embedder, map_location="cpu"):
         ckpt = torch.load(path, map_location=map_location, weights_only=True)
+
+        if "config" not in ckpt:
+            raise ValueError("[GPT.load] Invalid checkpoint: missing 'config'.")
 
         # === Vocab safety check ===
         expected_vocab = ckpt["vocab_size"]
@@ -454,17 +613,17 @@ class GPT(nn.Module):
             raise ValueError(
                 f"[GPT.load] Embedder vocab size mismatch: checkpoint={expected_vocab}, embedder={actual_vocab}"
             )
-        
+
         # === Outcome configuration check ===
         if "outcome_names" not in ckpt or "num_outcomes" not in ckpt:
             raise ValueError(
                 "[GPT.load] Invalid checkpoint: missing 'outcome_names' or 'num_outcomes'. "
                 "Checkpoint was saved with an older version of the code."
             )
-        
+
         expected_outcome_names = set(ckpt["outcome_names"])
         expected_num_outcomes = ckpt["num_outcomes"]
-        
+
         # Validate that current config matches checkpoint
         current_outcomes = set(OUTCOMES + TERMINAL_OUTCOMES)
         if not expected_outcome_names.issubset(current_outcomes):
@@ -474,31 +633,36 @@ class GPT(nn.Module):
                 f"  Current config outcomes: {sorted(current_outcomes)}\n"
                 f"  Please use the same OUTCOMES and TERMINAL_OUTCOMES config that was used during training."
             )
-        
+
         # Reconstruct model
         model = cls(cfg=ckpt["config"], embedder=embedder)
-        
+
         # Final sanity check
         if model.num_outcomes != expected_num_outcomes:
             raise ValueError(
                 f"[GPT.load] Architecture mismatch: checkpoint has {expected_num_outcomes} outcomes, "
                 f"but reconstructed model has {model.num_outcomes}."
             )
-        
+
         model.load_state_dict(ckpt["model_state"])
+
+        # Helpful metadata for callers that want to fully restore prior training settings.
+        model.checkpoint_model_config = copy.deepcopy(ckpt["config"])
+        model.checkpoint_training_settings = copy.deepcopy(ckpt.get("training_settings"))
 
         # Return full training state if available
         return (
             model,
-            ckpt["epoch"],
-            ckpt["best_val"],
-            ckpt["optim_state"],
-            ckpt["scheduler_state"],
-            ckpt["lambda_schedule_state"],
+            ckpt.get("epoch", 0),
+            ckpt.get("best_val", float("inf")),
+            ckpt.get("optim_state"),
+            ckpt.get("scheduler_state"),
+            ckpt.get("lambda_schedule_state"),
         )
 
 
-def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRANSFORMER_CHECKPOINT, training_settings=TRAINING_SETTINGS):
+@logger
+def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=PHASE2_CHECKPOINT, training_settings=TRAINING_SETTINGS):
     """
     Trains a Transformer-based EMR sequence model in Phase 2 (decoder stage),
     using a pretrained embedder and structured multi-loss optimization.
@@ -510,7 +674,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     -  Time prediction MSE loss guides the model to predict event timings (foundational task, start at epoch 0 with no schedule).
     -  Outcome prediction BCE loss guides the model to predict clinical outcomes (post-foundational task, start after the foundational phase with schedule).
 
-    Gradually applying curriculum and CBM during `scheduler.bce_only_epochs`, then implements early stopping based on best total loss, after warmup concludes. 
+    Gradually applying curriculum and CBM during `scheduler.bce_only_epochs`, then implements early stopping based on best total loss, after warmup concludes.
     Supports resume-from-checkpoint training. The CBM is applied during the foundational training phase only.
 
     Logits are masked to ensure only legal tokens are predicted, targets are masked to ensure proper loss denominator,
@@ -525,9 +689,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         training_settings (dict): A settings dictionary, imported from model_config.
 
     Returns:
-        None. Saves model checkpoints and plots training curves.
+        tuple: (model, train_losses, val_losses)
+        Saves model checkpoints and plots training curves.
 
-    NOTE: Despite intention, this function currently not implementing curriculum. in order to do so, one must add after 
+    NOTE: Despite intention, this function currently not implementing curriculum. in order to do so, one must add after
     pred_ids are calculated (in run_epoch) the following additions:
     if train_flag -> mix_with_predictions() from utils.py -> rebuild raw/concept/value from predicted position (define LUT?) ->
     apply mix_mask to all modalities -> Second forward pass on mixed inputs.
@@ -536,6 +701,16 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     luts = build_luts(model.embedder.tokenizer)
     luts = {k: v.to(device) if torch.is_tensor(v) else v for k,v in luts.items()}
+
+    ckpt_path = Path(checkpoint_path).resolve()
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_last = ckpt_path.parent / "ckpt_last.pt"
+
+    # If resuming, prefer checkpoint-saved settings to avoid config mismatch.
+    if resume and ckpt_last.exists():
+        pre_ckpt = torch.load(ckpt_last, map_location="cpu", weights_only=True)
+        if pre_ckpt.get("training_settings") is not None:
+            training_settings = pre_ckpt["training_settings"]
 
     # Allow embedder weights to update starting epoch 1
     set_embedder_frozen(model, freeze=False)
@@ -553,12 +728,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     # Training Dynamics
     cbm_ramp_epochs = training_settings["phase2_scheduler"]["bce_only_epochs"] # Couple CBM ramp up with the foundational phase to stabilize training before introducing the full curriculum. CBM will ramp up from 0 to max_p during these epochs, then stay at max_p for the rest of training.
 
-    # Get outcomes weights (from Tokenizer) for pos_weight in BCE loss
     valid_outcomes = [n for n in model.outcome_names if n in model.embedder.tokenizer.token2id]
     outcome_token_ids = [model.embedder.tokenizer.token2id[n] for n in valid_outcomes]
-    full_weights = model.embedder.tokenizer.outcome_weights.to(device)
-    pos_weights  = full_weights[outcome_token_ids].to(device)
-    
+
     # Build criterions once (for next token BCE and CE losses + aux outcome BCE)
     BCEcriterion = MaskedFocalBCE.from_counts(
         counts=model.embedder.tokenizer.token_counts,
@@ -575,11 +747,9 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         label_smoothing=0.0,     # optional
     ).to(device)
 
-    OutcomeCriterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction='none')
-
-    ckpt_path = Path(checkpoint_path).resolve()
-    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    ckpt_last = ckpt_path.parent / "ckpt_last.pt"
+    # No pos_weight: oversampling already rebalances rare outcomes in Phase-2.
+    # Combining pos_weight with oversampling would double-count, causing gradient explosion.
+    OutcomeCriterion = nn.BCEWithLogitsLoss(reduction='none')
 
     start_epoch = 0
     best_val = float("inf")
@@ -589,12 +759,19 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
     if resume and ckpt_last.exists():
         print(f"[GPT]: Loading model from checkpoint: {ckpt_last}")
         loaded_model, start_epoch, best_val, opt_state, sch_state, lambda_schedule_state = GPT.load(ckpt_last, embedder=model.embedder, map_location=device)
-        model.load_state_dict(loaded_model.state_dict())
-        optimizer.load_state_dict(opt_state)
+        model = loaded_model
+        model.to(device)
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+
+        # Prefer checkpoint-saved settings to avoid resume/config mismatch issues.
+        if getattr(model, "checkpoint_training_settings", None) is not None:
+            training_settings = model.checkpoint_training_settings
 
         # Scheduler needs to be re-initiated with the recovered optimizer before loading its state dict
         scheduler = LRScheduleController(optimizer, training_settings, train_dl)
-        scheduler.load_state_dict(sch_state)
+        if sch_state is not None:
+            scheduler.load_state_dict(sch_state)
         start_epoch += 1
         print(f"[Phase-2]: Resumed training at epoch {start_epoch} (best val_loss so far: {best_val:.4f})")
     else:
@@ -609,6 +786,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
     train_losses, val_losses = [], []
 
+    grad_accum_steps = training_settings.get("grad_accumulation_steps", 1)
+
     def run_epoch(loader, epoch, train_flag=False):
         if train_flag:
             model.train()
@@ -617,21 +796,24 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
         total_loss = total_bce = total_ce = total_outcome = total_dt = 0.0
         total_ce_raw = total_outcome_raw = total_dt_raw = 0.0
+        accum_step = 0
+        if train_flag:
+            optimizer.zero_grad()
         with torch.set_grad_enabled(train_flag):
-            for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=1.0, miniters=10, dynamic_ncols=True):
+            for batch in tqdm(loader, desc="Training" if train_flag else "Validation", leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
                 # === Apply CBM on training batchs ===
                 if train_flag:
                     # Starting at epoch 0, ramping through the foundational_epochs
-                    p = linear_schedule(epoch=epoch, 
-                                        start_epoch=0, 
+                    p = linear_schedule(epoch=epoch,
+                                        start_epoch=0,
                                         end_epoch=cbm_ramp_epochs,
                                         max_val=0.25)
-                    
-                    batch = apply_cbm(batch=batch, 
-                                      tokenizer=model.embedder.tokenizer, 
-                                      forbid_ids=luts["forbid_mask_ids"], 
+
+                    batch = apply_cbm(batch=batch,
+                                      tokenizer=model.embedder.tokenizer,
+                                      forbid_ids=luts["forbid_mask_ids"],
                                       p=p)
 
                 # === Original logits from Model ===
@@ -644,6 +826,10 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                         abs_ts=batch["abs_ts"],
                         context_vec=batch["context_vec"]
                     )
+                logits = logits.float()
+                abs_t_pred = abs_t_pred.float()
+                outcome_logits = outcome_logits.float()
+                dt_gate_logit = dt_gate_logit.float()
 
                 # logits is [B, T, V]
                 # abs_t_pred: [B, T]
@@ -660,7 +846,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 # Slicing Targets (Targets 1 to T-1)
                 full_targets = batch["targets"]
                 target_ids   = full_targets[:, 1:]    # [B, T-1] Used for loss calculation
-                
+
                 # === legality masks from Ground Truth + Targets ===
                 # Compute on FULL targets to preserve state history (t=0)
                 full_illegal = compute_legality_masks_tf(
@@ -708,6 +894,8 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     padding_idx=model.embedder.padding_idx,
                     vocab_size=pred_logits.size(-1),
                     window_size=_BCE_WIN,
+                    outcome_ids=model._outcome_ids,
+                    next_token_ids=full_targets[:, 1:],
                 )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 
@@ -717,7 +905,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # Calculate BCE loss (only valid positions)
                 loss_bce, _ = BCEcriterion(pred_logits, multi_hot, allowed)
-                
+
                 # === Loss: CE nudge (next token generation task) ===
                 # Foundational task to complement BCE, controlled by schedule
                 loss_ce_raw, _ = CEcriterion(pred_logits, multi_hot, allowed)
@@ -761,7 +949,7 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                     tau=_TAU,
                     horizon=_HORIZON,
                 )  # [B, T-1, K]
-                
+
                 # Only learn from valid (non-pad) time steps.
                 loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T-1, K]
                 loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
@@ -772,11 +960,32 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
                 # === Backprop and Log ===
                 if train_flag:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-                    scheduler.update()
+                    # NaN guard: skip batch and log which component is bad.
+                    # All-NaN collapse is typically caused by BF16 gradient overflow,
+                    # not by gradual explosion (which clipping would catch).
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "total": loss}
+                    _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
+                    if _bad:
+                        print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
+                        optimizer.zero_grad()
+                        accum_step = 0
+                        continue
+
+                    # Backward in FP32 — no outer autocast needed with use_reentrant=True.
+                    # Inner autocast inside _ckpt ensures BF16 recomputation matches forward.
+                    (loss / grad_accum_steps).backward()
+                    accum_step += 1
+                    if accum_step % grad_accum_steps == 0:
+                        # Catch any NaN in gradients before they corrupt weights.
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        if not torch.isfinite(grad_norm):
+                            print(f"[WARNING] NaN/inf grad norm at epoch {epoch}, skipping optimizer step.")
+                            optimizer.zero_grad()
+                            accum_step = 0
+                        else:
+                            optimizer.step()
+                            scheduler.update()
+                            optimizer.zero_grad()
                 # Update loss
                 total_loss    += loss.item()
                 total_bce     += loss_bce.item()
@@ -786,7 +995,14 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
                 total_ce_raw      += loss_ce_raw.item()
                 total_outcome_raw += loss_outcome_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
-        
+
+        # Flush any remaining accumulated gradients at end of epoch
+        if train_flag and accum_step % grad_accum_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            scheduler.update()
+            optimizer.zero_grad()
+
         n_batches = len(loader)
 
         return (
@@ -826,15 +1042,18 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
 
         # Save latest
         model.save(ckpt_last, epoch, best_val, optimizer, scheduler,
-                   lambda_schedule_state=schedule_controller.state_dict())
+                   lambda_schedule_state=schedule_controller.state_dict(),
+                   training_settings=training_settings, bad_epochs=bad_epochs)
 
         # Save best model
         warmup_gate = schedule_controller.current_warmup_end_epoch()
 
-        if (vl_loss < best_val - 1e-4) and (epoch >= warmup_gate):
+        min_delta_rel = training_settings.get("early-stop-min-delta-rel", 1e-3)
+        if (vl_loss < best_val * (1.0 - min_delta_rel)) and (epoch >= warmup_gate):
             best_val = vl_loss
             model.save(ckpt_path, epoch, best_val, optimizer, scheduler,
-                       lambda_schedule_state=schedule_controller.state_dict())
+                       lambda_schedule_state=schedule_controller.state_dict(),
+                       training_settings=training_settings, bad_epochs=bad_epochs)
             print("[Phase-2]: Current best model saved.")
             bad_epochs = 0
         elif epoch >= warmup_gate:
@@ -845,6 +1064,182 @@ def train_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=TRAN
         else:
             # If warmup isn't complete - do nothing.
             continue
+
+    plot_losses(train_losses, val_losses)
+    return model, train_losses, val_losses
+
+
+@logger
+def finetune_transformer(model, train_dl, val_dl, resume=True,
+                         checkpoint_path=PHASE3_CHECKPOINT, training_settings=TRAINING_SETTINGS):
+    """
+    Phase 3 — Outcome Head Fine-tuning.
+
+    Freezes the backbone (embedder + transformer blocks + time head) and fine-tunes
+    only the outcome_head on teacher-forced training data. Analogous to fine-tuning a
+    classification head in BERT-style models: the representation network is kept fixed
+    while only the task-specific head is updated.
+
+    The outcome loss uses the same time-decayed soft labels as Phase 2 (same
+    get_future_outcome_targets formula), so the head learns from exactly the same target
+    distribution — but now with perfect gradient isolation: backbone features are frozen
+    and gradients flow only through outcome_head.
+
+    Because the backbone is frozen, this phase converges quickly. Early stopping is
+    applied against validation outcome loss. Checkpoints are saved in the same full-model
+    format as Phase 2, so GPT.load() works identically for both checkpoints.
+
+    Args:
+        model             : trained GPT (loaded from Phase-2 best checkpoint).
+        train_dl          : training DataLoader (same batched loader used in Phase 2).
+        val_dl            : validation DataLoader.
+        resume            : if True, look for a Phase-3 checkpoint and continue from it.
+        checkpoint_path   : path for the best-checkpoint file.
+        training_settings : settings dict (from model_config).
+
+    Returns
+    -------
+    model, train_losses, val_losses
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ckpt_path = Path(checkpoint_path).resolve()
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    ckpt_last = ckpt_path.parent / "ckpt_last.pt"
+
+    tok = model.embedder.tokenizer
+    valid_outcomes    = [n for n in model.outcome_names if n in tok.token2id]
+    outcome_token_ids = [tok.token2id[n] for n in valid_outcomes]
+    pos_weights       = tok.outcome_weights[outcome_token_ids].to(device)
+    OutcomeCriterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction="none")
+
+    def _freeze_backbone_only(m):
+        """Freeze all params except outcome_head."""
+        for param in m.parameters():
+            param.requires_grad_(False)
+        for param in m.outcome_head.parameters():
+            param.requires_grad_(True)
+
+    def _make_p3_optimizer(m):
+        return torch.optim.AdamW(
+            list(m.outcome_head.parameters()),
+            lr=training_settings["phase3_learning_rate"],
+            weight_decay=training_settings["weight_decay"],
+        )
+
+    _freeze_backbone_only(model)
+    optimizer = _make_p3_optimizer(model)
+
+    start_epoch = 1
+    best_val    = float("inf")
+    bad_epochs  = 0
+
+    if resume and ckpt_last.exists():
+        print(f"[Phase-3]: Loading checkpoint: {ckpt_last}")
+        loaded_model, start_epoch, best_val, opt_state, _, _ = GPT.load(
+            ckpt_last, embedder=model.embedder, map_location=device
+        )
+        model = loaded_model
+        model.to(device)
+        _freeze_backbone_only(model)
+        optimizer = _make_p3_optimizer(model)
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+        start_epoch += 1
+        print(f"[Phase-3]: Resumed at epoch {start_epoch} (best val: {best_val:.4f})")
+    else:
+        model.to(device)
+        print("[Phase-3]: Fine-tuning outcome head...")
+
+    train_losses, val_losses = [], []
+
+    _ABS_TS_SCALE = 336.0
+    _TAU     = training_settings.get("outcome_decay_tau_hours", 12.0) / _ABS_TS_SCALE
+    _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
+
+    def run_epoch(loader, train_flag):
+        # Backbone stays in eval mode (no dropout updates, deterministic features).
+        # outcome_head is set to train mode when updating.
+        model.eval()
+        if train_flag:
+            model.outcome_head.train()
+
+        total_loss = 0.0
+        with torch.set_grad_enabled(train_flag):
+            for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
+                              leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
+                batch = {k: v.to(device) for k, v in batch.items()}
+
+                _, _, outcome_logits, _ = model(
+                    parent_raw_ids=batch["parent_raw_ids"],
+                    concept_ids=batch["concept_ids"],
+                    value_ids=batch["value_ids"],
+                    position_ids=batch["position_ids"],
+                    abs_ts=batch["abs_ts"],
+                    context_vec=batch["context_vec"],
+                )
+                outcome_logits = outcome_logits.float()
+
+                full_targets = batch["position_ids"]      # [B, T]
+                target_ids   = full_targets[:, 1:]        # [B, T-1]
+                outcome_pred = outcome_logits[:, :-1, :]  # [B, T-1, K]
+
+                outcome_targets = get_future_outcome_targets(
+                    target_ids=full_targets,
+                    outcome_ids=outcome_token_ids,
+                    all_abs_ts=batch["abs_ts"],
+                    query_abs_ts=batch["abs_ts"][:, :-1],
+                    tau=_TAU,
+                    horizon=_HORIZON,
+                )  # [B, T-1, K]
+
+                nonpad    = (target_ids != model.embedder.padding_idx)  # [B, T-1]
+                valid_pos = nonpad.unsqueeze(-1)                        # [B, T-1, 1]
+
+                loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
+                loss = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+
+                if train_flag:
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.outcome_head.parameters(), 1.0)
+                    optimizer.step()
+
+                total_loss += loss.item()
+
+        return total_loss / max(len(loader), 1)
+
+    n_epochs = training_settings["phase3_n_epochs"]
+    patience = training_settings["early-stop-patience"]
+
+    for epoch in range(start_epoch, start_epoch + n_epochs):
+        tr_loss = run_epoch(train_dl, train_flag=True)
+        vl_loss = run_epoch(val_dl,   train_flag=False)
+
+        train_losses.append(tr_loss)
+        val_losses.append(vl_loss)
+
+        print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}")
+
+        model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
+                   training_settings=training_settings, bad_epochs=bad_epochs)
+
+        min_delta_rel = training_settings.get("early-stop-min-delta-rel", 1e-3)
+        if vl_loss < best_val * (1.0 - min_delta_rel):
+            best_val = vl_loss
+            bad_epochs = 0
+            model.save(ckpt_path, epoch=epoch, best_val=best_val, optimizer=optimizer,
+                       training_settings=training_settings)
+            print("[Phase-3]: Current best model saved.")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= patience:
+                print("[Phase-3]: Early stopping triggered.")
+                break
+
+    # Restore gradients to all parameters
+    for param in model.parameters():
+        param.requires_grad_(True)
 
     plot_losses(train_losses, val_losses)
     return model, train_losses, val_losses

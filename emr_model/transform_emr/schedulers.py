@@ -19,7 +19,7 @@ LambdaScheduleController:
         loss plateaus — but only after the current stage's ramp has completed.
   - Frozen-fraction calibration: lambda_max = fraction_cap * tr_main / tr_aux
     (computed from TRAINING losses once, then fixed).
-  - Linear ramp from 0 to lambda_max over ramp_epochs (ramp_epochs=1 means immediate).
+  - Linear ramp from 0 to lambda_max over ramp_epochs (ramp_epochs=0 means immediate).
   - Warmup tracking: reports the epoch after which early stopping may begin.
 
 Config expected shape (phase-specific dict):
@@ -152,7 +152,7 @@ class LambdaScheduleController:
         self._cfg = schedule_config
         self.start_epoch = int(start_epoch)
         self._min_aux_loss = 1e-8
-        self._max_lambda_clamp = 100.0
+        self._max_lambda_clamp = 10.0
 
         caps = schedule_config["aux_fraction_caps"]
         ramp_cfg = schedule_config.get("ramp_epochs", {})
@@ -179,7 +179,7 @@ class LambdaScheduleController:
                 self._register_aux(
                     name=name,
                     start_epoch=s_epoch,
-                    ramp_epochs=max(1, int(ramp_cfg.get(name, 1))),
+                    ramp_epochs=max(0, int(ramp_cfg.get(name, 0))),
                     fraction=caps[name],
                 )
 
@@ -218,7 +218,7 @@ class LambdaScheduleController:
         self._auxiliaries[name] = {
             "name": name,
             "start_epoch": start_epoch,
-            "ramp_epochs": max(1, int(ramp_epochs)),
+            "ramp_epochs": max(0, int(ramp_epochs)),
             "fraction": float(fraction),
             "lambda_max": None,
             "anchor_main_loss": None,
@@ -226,17 +226,21 @@ class LambdaScheduleController:
         }
 
     def _ramp_end(self, name: str) -> int:
-        """Epoch at which the named aux task reaches its full lambda_max."""
+        """Epoch at which the named aux task reaches its full lambda_max.
+
+        ramp_epochs=0 → immediate (lambda at full value from start_epoch).
+        ramp_epochs=N → linear ramp; reaches max at start_epoch + N.
+        """
         spec = self._auxiliaries[name]
         s = spec["start_epoch"]
         if s is None:
             return float("inf")
-        return s if spec["ramp_epochs"] <= 1 else s + spec["ramp_epochs"]
+        return s + spec["ramp_epochs"]
 
     @staticmethod
     def _check_plateau(metric_val, best_val, bad_epochs, min_delta, patience):
-        """Returns (new_best, new_bad_epochs, is_plateau)."""
-        if metric_val < (best_val - min_delta):
+        """Returns (new_best, new_bad_epochs, is_plateau). min_delta is relative (e.g. 1e-4 = 0.01%)."""
+        if metric_val < best_val * (1.0 - min_delta):
             return metric_val, 0, False
         bad_epochs += 1
         return best_val, bad_epochs, bad_epochs >= patience
@@ -279,9 +283,11 @@ class LambdaScheduleController:
             messages.extend(self._check_stage_transitions(epoch, vl_total))
 
         # Step 2: Calibrate each auxiliary once using training losses.
+        # Pre-calibrate one epoch before start_epoch so the first active epoch already
+        # has a known lambda_max (get_lambdas still returns 0 when epoch < start_epoch).
         for name, spec in self._auxiliaries.items():
-            if spec["start_epoch"] is None or epoch < spec["start_epoch"]:
-                continue  # Not yet active
+            if spec["start_epoch"] is None or epoch < spec["start_epoch"] - 1:
+                continue  # Not yet time to calibrate
             if spec["lambda_max"] is not None:
                 continue  # Already calibrated
             if name not in tr_aux_losses:

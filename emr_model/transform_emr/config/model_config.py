@@ -5,13 +5,13 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 
 # Checkpoint paths
 CHECKPOINT_PATH = os.path.join(PROJECT_ROOT, 'checkpoints')
-EMBEDDER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase1', 'ckpt_best.pt')
-TRANSFORMER_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'ckpt_best.pt')
+PHASE1_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase1', 'ckpt_best.pt')
+PHASE2_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'ckpt_best.pt')
+PHASE3_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase3', 'ckpt_best.pt')
 
 MODEL_CONFIG = {
       "time2vec_dim": 32,
       "embed_dim": 256,
-      "block_size": 512,  # //e.g. sequence length, number of tokens processed concurrently
       "n_head": 4,
       "n_layer": 4,
       "dropout": 0.1,
@@ -19,19 +19,24 @@ MODEL_CONFIG = {
     }
 
 TRAINING_SETTINGS = {
-    "phase1_n_epochs": 100,
-    "phase2_n_epochs": 100,
+    "phase1_n_epochs": 50,
+    "phase2_n_epochs": 50,
+    "phase3_n_epochs": 50,
+    "sample": None,  # set to int (e.g. 50) for a quick smoke-test
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
     "lr_warmup_epochs": 5,
     "early-stop-patience": 5,
+    "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,
-    "phase2_learning_rate": 5e-4,
+    "phase2_learning_rate": 3e-4,
+    "phase3_learning_rate":  1e-4,
     "weight_decay": 1e-3,
 
-    "batch_size": 64, # Number of patients processed concurrently
+    "batch_size": 16, # Number of patients processed concurrently (effective batch=64 via grad accumulation)
+    "grad_accumulation_steps": 4, # Accumulate gradients over N steps before optimizer.step()
     "phase1_bce_window_hours": 3.0,
     "phase2_bce_window_hours": 12.0,
 
@@ -43,13 +48,13 @@ TRAINING_SETTINGS = {
     "phase1_scheduler": {
         "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
         "aux_fraction_caps": {
-            "mlm": 0.20,  # MLM auxiliary capped to 20% of BCE at calibration epoch
-            "dt":  0.20,  # Time regression auxiliary capped to 20% of BCE at calibration epoch
+            "mlm": 1.50,  # MLM auxiliary capped to 150% of BCE at calibration epoch
+            "dt":  0.40,  # Time regression auxiliary capped to 40% of BCE at calibration epoch
         },
         "order": [["mlm", "dt"]],  # Single stage: both active together after bce_only_epochs
         "ramp_epochs": {
-            "mlm": 1,  # No ramp (immediate full lambda after calibration)
-            "dt":  1,
+            "mlm": 0,  # No ramp (immediate full lambda after calibration)
+            "dt":  0,
         },
     },
 
@@ -64,21 +69,21 @@ TRAINING_SETTINGS = {
         # Run BCE alone first so auxiliary lambda calibration uses a trained BCE baseline.
         # This value is also used to align early curricula (CBM ramp from epoch 0 and LR warmup).
         # You can decouple these by setting a separate `warmup_epochs` for LR in the scheduler and keeping this as the BCE-only period for curriculum and lambda warmup.
-        "bce_only_epochs": 5,
+        "bce_only_epochs": 2,
         "aux_fraction_caps": {
-            "ce":      2.00,    # Next-token CE nudge cap
-            "dt":      0.20,    # Time regression cap
-            "outcome": 10.00,   # Future-outcome auxiliary cap
+            "ce":      0.50,    # Next-token CE nudge cap
+            "dt":      0.50,    # Time regression cap
+            "outcome": 0.20,    # Future-outcome auxiliary cap
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
-            "ce":      1,  # No ramp
-            "dt":      1,  # No ramp
-            "outcome": 5,  # Gradual ramp after unlocking
+            "ce":      0,  # No ramp (immediate full lambda after calibration)
+            "dt":      0,  # No ramp
+            "outcome": 3,  # Gradual ramp over 3 epochs after unlocking
         },
         # Plateau detection settings (applied per stage transition, in order)
-        "plateau_min_delta": 1e-4,
-        "plateau_patience":  [3],  # Patience per transition: [0→1]
+        "plateau_min_delta": 1e-3,
+        "plateau_patience":  [2],  # Patience per transition: [0→1]
     },
 
     # Outcome head — time-decayed soft labels.

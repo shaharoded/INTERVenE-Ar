@@ -37,3 +37,14 @@ RELEASE_TOKEN = "RELEASE_EVENT"
 TERMINAL_OUTCOMES = [RELEASE_TOKEN, DEATH_TOKEN]
 
 MEAL_TOKENS = ["MEAL_CONTEXT_Breakfast", "MEAL_CONTEXT_Lunch", "MEAL_CONTEXT_Dinner", "MEAL_CONTEXT_Night-Snack"] # Keep ordered! concept_value tokens
+
+# inclusion/exclusion criteria to filter all datasets
+INCLUSION_EXCLUSION_CRITERIA = {
+    "temporal": [
+        "WHERE Value NOT LIKE '%Steady%'",
+        "WHERE ConceptName NOT LIKE '%_PATTERN%'",
+    ],
+    "context":[
+
+    ]
+}
