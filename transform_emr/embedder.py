@@ -133,8 +133,14 @@ class EMREmbedding(nn.Module):
             nn.Linear(time2vec_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 1),
-            nn.Sigmoid() # bound to [0,1]
         )
+        # Skip path for direct time regression (init at 0 to preserve old behavior).
+        self.time_skip = nn.Linear(1, 1, bias=True)
+        nn.init.zeros_(self.time_skip.weight)
+        nn.init.zeros_(self.time_skip.bias)
+
+        # Gate head: predicts P(Δt > 0) for Phase-1 temporal supervision.
+        self.dt_gate_head = nn.Linear(time2vec_dim, 1)
 
         # --- patient‑context slot ----------------------------------------
         # NOTE: In phase-1, this projection's output is added directly to the event
@@ -170,11 +176,31 @@ class EMREmbedding(nn.Module):
         Returns: [B, T, 1] values ∈ [0,1]
         """
         t_abs = self.time2vec_abs(abs_ts)      # [B, T, k]
-        return self.time_head(t_abs)           # [B, T, 1]
+        logits = self.time_head(t_abs)         # [B, T, 1]
+        logits = logits + self.time_skip(abs_ts.unsqueeze(-1))
+        return torch.sigmoid(logits)
+
+    def predict_dt(self, abs_ts):
+        """
+        Purpose: Phase-1 two-head Δt supervision — gate + magnitude.
+        Method: Runs time2vec on abs_ts, returns a gate logit (P(Δt>0)) and
+                a raw magnitude logit (target: log1p(Δt_hours)).
+
+        Args:
+            abs_ts (FloatTensor): [B, T] normalised absolute timestamps (hours/336).
+
+        Returns:
+            gate_logit (FloatTensor): [B, T, 1] raw logit for BCE gate loss.
+            mag_logit  (FloatTensor): [B, T, 1] raw logit for log1p magnitude MSE.
+        """
+        t_abs      = self.time2vec_abs(abs_ts)                         # [B, T, k]
+        gate_logit = self.dt_gate_head(t_abs)                          # [B, T, 1]
+        mag_logit  = self.time_head(t_abs) + self.time_skip(abs_ts.unsqueeze(-1))  # [B, T, 1]
+        return gate_logit, mag_logit
 
 
     def forward(self, parent_raw_ids, concept_ids, value_ids, position_ids,
-                 abs_ts, patient_contexts, return_mask=False):
+                 abs_ts, patient_contexts, return_mask=False, detach_time=False):
         """
         Build time-aware event embeddings for a full sequence.
 
@@ -186,6 +212,7 @@ class EMREmbedding(nn.Module):
             abs_ts (FloatTensor):         [B, T]
             patient_contexts (FloatTensor): [B, ctx_dim]
             return_mask (bool): Whether to return an attention mask
+            detach_time (bool): If True, stop gradients through time embeddings
 
         Returns:
                     seq:  [B, T, D]  (Event embeddings)
@@ -211,6 +238,8 @@ class EMREmbedding(nn.Module):
         # --- Time encoding ---
         t_abs = self.time2vec_abs(abs_ts)           # [B, T, k] (k = time2vec_dim)
         t_emb = self.time_proj(t_abs)               # [B, T, D]
+        if detach_time:
+            t_emb = t_emb.detach()
 
         # --- Combine all token-wise pieces ---
         combined = torch.cat([r_emb, c_emb, v_emb, p_emb, t_emb], dim=-1)  # [B, T, 5D]
@@ -248,6 +277,7 @@ class EMREmbedding(nn.Module):
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
         return_mask=False,
+        detach_time=True,
         )  # → returns only [B,T,D]
 
         # Context Dropout (Crucial for Phase 2 compatibility)
@@ -285,6 +315,7 @@ class EMREmbedding(nn.Module):
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
         return_mask=False,
+        detach_time=True,  # MLM must not corrupt time head training
         )    # [B,T,D]
 
         # Context Dropout (Crucial for Phase 2 compatibility)
@@ -553,17 +584,37 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
             lambdas = schedule_controller.get_lambdas(epoch)
             mlm_loss = mlm_raw * lambdas["mlm"]
             
-            # Δt regression supervision
-            # Predict normalised absolute time for every step (non-padding only)
-            nonpad = (batch["position_ids"] != embedder.padding_idx)  # [B,T]
+            # Δt: two-head temporal supervision matching Phase-2 structure.
+            # Gate BCE (all non-pad pairs): P(Δt>0) — gives signal on simultaneous events.
+            # Magnitude MSE (non-simultaneous pairs only): log1p(Δt_hours) — meaningful scale.
+            nonpad_src  = (batch["position_ids"][:, :-1] != embedder.padding_idx)  # [B, T-1]
+            nonpad_tgt  = (batch["position_ids"][:, 1:]  != embedder.padding_idx)  # [B, T-1]
+            nonpad_pair = nonpad_src & nonpad_tgt
+
+            dt_vals_hrs = (batch["abs_ts"][:, 1:] - batch["abs_ts"][:, :-1]) * 336.0  # hours
+            dt_nonzero  = dt_vals_hrs > 1e-3
+            nonpad_nz   = nonpad_pair & dt_nonzero
+
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                pred_t = embedder.predict_time(batch["abs_ts"])            # [B,T,1]
-            pred_t = pred_t.float()
-            dt_raw = F.mse_loss(
-                pred_t.squeeze(-1)[nonpad],                            # [N_real]
-                batch["abs_ts"][nonpad],                               # [N_real]
-                reduction='mean'
+                gate_logit, mag_logit = embedder.predict_dt(batch["abs_ts"][:, :-1])  # [B, T-1, 1]
+            gate_logit = gate_logit.squeeze(-1).float()  # [B, T-1]
+            mag_logit  = mag_logit.squeeze(-1).float()   # [B, T-1]
+
+            gate_loss = F.binary_cross_entropy_with_logits(
+                gate_logit[nonpad_pair],
+                dt_nonzero[nonpad_pair].float(),
+                reduction="mean",
             )
+            if nonpad_nz.any():
+                mag_loss = F.mse_loss(
+                    mag_logit[nonpad_nz],
+                    torch.log1p(dt_vals_hrs[nonpad_nz]),  # log1p(hours): 1hr→0.69, 6hr→1.95
+                    reduction="mean",
+                )
+            else:
+                mag_loss = gate_logit.new_tensor(0.0)
+
+            dt_raw = gate_loss + mag_loss
             time_loss = dt_raw * lambdas["dt"]
             loss = bce_loss + time_loss + mlm_loss
 

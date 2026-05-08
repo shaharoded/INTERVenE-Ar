@@ -170,10 +170,10 @@ class MLP(nn.Module):
     """
     def __init__(self, cfg):
         super().__init__()
-        # Standard GPT uses 4x expansion. 
+        # Standard GPT uses 4x expansion.
         # For SwiGLU, we project to 2 * (4 * dim) so we can split it into two 4x vectors.
         hidden_dim = 4 * cfg["embed_dim"]
-        
+
         self.w1 = nn.Linear(cfg["embed_dim"], 2 * hidden_dim, bias=cfg["bias"])
         self.w2 = nn.Linear(hidden_dim, cfg["embed_dim"], bias=cfg["bias"])
         self.drop = nn.Dropout(cfg["dropout"])
@@ -181,13 +181,13 @@ class MLP(nn.Module):
     def forward(self, x):
         # 1. Project to double width
         projected = self.w1(x)
-        
+
         # 2. Split into x (content) and g (gate)
         x_val, x_gate = projected.chunk(2, dim=-1)
-        
+
         # 3. Gating: Val * SiLU(Gate)
         out = x_val * F.silu(x_gate)
-        
+
         # 4. Project back
         return self.drop(self.w2(out))
 
@@ -195,17 +195,17 @@ class MLP(nn.Module):
 class AdaLNBlock(nn.Module):
     """
     Transformer block with AdaLN-Zero conditioning.
-    
+
     Instead of adding [CTX] to the sequence, we inject patient context into
     the normalization layers of *every* block.
-    
+
     Mechanism:
         1. Project context_emb -> (scale, shift, gate)
         2. Norm(x) = (x - mu)/sigma * (1 + scale) + shift
         3. Output = x + gate * Block(Norm(x))
-    
+
     Zero Initialization:
-        We initialize the modulation projection to 0. This ensures that at the 
+        We initialize the modulation projection to 0. This ensures that at the
         start of training, the block acts as an identity function (ignoring context),
         which stabilizes deep training.
     """
@@ -349,27 +349,14 @@ class GPT(nn.Module):
             # Note: No Sigmoid here if using BCEWithLogitsLoss later
         )
 
-        # _outcome_lm_ids: vocab positions for outcome_names — used by the LM coupling.
-        # _outcome_ids: vocab positions for ALL OUTCOMES+TERMINAL_OUTCOMES in vocab
-        #   (broader than outcome_names; used for 1-hot override in multi-hot targets).
-        self.register_buffer(
-            "_outcome_lm_ids",
-            torch.tensor([tok.token2id[n] for n in self.outcome_names], dtype=torch.long),
-            persistent=True,
-        )
+        # Vocab positions for ALL OUTCOMES+TERMINAL_OUTCOMES that exist in vocab.
+        # Broader than outcome_names (includes outcomes filtered by rarity); used
+        # for the 1-hot override in multi-hot BCE targets during phase-2 training.
         self.register_buffer(
             "_outcome_ids",
             torch.tensor([tok.token2id[n] for n in in_vocab], dtype=torch.long),
             persistent=True,
         )
-
-        # One-way coupling: outcome_head → LM head at outcome vocab positions.
-        # outcome_to_lm reads outcome_logits.detach() so LM loss never corrupts
-        # outcome_head training. Zero-init = no-op at start; trained in phase-3 only
-        # alongside outcome_head after it is well-calibrated from phase-2.
-        self.outcome_to_lm = nn.Linear(self.num_outcomes, self.num_outcomes, bias=True)
-        nn.init.zeros_(self.outcome_to_lm.weight)
-        nn.init.zeros_(self.outcome_to_lm.bias)
 
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
@@ -442,7 +429,7 @@ class GPT(nn.Module):
         ]
 
         return torch.optim.AdamW(optim_groups, betas=betas)
-    
+
 # ---------------------------------------------------- forward ---- #
     def forward(self, parent_raw_ids, concept_ids, value_ids, position_ids,
             abs_ts, context_vec=None):
@@ -454,7 +441,7 @@ class GPT(nn.Module):
             position_ids (torch.Tensor)      - padded token ids, (B, T)
             abs_ts (torch.Tensor)            - relative start times from ADMISSION (hours), (B, T)
             context_vec (torch.Tensor)       - age/gender or [] if not used, (B, C)
-        
+
         Returns:
             logits (FloatTensor): [B, T, V]
                 - Next-token logits for the sequence.
@@ -479,14 +466,21 @@ class GPT(nn.Module):
         # We pass cond_emb to every block to modulate the normalization layers
         for blk in self.blocks:
             if self.training and self.use_checkpoint:
-                x = checkpoint.checkpoint(
-                    lambda x, c, m, t: blk(x, c, key_pad_mask=m, abs_ts=t),
-                    x, cond_emb, pad_mask, abs_ts,
-                    use_reentrant=False
-                )
+                # use_reentrant=True: reentrant checkpoint, no tensor-count consistency check.
+                # use_reentrant=False triggers CheckpointError on this model regardless of AMP
+                # state (confirmed: amp=True for all 8 forward+recomp calls, counts still differ).
+                # Default-arg capture (_blk=blk) fixes the closure bug where lambdas all closed
+                # over the last block; reentrant recomputation runs correctly with each block's
+                # own weights. Inner autocast ensures BF16 ops during recomputation.
+                def _ckpt(_x, _c, _m, _t, _blk=blk):
+                    _dev = _x.device.type
+                    _amp = _dev == "cuda" and torch.cuda.is_bf16_supported()
+                    with torch.autocast(device_type=_dev, dtype=torch.bfloat16, enabled=_amp):
+                        return _blk(_x, _c, key_pad_mask=_m, abs_ts=_t)
+                x = checkpoint.checkpoint(_ckpt, x, cond_emb, pad_mask, abs_ts, use_reentrant=True)
             else:
                 x = blk(x, cond_emb, key_pad_mask=pad_mask, abs_ts=abs_ts)
-        
+
         x = self.ln_f(x)                     # [B, T, D]
 
         # 3. Main next-token prediction head
@@ -496,12 +490,6 @@ class GPT(nn.Module):
         # Input: Contextual embedding at step t (representing history 0..t)
         # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
         outcome_logits = self.outcome_head(x)
-
-        # 4b. One-way outcome→LM coupling: add a learned bias at the outcome vocab
-        # positions. Detach prevents LM loss from flowing into outcome_head weights.
-        # outcome_to_lm is zero-init (no-op until trained in phase-3).
-        lm_bias = self.outcome_to_lm(outcome_logits.detach())   # [B, T, num_outcomes]
-        logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)
 
         # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
@@ -578,8 +566,6 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
-        lm_bias        = self.outcome_to_lm(outcome_logits.detach())
-        logits         = logits.index_add(2, self._outcome_lm_ids, lm_bias)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
@@ -612,7 +598,7 @@ class GPT(nn.Module):
             ckpt["scheduler_state"] = scheduler.state_dict()
         torch.save(ckpt, path)
 
-    
+
     @classmethod
     def load(cls, path, embedder, map_location="cpu"):
         ckpt = torch.load(path, map_location=map_location, weights_only=True)
@@ -627,17 +613,17 @@ class GPT(nn.Module):
             raise ValueError(
                 f"[GPT.load] Embedder vocab size mismatch: checkpoint={expected_vocab}, embedder={actual_vocab}"
             )
-        
+
         # === Outcome configuration check ===
         if "outcome_names" not in ckpt or "num_outcomes" not in ckpt:
             raise ValueError(
                 "[GPT.load] Invalid checkpoint: missing 'outcome_names' or 'num_outcomes'. "
                 "Checkpoint was saved with an older version of the code."
             )
-        
+
         expected_outcome_names = set(ckpt["outcome_names"])
         expected_num_outcomes = ckpt["num_outcomes"]
-        
+
         # Validate that current config matches checkpoint
         current_outcomes = set(OUTCOMES + TERMINAL_OUTCOMES)
         if not expected_outcome_names.issubset(current_outcomes):
@@ -647,17 +633,17 @@ class GPT(nn.Module):
                 f"  Current config outcomes: {sorted(current_outcomes)}\n"
                 f"  Please use the same OUTCOMES and TERMINAL_OUTCOMES config that was used during training."
             )
-        
+
         # Reconstruct model
         model = cls(cfg=ckpt["config"], embedder=embedder)
-        
+
         # Final sanity check
         if model.num_outcomes != expected_num_outcomes:
             raise ValueError(
                 f"[GPT.load] Architecture mismatch: checkpoint has {expected_num_outcomes} outcomes, "
                 f"but reconstructed model has {model.num_outcomes}."
             )
-        
+
         model.load_state_dict(ckpt["model_state"])
 
         # Helpful metadata for callers that want to fully restore prior training settings.
@@ -688,7 +674,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
     -  Time prediction MSE loss guides the model to predict event timings (foundational task, start at epoch 0 with no schedule).
     -  Outcome prediction BCE loss guides the model to predict clinical outcomes (post-foundational task, start after the foundational phase with schedule).
 
-    Gradually applying curriculum and CBM during `scheduler.bce_only_epochs`, then implements early stopping based on best total loss, after warmup concludes. 
+    Gradually applying curriculum and CBM during `scheduler.bce_only_epochs`, then implements early stopping based on best total loss, after warmup concludes.
     Supports resume-from-checkpoint training. The CBM is applied during the foundational training phase only.
 
     Logits are masked to ensure only legal tokens are predicted, targets are masked to ensure proper loss denominator,
@@ -706,7 +692,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         tuple: (model, train_losses, val_losses)
         Saves model checkpoints and plots training curves.
 
-    NOTE: Despite intention, this function currently not implementing curriculum. in order to do so, one must add after 
+    NOTE: Despite intention, this function currently not implementing curriculum. in order to do so, one must add after
     pred_ids are calculated (in run_epoch) the following additions:
     if train_flag -> mix_with_predictions() from utils.py -> rebuild raw/concept/value from predicted position (define LUT?) ->
     apply mix_mask to all modalities -> Second forward pass on mixed inputs.
@@ -820,14 +806,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 # === Apply CBM on training batchs ===
                 if train_flag:
                     # Starting at epoch 0, ramping through the foundational_epochs
-                    p = linear_schedule(epoch=epoch, 
-                                        start_epoch=0, 
+                    p = linear_schedule(epoch=epoch,
+                                        start_epoch=0,
                                         end_epoch=cbm_ramp_epochs,
                                         max_val=0.25)
-                    
-                    batch = apply_cbm(batch=batch, 
-                                      tokenizer=model.embedder.tokenizer, 
-                                      forbid_ids=luts["forbid_mask_ids"], 
+
+                    batch = apply_cbm(batch=batch,
+                                      tokenizer=model.embedder.tokenizer,
+                                      forbid_ids=luts["forbid_mask_ids"],
                                       p=p)
 
                 # === Original logits from Model ===
@@ -860,7 +846,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 # Slicing Targets (Targets 1 to T-1)
                 full_targets = batch["targets"]
                 target_ids   = full_targets[:, 1:]    # [B, T-1] Used for loss calculation
-                
+
                 # === legality masks from Ground Truth + Targets ===
                 # Compute on FULL targets to preserve state history (t=0)
                 full_illegal = compute_legality_masks_tf(
@@ -919,7 +905,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
                 # Calculate BCE loss (only valid positions)
                 loss_bce, _ = BCEcriterion(pred_logits, multi_hot, allowed)
-                
+
                 # === Loss: CE nudge (next token generation task) ===
                 # Foundational task to complement BCE, controlled by schedule
                 loss_ce_raw, _ = CEcriterion(pred_logits, multi_hot, allowed)
@@ -963,7 +949,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     tau=_TAU,
                     horizon=_HORIZON,
                 )  # [B, T-1, K]
-                
+
                 # Only learn from valid (non-pad) time steps.
                 loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T-1, K]
                 loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
@@ -974,13 +960,32 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
                 # === Backprop and Log ===
                 if train_flag:
+                    # NaN guard: skip batch and log which component is bad.
+                    # All-NaN collapse is typically caused by BF16 gradient overflow,
+                    # not by gradual explosion (which clipping would catch).
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "total": loss}
+                    _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
+                    if _bad:
+                        print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
+                        optimizer.zero_grad()
+                        accum_step = 0
+                        continue
+
+                    # Backward in FP32 — no outer autocast needed with use_reentrant=True.
+                    # Inner autocast inside _ckpt ensures BF16 recomputation matches forward.
                     (loss / grad_accum_steps).backward()
                     accum_step += 1
                     if accum_step % grad_accum_steps == 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        optimizer.step()
-                        scheduler.update()
-                        optimizer.zero_grad()
+                        # Catch any NaN in gradients before they corrupt weights.
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        if not torch.isfinite(grad_norm):
+                            print(f"[WARNING] NaN/inf grad norm at epoch {epoch}, skipping optimizer step.")
+                            optimizer.zero_grad()
+                            accum_step = 0
+                        else:
+                            optimizer.step()
+                            scheduler.update()
+                            optimizer.zero_grad()
                 # Update loss
                 total_loss    += loss.item()
                 total_bce     += loss_bce.item()
@@ -1109,17 +1114,15 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     OutcomeCriterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction="none")
 
     def _freeze_backbone_only(m):
-        """Freeze all params except outcome_head and outcome_to_lm."""
+        """Freeze all params except outcome_head."""
         for param in m.parameters():
             param.requires_grad_(False)
         for param in m.outcome_head.parameters():
             param.requires_grad_(True)
-        for param in m.outcome_to_lm.parameters():
-            param.requires_grad_(True)
 
     def _make_p3_optimizer(m):
         return torch.optim.AdamW(
-            list(m.outcome_head.parameters()) + list(m.outcome_to_lm.parameters()),
+            list(m.outcome_head.parameters()),
             lr=training_settings["phase3_learning_rate"],
             weight_decay=training_settings["weight_decay"],
         )
@@ -1127,7 +1130,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     _freeze_backbone_only(model)
     optimizer = _make_p3_optimizer(model)
 
-    start_epoch = 0
+    start_epoch = 1
     best_val    = float("inf")
     bad_epochs  = 0
 
@@ -1146,7 +1149,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         print(f"[Phase-3]: Resumed at epoch {start_epoch} (best val: {best_val:.4f})")
     else:
         model.to(device)
-        print("[Phase-3]: Fine-tuning outcome head + outcome_to_lm coupling...")
+        print("[Phase-3]: Fine-tuning outcome head...")
 
     train_losses, val_losses = [], []
 
@@ -1156,19 +1159,18 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
-        # outcome_head and outcome_to_lm are set to train mode when updating.
+        # outcome_head is set to train mode when updating.
         model.eval()
         if train_flag:
             model.outcome_head.train()
-            model.outcome_to_lm.train()
 
-        total_loss = total_outcome = total_ce = 0.0
+        total_loss = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
-                logits, _, outcome_logits, _ = model(
+                _, _, outcome_logits, _ = model(
                     parent_raw_ids=batch["parent_raw_ids"],
                     concept_ids=batch["concept_ids"],
                     value_ids=batch["value_ids"],
@@ -1176,13 +1178,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     abs_ts=batch["abs_ts"],
                     context_vec=batch["context_vec"],
                 )
-                logits         = logits.float()
                 outcome_logits = outcome_logits.float()
 
                 full_targets = batch["position_ids"]      # [B, T]
                 target_ids   = full_targets[:, 1:]        # [B, T-1]
                 outcome_pred = outcome_logits[:, :-1, :]  # [B, T-1, K]
-                pred_logits  = logits[:, :-1, :]          # [B, T-1, V]
 
                 outcome_targets = get_future_outcome_targets(
                     target_ids=full_targets,
@@ -1196,52 +1196,30 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 nonpad    = (target_ids != model.embedder.padding_idx)  # [B, T-1]
                 valid_pos = nonpad.unsqueeze(-1)                        # [B, T-1, 1]
 
-                loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
-                loss_outcome = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
-
-                # CE at outcome positions: trains outcome_to_lm via LM logits
-                oids = model._outcome_ids
-                is_outcome_pos = (target_ids.unsqueeze(-1) == oids.view(1, 1, -1)).any(-1) & nonpad
-                if is_outcome_pos.any():
-                    loss_ce = F.cross_entropy(
-                        pred_logits[is_outcome_pos],
-                        target_ids[is_outcome_pos],
-                        reduction="mean",
-                    )
-                else:
-                    loss_ce = torch.tensor(0.0, device=device)
-
-                loss = loss_outcome + loss_ce
+                loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
+                loss = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
 
                 if train_flag:
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(
-                        list(model.outcome_head.parameters()) + list(model.outcome_to_lm.parameters()),
-                        1.0,
-                    )
+                    nn.utils.clip_grad_norm_(model.outcome_head.parameters(), 1.0)
                     optimizer.step()
 
-                total_loss    += loss.item()
-                total_outcome += loss_outcome.item()
-                total_ce      += loss_ce.item()
+                total_loss += loss.item()
 
-        n = max(len(loader), 1)
-        return total_loss / n, total_outcome / n, total_ce / n
+        return total_loss / max(len(loader), 1)
 
     n_epochs = training_settings["phase3_n_epochs"]
     patience = training_settings["early-stop-patience"]
 
     for epoch in range(start_epoch, start_epoch + n_epochs):
-        tr_loss, tr_outcome, tr_ce = run_epoch(train_dl, train_flag=True)
-        vl_loss, vl_outcome, vl_ce = run_epoch(val_dl,   train_flag=False)
+        tr_loss = run_epoch(train_dl, train_flag=True)
+        vl_loss = run_epoch(val_dl,   train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        print(f"[Phase-3]: Epoch {epoch:02d}  "
-              f"train={tr_loss:.4f} (outcome={tr_outcome:.4f}, ce={tr_ce:.4f})  "
-              f"val={vl_loss:.4f} (outcome={vl_outcome:.4f}, ce={vl_ce:.4f})")
+        print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}")
 
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)

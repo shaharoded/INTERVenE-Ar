@@ -30,7 +30,7 @@ TRAINING_SETTINGS = {
     "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,
-    "phase2_learning_rate": 5e-4,
+    "phase2_learning_rate": 3e-4,
     "phase3_learning_rate":  1e-4,
     "weight_decay": 1e-3,
 
@@ -47,8 +47,8 @@ TRAINING_SETTINGS = {
     "phase1_scheduler": {
         "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
         "aux_fraction_caps": {
-            "mlm": 0.20,  # MLM auxiliary capped to 20% of BCE at calibration epoch
-            "dt":  0.20,  # Time regression auxiliary capped to 20% of BCE at calibration epoch
+            "mlm": 1.50,  # MLM auxiliary capped to 150% of BCE at calibration epoch
+            "dt":  0.40,  # Time regression auxiliary capped to 40% of BCE at calibration epoch
         },
         "order": [["mlm", "dt"]],  # Single stage: both active together after bce_only_epochs
         "ramp_epochs": {
@@ -68,10 +68,10 @@ TRAINING_SETTINGS = {
         # Run BCE alone first so auxiliary lambda calibration uses a trained BCE baseline.
         # This value is also used to align early curricula (CBM ramp from epoch 0 and LR warmup).
         # You can decouple these by setting a separate `warmup_epochs` for LR in the scheduler and keeping this as the BCE-only period for curriculum and lambda warmup.
-        "bce_only_epochs": 5,
+        "bce_only_epochs": 2,
         "aux_fraction_caps": {
-            "ce":      2.00,    # Next-token CE nudge cap
-            "dt":      1.00,    # Time regression cap
+            "ce":      0.50,    # Next-token CE nudge cap
+            "dt":      0.50,    # Time regression cap
             "outcome": 0.20,    # Future-outcome auxiliary cap
         },
         "order": [["ce", "dt"], ["outcome"]],

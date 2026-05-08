@@ -152,7 +152,7 @@ class LambdaScheduleController:
         self._cfg = schedule_config
         self.start_epoch = int(start_epoch)
         self._min_aux_loss = 1e-8
-        self._max_lambda_clamp = 100.0
+        self._max_lambda_clamp = 10.0
 
         caps = schedule_config["aux_fraction_caps"]
         ramp_cfg = schedule_config.get("ramp_epochs", {})
