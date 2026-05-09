@@ -340,9 +340,13 @@ class GPT(nn.Module):
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
 
-        # A simple MLP classifier
+        # Outcome head: takes [hidden_state || lm_logits_at_outcome_positions] as input.
+        # LM head already discriminates outcomes well (teacher-forced AUROC: CARDIO 0.846 vs
+        # outcome_head 0.564 in diagnostics). Adding LM logits as side-channel features lets
+        # the outcome head leverage the LM's learned outcome representations.
+        # Input dim: embed_dim + num_outcomes (D + K), where K ≈ 6 outcomes.
         self.outcome_head = nn.Sequential(
-            nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
+            nn.Linear(cfg["embed_dim"] + self.num_outcomes, cfg["embed_dim"]),
             nn.ReLU(),
             nn.Dropout(cfg["dropout"]),
             nn.Linear(cfg["embed_dim"], self.num_outcomes)
@@ -355,6 +359,14 @@ class GPT(nn.Module):
         self.register_buffer(
             "_outcome_ids",
             torch.tensor([tok.token2id[n] for n in in_vocab], dtype=torch.long),
+            persistent=True,
+        )
+
+        # Vocab positions for the valid outcomes predicted by outcome_head (same order as outcome_names).
+        # Used to extract LM logits at outcome token positions for the augmented outcome_head input.
+        self.register_buffer(
+            "_outcome_head_ids",
+            torch.tensor([tok.token2id[n] for n in valid_outcomes], dtype=torch.long),
             persistent=True,
         )
 
@@ -487,9 +499,10 @@ class GPT(nn.Module):
         logits = self.lm_head(x)             # [B, T, V]
 
         # 4. Outcome Prediction Head (Auxiliary Task)
-        # Input: Contextual embedding at step t (representing history 0..t)
+        # Input: Contextual embedding + LM logits at outcome token positions (detached)
         # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
-        outcome_logits = self.outcome_head(x)
+        lm_outcome_feat = logits[:, :, self._outcome_head_ids].detach()  # [B, T, K]
+        outcome_logits = self.outcome_head(torch.cat([x, lm_outcome_feat], dim=-1))
 
         # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
@@ -565,7 +578,8 @@ class GPT(nn.Module):
 
         # 3. Heads
         logits         = self.lm_head(x)
-        outcome_logits = self.outcome_head(x)
+        lm_outcome_feat = logits[:, :, self._outcome_head_ids].detach()  # [B, T, K]
+        outcome_logits = self.outcome_head(torch.cat([x, lm_outcome_feat], dim=-1))
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
