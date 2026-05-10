@@ -39,7 +39,7 @@ TRAINING_SETTINGS = {
     "batch_size": 16, # Number of patients processed concurrently (effective batch=64 via grad accumulation)
     "grad_accumulation_steps": 4, # Accumulate gradients over N steps before optimizer.step()
     "phase1_bce_window_hours": 3.0,
-    "phase2_bce_window_hours": 12.0,
+    "phase2_bce_window_hours": 24.0,
 
     # Phase-1 auxiliary scheduler.
     # Single stage: mlm and dt activate after bce_only_epochs of pure BCE training.

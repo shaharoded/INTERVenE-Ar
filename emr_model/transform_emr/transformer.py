@@ -340,18 +340,12 @@ class GPT(nn.Module):
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
 
-        # 3-layer MLP outcome classifier: D→2D→D→K. Wider hidden layer provides more
-        # capacity to extract outcome-relevant patterns from backbone representations.
-        _D  = cfg["embed_dim"]
-        _2D = cfg["embed_dim"] * 2
+        # 2-layer MLP outcome classifier (exp24 confirmed deeper head doesn't help).
         self.outcome_head = nn.Sequential(
-            nn.Linear(_D,  _2D),
+            nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
             nn.Dropout(cfg["dropout"]),
-            nn.Linear(_2D, _D),
-            nn.ReLU(),
-            nn.Dropout(cfg["dropout"]),
-            nn.Linear(_D,  self.num_outcomes)
+            nn.Linear(cfg["embed_dim"], self.num_outcomes)
         )
 
         # Vocab positions for ALL OUTCOMES+TERMINAL_OUTCOMES that exist in vocab.
