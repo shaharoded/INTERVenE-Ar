@@ -637,6 +637,7 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     probe_dt_head(model, val_dl, n_batches=2)
     probe_outcome_label_alignment(model, val_dl, tokenizer, n_batches=2)
     probe_outcome_logit_distribution(model, val_dl, n_batches=2)
+    probe_outcome_lm_coupling(model, val_dl, n_batches=2)
 
     print("\n[Diag] Done.")
 
@@ -1150,6 +1151,130 @@ def probe_legality_starvation(model, val_dl, tokenizer, n_batches: int = 1) -> d
             "frac_blocked":       float(frac) if frac == frac else float("nan"),
         }
     return out
+
+
+def probe_outcome_lm_coupling(model, val_dl, n_batches: int = 1) -> dict:
+    """
+    Purpose: Verify that outcome_to_lm has activated and that it produces
+        meaningful additive corrections to LM logits at outcome vocab positions.
+    Method: Forward a val slice. For each outcome k: compute Pearson r between
+        the outcome head logit and the lm_bias produced by outcome_to_lm.
+        Also report mean absolute LM logit at outcome positions before (raw lm_head)
+        and after (+ lm_bias) coupling, and the weight norm of outcome_to_lm.
+
+    Args:
+        model: GPT in eval mode (must have outcome_to_lm and _outcome_lm_ids).
+        val_dl (DataLoader): Validation dataloader.
+        n_batches (int): Batches to consume.
+
+    Returns:
+        dict: weight_norm, per-outcome pearson_r, mean_bias, mean_lm_logit.
+    """
+    if not hasattr(model, "outcome_to_lm") or not hasattr(model, "_outcome_lm_ids"):
+        print("\n[probe_outcome_lm_coupling] outcome_to_lm not present in model — skipping.")
+        return {}
+
+    device = next(model.parameters()).device
+    pad_idx = model.embedder.padding_idx
+    model.eval()
+
+    w_norm = model.outcome_to_lm.weight.detach().cpu().norm().item()
+
+    oh_list, bias_list, lm_pre_list, lm_post_list, tgt_list = [], [], [], [], []
+    with torch.no_grad():
+        for i, batch in enumerate(val_dl):
+            if i >= n_batches:
+                break
+            batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+            # Compute pre-coupling logits by temporarily zeroing outcome_to_lm
+            x_out = []
+            hooks = []
+            for blk in model.blocks:
+                pass  # no hooks needed — just run two separate forwards
+
+            # Pre-coupling: zero out outcome_to_lm weight to get raw lm_head output
+            orig_w = model.outcome_to_lm.weight.data.clone()
+            orig_b = model.outcome_to_lm.bias.data.clone()
+            model.outcome_to_lm.weight.data.zero_()
+            model.outcome_to_lm.bias.data.zero_()
+            logits_pre, _, outcome_logits, _ = model(
+                parent_raw_ids=batch["parent_raw_ids"],
+                concept_ids=batch["concept_ids"],
+                value_ids=batch["value_ids"],
+                position_ids=batch["position_ids"],
+                abs_ts=batch["abs_ts"],
+                context_vec=batch["context_vec"],
+            )
+            model.outcome_to_lm.weight.data.copy_(orig_w)
+            model.outcome_to_lm.bias.data.copy_(orig_b)
+
+            # Post-coupling: full forward
+            logits_post, _, _, _ = model(
+                parent_raw_ids=batch["parent_raw_ids"],
+                concept_ids=batch["concept_ids"],
+                value_ids=batch["value_ids"],
+                position_ids=batch["position_ids"],
+                abs_ts=batch["abs_ts"],
+                context_vec=batch["context_vec"],
+            )
+            bias = logits_post - logits_pre  # [B, T, V] — non-zero only at outcome positions
+
+            oh_list.append(outcome_logits.float().cpu())
+            bias_list.append(bias.float().cpu())
+            lm_pre_list.append(logits_pre.float().cpu())
+            lm_post_list.append(logits_post.float().cpu())
+            tgt_list.append(batch["targets"].cpu())
+
+    T_max = max(t.size(1) for t in tgt_list)
+
+    def _pad(t, fill):
+        if t.size(1) == T_max:
+            return t
+        pad = torch.full([t.size(0), T_max - t.size(1)] + list(t.shape[2:]), fill, dtype=t.dtype)
+        return torch.cat([t, pad], dim=1)
+
+    oh      = torch.cat([_pad(x, 0.0) for x in oh_list],       dim=0)
+    bias    = torch.cat([_pad(x, 0.0) for x in bias_list],     dim=0)
+    lm_pre  = torch.cat([_pad(x, 0.0) for x in lm_pre_list],  dim=0)
+    lm_post = torch.cat([_pad(x, 0.0) for x in lm_post_list], dim=0)
+    tgt     = torch.cat([_pad(x, pad_idx) for x in tgt_list],  dim=0)
+    nonpad  = (tgt != pad_idx)
+
+    oids = model._outcome_lm_ids.cpu()
+
+    print("\n" + "=" * 90)
+    print("PROBE - OUTCOME→LM COUPLING")
+    print("=" * 90)
+    print(f"  outcome_to_lm weight norm : {w_norm:.6f}")
+    if w_norm < 1e-6:
+        print("  ⚠ Weight norm near zero — coupling has not activated (expected if Phase-3 not run yet).")
+
+    rows = []
+    for k, name in enumerate(model.outcome_names):
+        oid = oids[k].item()
+        head_logit = oh[..., k][nonpad].numpy()
+        lm_bias_k  = bias[..., oid][nonpad].numpy()
+        lm_pre_k   = lm_pre[..., oid][nonpad].numpy()
+        lm_post_k  = lm_post[..., oid][nonpad].numpy()
+        if len(head_logit) < 10:
+            continue
+        # Pearson r between outcome head logit and lm_bias at that outcome's vocab position
+        hm, bm = head_logit.mean(), lm_bias_k.mean()
+        cov = float(((head_logit - hm) * (lm_bias_k - bm)).mean())
+        r = cov / (head_logit.std() * lm_bias_k.std() + 1e-12)
+        rows.append({
+            "outcome": name,
+            "head→bias_r": round(float(r), 4),
+            "mean_bias":   round(float(lm_bias_k.mean()), 4),
+            "bias_std":    round(float(lm_bias_k.std()), 4),
+            "lm_pre":      round(float(lm_pre_k.mean()), 4),
+            "lm_post":     round(float(lm_post_k.mean()), 4),
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        print(df.to_string(index=False))
+    return {"weight_norm": w_norm, "details": rows}
 
 
 def probe_outcome_logit_distribution(model, val_dl, n_batches: int = 1) -> pd.DataFrame:
