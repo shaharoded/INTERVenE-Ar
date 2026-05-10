@@ -32,7 +32,8 @@ TRAINING_SETTINGS = {
 
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 3e-4,
-    "phase3_learning_rate":  1e-4,
+    "phase3_learning_rate":       1e-4,
+    "phase3_backbone_lr_factor":  0.01,  # backbone LR = phase3_lr * factor (1e-6); 0.0 = fully frozen
     "weight_decay": 1e-3,
 
     "batch_size": 16, # Number of patients processed concurrently (effective batch=64 via grad accumulation)
@@ -71,17 +72,15 @@ TRAINING_SETTINGS = {
         # You can decouple these by setting a separate `warmup_epochs` for LR in the scheduler and keeping this as the BCE-only period for curriculum and lambda warmup.
         "bce_only_epochs": 2,
         "aux_fraction_caps": {
-            "ce":         0.50,   # Next-token CE nudge cap
-            "dt":         0.50,   # Time regression cap
-            "outcome":    9.00,   # Future-outcome auxiliary cap (peak confirmed at 9.0)
-            "lm_outcome": 3.00,   # LM-head outcome auxiliary (conservative; forces backbone to encode risk)
+            "ce":      0.50,    # Next-token CE nudge cap
+            "dt":      0.50,    # Time regression cap
+            "outcome": 9.00,    # Future-outcome auxiliary cap (peak confirmed at 9.0)
         },
-        "order": [["ce", "dt"], ["outcome", "lm_outcome"]],
+        "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
-            "ce":         0,  # No ramp (immediate full lambda after calibration)
-            "dt":         0,  # No ramp
-            "outcome":    3,  # Gradual ramp over 3 epochs after unlocking
-            "lm_outcome": 3,  # Same ramp as outcome
+            "ce":      0,  # No ramp (immediate full lambda after calibration)
+            "dt":      0,  # No ramp
+            "outcome": 3,  # Gradual ramp over 3 epochs after unlocking
         },
         # Plateau detection settings (applied per stage transition, in order)
         "plateau_min_delta": 1e-3,

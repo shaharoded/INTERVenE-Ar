@@ -340,7 +340,7 @@ class GPT(nn.Module):
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
 
-        # A simple MLP classifier for outcome prediction.
+        # A simple MLP classifier
         self.outcome_head = nn.Sequential(
             nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
@@ -355,16 +355,6 @@ class GPT(nn.Module):
         self.register_buffer(
             "_outcome_ids",
             torch.tensor([tok.token2id[n] for n in in_vocab], dtype=torch.long),
-            persistent=True,
-        )
-
-        # Vocab positions for the valid outcomes predicted by outcome_head (same order as outcome_names).
-        # Used to extract LM logits at outcome positions for the Phase-2 lm_outcome auxiliary loss.
-        # The lm_outcome loss directly supervises the LM head on outcome discrimination,
-        # forcing the backbone to encode outcome risk more explicitly.
-        self.register_buffer(
-            "_outcome_head_ids",
-            torch.tensor([tok.token2id[n] for n in valid_outcomes], dtype=torch.long),
             persistent=True,
         )
 
@@ -811,7 +801,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             model.eval()
 
         total_loss = total_bce = total_ce = total_outcome = total_dt = 0.0
-        total_ce_raw = total_outcome_raw = total_dt_raw = total_lm_outcome_raw = 0.0
+        total_ce_raw = total_outcome_raw = total_dt_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -971,26 +961,15 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
                 loss_outcome = lambdas["outcome"] * loss_outcome_raw
 
-                # === Loss: LM-outcome auxiliary — directly supervise LM head at outcome positions ===
-                # Forces the backbone to encode outcome risk explicitly. Uses the same soft labels
-                # as the outcome_head but applied to lm_head logits at outcome vocab positions.
-                # This amplifies the LM head's implicit outcome discrimination (teacher-forced
-                # AUROC: CARDIO 0.846) into an explicit signal, improving backbone representations
-                # even before Phase-3 outcome-head fine-tuning.
-                lm_outcome_logits_raw = logits[:, :-1, model._outcome_head_ids].float()  # [B, T-1, K]
-                loss_lm_outcome_raw = OutcomeCriterion(lm_outcome_logits_raw, outcome_targets)  # [B, T-1, K]
-                loss_lm_outcome_raw = (loss_lm_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
-                loss_lm_outcome = lambdas["lm_outcome"] * loss_lm_outcome_raw
-
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_lm_outcome
+                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "lm_out": loss_lm_outcome, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1019,10 +998,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce      += loss_ce.item()
                 total_outcome += loss_outcome.item()
                 total_dt      += abs_t_loss.item()
-                total_ce_raw          += loss_ce_raw.item()
-                total_outcome_raw     += loss_outcome_raw.item()
-                total_dt_raw          += abs_t_loss_raw.item()
-                total_lm_outcome_raw  += loss_lm_outcome_raw.item()
+                total_ce_raw      += loss_ce_raw.item()
+                total_outcome_raw += loss_outcome_raw.item()
+                total_dt_raw      += abs_t_loss_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1039,15 +1017,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_outcome / n_batches,
             total_dt      / n_batches,
-            total_ce_raw          / n_batches,
-            total_outcome_raw     / n_batches,
-            total_dt_raw          / n_batches,
-            total_lm_outcome_raw  / n_batches,
+            total_ce_raw      / n_batches,
+            total_outcome_raw / n_batches,
+            total_dt_raw      / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_ce_raw, tr_outcome_raw, tr_dt_raw, tr_lm_outcome_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, _, _, _, _                                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_ce_raw, tr_outcome_raw, tr_dt_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
@@ -1063,7 +1040,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             outcome=tr_outcome_raw,
-            lm_outcome=tr_lm_outcome_raw,
         )
         for msg in schedule_events:
             print(msg)
@@ -1105,15 +1081,18 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     """
     Phase 3 — Outcome Head Fine-tuning.
 
-    Freezes the backbone (embedder + transformer blocks + time head) and fine-tunes
-    only the outcome_head on teacher-forced training data. Analogous to fine-tuning a
-    classification head in BERT-style models: the representation network is kept fixed
-    while only the task-specific head is updated.
+    Fine-tunes the outcome_head with differential learning rates:
+      - outcome_head:  phase3_learning_rate      (e.g. 1e-4)
+      - backbone:      phase3_learning_rate * phase3_backbone_lr_factor  (e.g. 1e-6)
+
+    The backbone is kept in eval mode (deterministic features, no dropout) but receives
+    tiny gradient updates guided by outcome loss. This allows micro-adaptation of the
+    backbone without catastrophic forgetting (unlike exp7 which unfroze at full LR).
+    Setting phase3_backbone_lr_factor=0.0 (default) is equivalent to full freeze.
 
     The outcome loss uses the same time-decayed soft labels as Phase 2 (same
     get_future_outcome_targets formula), so the head learns from exactly the same target
-    distribution — but now with perfect gradient isolation: backbone features are frozen
-    and gradients flow only through outcome_head.
+    distribution as Phase 2's outcome auxiliary.
 
     Because the backbone is frozen, this phase converges quickly. Early stopping is
     applied against validation outcome loss. Checkpoints are saved in the same full-model
@@ -1143,17 +1122,22 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     pos_weights       = tok.outcome_weights[outcome_token_ids].to(device)
     OutcomeCriterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction="none")
 
+    backbone_lr_factor = training_settings.get("phase3_backbone_lr_factor", 0.0)
+    p3_lr = training_settings["phase3_learning_rate"]
+
     def _freeze_backbone_only(m):
-        """Freeze all params except outcome_head."""
+        """Enable gradients for all params; optimizer LR controls effective freeze."""
         for param in m.parameters():
-            param.requires_grad_(False)
-        for param in m.outcome_head.parameters():
             param.requires_grad_(True)
 
     def _make_p3_optimizer(m):
+        backbone_params = [p for n, p in m.named_parameters() if "outcome_head" not in n]
+        head_params     = list(m.outcome_head.parameters())
         return torch.optim.AdamW(
-            list(m.outcome_head.parameters()),
-            lr=training_settings["phase3_learning_rate"],
+            [
+                {"params": backbone_params, "lr": p3_lr * backbone_lr_factor},
+                {"params": head_params,     "lr": p3_lr},
+            ],
             weight_decay=training_settings["weight_decay"],
         )
 
@@ -1179,7 +1163,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         print(f"[Phase-3]: Resumed at epoch {start_epoch} (best val: {best_val:.4f})")
     else:
         model.to(device)
-        print("[Phase-3]: Fine-tuning outcome head...")
+        print(f"[Phase-3]: Fine-tuning outcome head (backbone_lr_factor={backbone_lr_factor})...")
 
     train_losses, val_losses = [], []
 
@@ -1232,7 +1216,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 if train_flag:
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(model.outcome_head.parameters(), 1.0)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
 
                 total_loss += loss.item()
