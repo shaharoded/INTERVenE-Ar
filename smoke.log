@@ -1,0 +1,111 @@
+Device: cuda
+[Data]: Loading source temporal events and context data...
+[Data]: Processing train split (fitting scaler)...
+[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 7605 -> 6460
+[DataProcessor] Applied temporal filter: WHERE ConceptName NOT LIKE '%_PATTERN%' | rows 6460 -> 5960
+[Data]: Processing val split (applying fitted scaler)...
+[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 1726 -> 1483
+[DataProcessor] Applied temporal filter: WHERE ConceptName NOT LIKE '%_PATTERN%' | rows 1483 -> 1356
+[Data]: Loading tokenizer from cache...
+[Warning][EMRDataset] Unknown Concept values found (count=2) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+[Warning][EMRDataset] Unknown ValueToken values found (count=4) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+  - HEMATOCRIT_MEASURE_STATE_Hemoconcentration
+  - HEMOGLOBIN_MEASURE_STATE_Polycythemia
+[Warning][EMRDataset] Unknown PositionToken values found (count=6) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+  - HEMATOCRIT_MEASURE_STATE_Hemoconcentration_START
+  - HEMOGLOBIN_MEASURE_STATE_Polycythemia_START
+  - HEMATOCRIT_MEASURE_STATE_Hemoconcentration_END
+  - HEMOGLOBIN_MEASURE_STATE_Polycythemia_END
+[Data]: 40 train / 10 val patients  (10,920 train records, 2,374 val records)
+Model config: {'time2vec_dim': 32, 'embed_dim': 256, 'n_head': 4, 'n_layer': 4, 'dropout': 0.1, 'bias': True, 'hazard_bins': 12, 'ctx_dim': 10}
+[Phase 1]: Config unchanged — loading cached embedder, skipping training.
+[GPT] Outcomes not in tokenizer vocab (ignored): ['ATHEROSCLEROSIS_EVENT', 'DIABETIC_COMA_EVENT', 'OTHER_COMPLICATION_EVENT']
+[GPT]: Total params: 6.43 M
+[Logger] Logging to: /workspace/autoresearch/emr_model/checkpoints/logs/training.log
+
+======================================================================
+  pretrain_transformer  |  2026-05-10 22:35:37
+  model config      : {'time2vec_dim': 32, 'embed_dim': 256, 'n_head': 4, 'n_layer': 4, 'dropout': 0.1, 'bias': True, 'hazard_bins': 12, 'ctx_dim': 10}
+  training settings : {'phase1_n_epochs': 1, 'phase2_n_epochs': 1, 'phase3_n_epochs': 1, 'sample': 50, 'lr_warmup_epochs': 5, 'early-stop-patience': 5, 'early-stop-min-delta-rel': 0.001, 'phase1_learning_rate': 0.0003, 'phase2_learning_rate': 0.0003, 'phase3_learning_rate': 0.0001, 'phase3_backbone_lr_factor': 0.01, 'phase3_weight_decay': 0.001, 'weight_decay': 0.001, 'batch_size': 16, 'grad_accumulation_steps': 4, 'phase1_bce_window_hours': 3.0, 'phase2_bce_window_hours': 12.0, 'phase1_scheduler': {'bce_only_epochs': 3, 'aux_fraction_caps': {'mlm': 1.5, 'dt': 0.4}, 'order': [['mlm', 'dt']], 'ramp_epochs': {'mlm': 0, 'dt': 0}}, 'phase2_scheduler': {'bce_only_epochs': 4, 'aux_fraction_caps': {'ce': 0.5, 'dt': 0.5, 'outcome': 10.0, 'hazard': 5.0}, 'order': [['ce', 'dt'], ['outcome', 'hazard']], 'ramp_epochs': {'ce': 0, 'dt': 0, 'outcome': 3, 'hazard': 3}, 'plateau_min_delta': 0.001, 'plateau_patience': [2]}, 'outcome_decay_tau_hours': 12.0, 'outcome_horizon_hours': 48.0}
+======================================================================
+[Phase-2]: Starting transformer training loop...
+Training:   0%|          | 0/3 [00:00<?, ?it/s]/usr/local/lib/python3.11/dist-packages/torch/utils/checkpoint.py:295: FutureWarning: `torch.cpu.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cpu', args...)` instead.
+  with torch.enable_grad(), device_autocast_ctx, torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
+                                               Validation:   0%|          | 0/10 [00:00<?, ?it/s]                                                  [Phase-2]: Epoch 00
+        --> Train=0.0307 (BCE=0.0307, CE=0.0000, Out=0.0000, Δt=0.0000, Haz=0.0000)
+        --> Val=0.0330 (BCE=0.0330, CE=0.0000, Out=0.0000, Δt=0.0000, Haz=0.0000)
+[Scheduler] epoch=0 | ce:λ=0.0000(pending) | dt:λ=0.0000(pending) | hazard:λ=0.0000(pending) | outcome:λ=0.0000(pending)
+[GPT] Outcomes not in tokenizer vocab (ignored): ['ATHEROSCLEROSIS_EVENT', 'DIABETIC_COMA_EVENT', 'OTHER_COMPLICATION_EVENT']
+[GPT]: Total params: 6.43 M
+
+======================================================================
+  finetune_transformer  |  2026-05-10 22:35:39
+  model config      : {'time2vec_dim': 32, 'embed_dim': 256, 'n_head': 4, 'n_layer': 4, 'dropout': 0.1, 'bias': True, 'hazard_bins': 12, 'ctx_dim': 10}
+  training settings : {'phase1_n_epochs': 1, 'phase2_n_epochs': 1, 'phase3_n_epochs': 1, 'sample': 50, 'lr_warmup_epochs': 5, 'early-stop-patience': 5, 'early-stop-min-delta-rel': 0.001, 'phase1_learning_rate': 0.0003, 'phase2_learning_rate': 0.0003, 'phase3_learning_rate': 0.0001, 'phase3_backbone_lr_factor': 0.01, 'phase3_weight_decay': 0.001, 'weight_decay': 0.001, 'batch_size': 16, 'grad_accumulation_steps': 4, 'phase1_bce_window_hours': 3.0, 'phase2_bce_window_hours': 12.0, 'phase1_scheduler': {'bce_only_epochs': 3, 'aux_fraction_caps': {'mlm': 1.5, 'dt': 0.4}, 'order': [['mlm', 'dt']], 'ramp_epochs': {'mlm': 0, 'dt': 0}}, 'phase2_scheduler': {'bce_only_epochs': 4, 'aux_fraction_caps': {'ce': 0.5, 'dt': 0.5, 'outcome': 10.0, 'hazard': 5.0}, 'order': [['ce', 'dt'], ['outcome', 'hazard']], 'ramp_epochs': {'ce': 0, 'dt': 0, 'outcome': 3, 'hazard': 3}, 'plateau_min_delta': 0.001, 'plateau_patience': [2]}, 'outcome_decay_tau_hours': 12.0, 'outcome_horizon_hours': 48.0}
+======================================================================
+[Phase-3]: Fine-tuning outcome head (backbone_lr_factor=0.01)...
+[Phase-3] Train:   0%|          | 0/20 [00:00<?, ?it/s]                                                       [Phase-3] Val:   0%|          | 0/10 [00:00<?, ?it/s]                                                     [Phase-3]: Epoch 01  train=10.4507  val=9.4737
+[Phase-3]: Current best model saved.
+[GPT] Outcomes not in tokenizer vocab (ignored): ['ATHEROSCLEROSIS_EVENT', 'DIABETIC_COMA_EVENT', 'OTHER_COMPLICATION_EVENT']
+[GPT]: Total params: 6.43 M
+[Eval] Processing full val sequences (ground truth)...
+[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 1726 -> 1483
+[DataProcessor] Applied temporal filter: WHERE ConceptName NOT LIKE '%_PATTERN%' | rows 1483 -> 1356
+[Warning][EMRDataset] Unknown Concept values found (count=2) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+[Warning][EMRDataset] Unknown ValueToken values found (count=4) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+  - HEMATOCRIT_MEASURE_STATE_Hemoconcentration
+  - HEMOGLOBIN_MEASURE_STATE_Polycythemia
+[Warning][EMRDataset] Unknown PositionToken values found (count=6) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+  - HEMATOCRIT_MEASURE_STATE_Hemoconcentration_START
+  - HEMOGLOBIN_MEASURE_STATE_Polycythemia_START
+  - HEMATOCRIT_MEASURE_STATE_Hemoconcentration_END
+  - HEMOGLOBIN_MEASURE_STATE_Polycythemia_END
+[Eval] Processing truncated val sequences (2-day input)...
+[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 1726 -> 1483
+[DataProcessor] Applied temporal filter: WHERE ConceptName NOT LIKE '%_PATTERN%' | rows 1483 -> 1356
+[Warning][EMRDataset] Unknown Concept values found (count=2) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+[Warning][EMRDataset] Unknown ValueToken values found (count=4) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+  - HEMATOCRIT_MEASURE_STATE_Hemoconcentration
+  - HEMOGLOBIN_MEASURE_STATE_Polycythemia
+[Warning][EMRDataset] Unknown PositionToken values found (count=4) — mapping to [MASK]:
+  - ANTIDIABETIC_BITZUA_EVENT
+  - ATHEROSCLEROSIS_EVENT
+  - HEMATOCRIT_MEASURE_STATE_Hemoconcentration_START
+  - HEMOGLOBIN_MEASURE_STATE_Polycythemia_START
+[Eval] Generating risk curves...
+Generating:   0%|          | 0/1 [00:00<?, ?it/s]Generating: 100%|██████████| 1/1 [00:00<00:00,  5.20it/s]                                                         [generate] INFO  10/10 (100.0%) patient(s) reached max_len=500 without a natural terminal — forced terminal injected.
+[Eval] Generated 795 rows for 10 patients.
+[Eval] Computing episode-level AUC and time accuracy...
+[Eval] Per-outcome AUROC:
+  RELEASE_EVENT                                 AUROC=0.664  AUPRC=0.265
+  DISGLYCEMIA_EVENT_Hyperglycemia               AUROC=0.642  AUPRC=0.160
+---
+outcome_auroc:    0.652988
+outcome_auprc:    0.212605
+onset_mae_hrs:    160.21
+phase2_best_val:  0.033049
+phase2_epochs:    1
+phase3_best_val:  9.473661
+phase3_epochs:    1
+total_seconds:    9.6
+peak_vram_mb:     522.5
+embed_dim:        256
+n_layer:          4
+n_head:           4
+num_params:       6,427,731

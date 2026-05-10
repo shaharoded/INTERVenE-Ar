@@ -1135,6 +1135,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             outcome=tr_outcome_raw,
+            hazard=tr_hazard_raw,
         )
         for msg in schedule_events:
             print(msg)
