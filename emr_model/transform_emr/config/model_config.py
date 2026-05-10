@@ -71,15 +71,17 @@ TRAINING_SETTINGS = {
         # You can decouple these by setting a separate `warmup_epochs` for LR in the scheduler and keeping this as the BCE-only period for curriculum and lambda warmup.
         "bce_only_epochs": 2,
         "aux_fraction_caps": {
-            "ce":      0.50,    # Next-token CE nudge cap
-            "dt":      0.50,    # Time regression cap
-            "outcome": 9.00,    # Future-outcome auxiliary cap (peak confirmed at 9.0)
+            "ce":         0.50,   # Next-token CE nudge cap
+            "dt":         0.50,   # Time regression cap
+            "outcome":    9.00,   # Future-outcome auxiliary cap (peak confirmed at 9.0)
+            "lm_outcome": 3.00,   # LM-head outcome auxiliary (conservative; forces backbone to encode risk)
         },
-        "order": [["ce", "dt"], ["outcome"]],
+        "order": [["ce", "dt"], ["outcome", "lm_outcome"]],
         "ramp_epochs": {
-            "ce":      0,  # No ramp (immediate full lambda after calibration)
-            "dt":      0,  # No ramp
-            "outcome": 3,  # Gradual ramp over 3 epochs after unlocking
+            "ce":         0,  # No ramp (immediate full lambda after calibration)
+            "dt":         0,  # No ramp
+            "outcome":    3,  # Gradual ramp over 3 epochs after unlocking
+            "lm_outcome": 3,  # Same ramp as outcome
         },
         # Plateau detection settings (applied per stage transition, in order)
         "plateau_min_delta": 1e-3,

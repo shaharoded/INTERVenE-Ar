@@ -340,13 +340,9 @@ class GPT(nn.Module):
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
 
-        # Outcome head: takes [hidden_state || lm_logits_at_outcome_positions] as input.
-        # LM head already discriminates outcomes well (teacher-forced AUROC: CARDIO 0.846 vs
-        # outcome_head 0.564 in diagnostics). Adding LM logits as side-channel features lets
-        # the outcome head leverage the LM's learned outcome representations.
-        # Input dim: embed_dim + num_outcomes (D + K), where K ≈ 6 outcomes.
+        # A simple MLP classifier for outcome prediction.
         self.outcome_head = nn.Sequential(
-            nn.Linear(cfg["embed_dim"] + self.num_outcomes, cfg["embed_dim"]),
+            nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
             nn.Dropout(cfg["dropout"]),
             nn.Linear(cfg["embed_dim"], self.num_outcomes)
@@ -363,7 +359,9 @@ class GPT(nn.Module):
         )
 
         # Vocab positions for the valid outcomes predicted by outcome_head (same order as outcome_names).
-        # Used to extract LM logits at outcome token positions for the augmented outcome_head input.
+        # Used to extract LM logits at outcome positions for the Phase-2 lm_outcome auxiliary loss.
+        # The lm_outcome loss directly supervises the LM head on outcome discrimination,
+        # forcing the backbone to encode outcome risk more explicitly.
         self.register_buffer(
             "_outcome_head_ids",
             torch.tensor([tok.token2id[n] for n in valid_outcomes], dtype=torch.long),
@@ -499,10 +497,9 @@ class GPT(nn.Module):
         logits = self.lm_head(x)             # [B, T, V]
 
         # 4. Outcome Prediction Head (Auxiliary Task)
-        # Input: Contextual embedding + LM logits at outcome token positions (detached)
+        # Input: Contextual embedding at step t (representing history 0..t)
         # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
-        lm_outcome_feat = logits[:, :, self._outcome_head_ids].detach()  # [B, T, K]
-        outcome_logits = self.outcome_head(torch.cat([x, lm_outcome_feat], dim=-1))
+        outcome_logits = self.outcome_head(x)
 
         # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
@@ -578,8 +575,7 @@ class GPT(nn.Module):
 
         # 3. Heads
         logits         = self.lm_head(x)
-        lm_outcome_feat = logits[:, :, self._outcome_head_ids].detach()  # [B, T, K]
-        outcome_logits = self.outcome_head(torch.cat([x, lm_outcome_feat], dim=-1))
+        outcome_logits = self.outcome_head(x)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
@@ -815,7 +811,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             model.eval()
 
         total_loss = total_bce = total_ce = total_outcome = total_dt = 0.0
-        total_ce_raw = total_outcome_raw = total_dt_raw = 0.0
+        total_ce_raw = total_outcome_raw = total_dt_raw = total_lm_outcome_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -975,15 +971,26 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
                 loss_outcome = lambdas["outcome"] * loss_outcome_raw
 
+                # === Loss: LM-outcome auxiliary — directly supervise LM head at outcome positions ===
+                # Forces the backbone to encode outcome risk explicitly. Uses the same soft labels
+                # as the outcome_head but applied to lm_head logits at outcome vocab positions.
+                # This amplifies the LM head's implicit outcome discrimination (teacher-forced
+                # AUROC: CARDIO 0.846) into an explicit signal, improving backbone representations
+                # even before Phase-3 outcome-head fine-tuning.
+                lm_outcome_logits_raw = logits[:, :-1, model._outcome_head_ids].float()  # [B, T-1, K]
+                loss_lm_outcome_raw = OutcomeCriterion(lm_outcome_logits_raw, outcome_targets)  # [B, T-1, K]
+                loss_lm_outcome_raw = (loss_lm_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+                loss_lm_outcome = lambdas["lm_outcome"] * loss_lm_outcome_raw
+
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss
+                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_lm_outcome
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "lm_out": loss_lm_outcome, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1012,9 +1019,10 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce      += loss_ce.item()
                 total_outcome += loss_outcome.item()
                 total_dt      += abs_t_loss.item()
-                total_ce_raw      += loss_ce_raw.item()
-                total_outcome_raw += loss_outcome_raw.item()
-                total_dt_raw      += abs_t_loss_raw.item()
+                total_ce_raw          += loss_ce_raw.item()
+                total_outcome_raw     += loss_outcome_raw.item()
+                total_dt_raw          += abs_t_loss_raw.item()
+                total_lm_outcome_raw  += loss_lm_outcome_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1031,14 +1039,15 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_outcome / n_batches,
             total_dt      / n_batches,
-            total_ce_raw      / n_batches,
-            total_outcome_raw / n_batches,
-            total_dt_raw      / n_batches,
+            total_ce_raw          / n_batches,
+            total_outcome_raw     / n_batches,
+            total_dt_raw          / n_batches,
+            total_lm_outcome_raw  / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_ce_raw, tr_outcome_raw, tr_dt_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_ce_raw, tr_outcome_raw, tr_dt_raw, tr_lm_outcome_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, _, _, _, _                                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
@@ -1054,6 +1063,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             outcome=tr_outcome_raw,
+            lm_outcome=tr_lm_outcome_raw,
         )
         for msg in schedule_events:
             print(msg)
