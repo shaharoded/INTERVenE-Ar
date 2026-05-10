@@ -74,7 +74,7 @@ TRAINING_SETTINGS = {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "outcome": 10.00,   # Confirmed optimal at bce_only=4
-            "hazard":  5.00,    # Discrete-time survival head; half of outcome cap
+            "hazard":  7.50,    # Discrete-time survival head; 75% of outcome cap (exp43: cap 5.0→7.5)
         },
         "order": [["ce", "dt"], ["outcome", "hazard"]],
         "ramp_epochs": {
