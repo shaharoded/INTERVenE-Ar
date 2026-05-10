@@ -511,7 +511,8 @@ class GPT(nn.Module):
         # 4b. Outcome→LM coupling: scatter K additive corrections into LM logits at outcome positions.
         # .detach() ensures LM loss does not backprop through outcome_head; outcome_to_lm is the
         # only module trained by CE loss in Phase-3. Zero-init means no effect during Phase-2.
-        lm_bias = self.outcome_to_lm(outcome_logits.detach())           # [B, T, K]
+        # Clamp prevents BF16-overflowed outcome_logits from injecting extreme lm_bias values.
+        lm_bias = self.outcome_to_lm(outcome_logits.detach().clamp(-20.0, 20.0))  # [B, T, K]
         logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)    # [B, T, V]
 
         # 5. Absolute time prediction (two-head: gate + magnitude)
@@ -590,7 +591,7 @@ class GPT(nn.Module):
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
 
-        lm_bias = self.outcome_to_lm(outcome_logits.detach())
+        lm_bias = self.outcome_to_lm(outcome_logits.detach().clamp(-20.0, 20.0))
         logits  = logits.index_add(2, self._outcome_lm_ids, lm_bias)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
@@ -1020,18 +1021,21 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     # Backward in FP32 — no outer autocast needed with use_reentrant=True.
                     # Inner autocast inside _ckpt ensures BF16 recomputation matches forward.
                     (loss / grad_accum_steps).backward()
+
+                    # Immediate per-batch NaN check: prevents NaN from one batch contaminating
+                    # subsequent accumulation steps (NaN + finite = NaN accumulates silently).
+                    _batch_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float('inf'))
+                    if not torch.isfinite(_batch_norm):
+                        optimizer.zero_grad()
+                        accum_step = 0
+                        continue
+
                     accum_step += 1
                     if accum_step % grad_accum_steps == 0:
-                        # Catch any NaN in gradients before they corrupt weights.
                         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        if not torch.isfinite(grad_norm):
-                            print(f"[WARNING] NaN/inf grad norm at epoch {epoch}, skipping optimizer step.")
-                            optimizer.zero_grad()
-                            accum_step = 0
-                        else:
-                            optimizer.step()
-                            scheduler.update()
-                            optimizer.zero_grad()
+                        optimizer.step()
+                        scheduler.update()
+                        optimizer.zero_grad()
                 # Update loss
                 total_loss    += loss.item()
                 total_bce     += loss_bce.item()
