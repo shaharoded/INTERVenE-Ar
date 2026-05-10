@@ -23,6 +23,9 @@ dev/
 results.tsv
 run.log
 progress.png
+diag.log
+smoke.log
+.claude/
 
 # Model checkpoints (large, rebuilt each experiment)
 emr_model/checkpoints/
