@@ -1145,6 +1145,12 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     _freeze_backbone_only(model)
     optimizer = _make_p3_optimizer(model)
 
+    # Adaptive LR reduction when val loss plateaus — allows continued refinement
+    # after initial convergence without hardcoding a decay schedule.
+    p3_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-7
+    )
+
     start_epoch = 1
     best_val    = float("inf")
     bad_epochs  = 0
@@ -1234,7 +1240,13 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}")
+        prev_lr = optimizer.param_groups[-1]["lr"]
+        p3_scheduler.step(vl_loss)
+        cur_lr  = optimizer.param_groups[-1]["lr"]
+        lr_reduced = cur_lr < prev_lr - 1e-10
+
+        print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}"
+              + (f"  lr→{cur_lr:.2e}" if lr_reduced else ""))
 
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)
@@ -1248,7 +1260,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             print("[Phase-3]: Current best model saved.")
         else:
             bad_epochs += 1
-            if bad_epochs >= patience:
+            if lr_reduced:
+                # Give the model another chance at the reduced LR
+                bad_epochs = 0
+                print(f"[Phase-3]: LR reduced to {cur_lr:.2e}; resetting early-stop counter.")
+            elif bad_epochs >= patience:
                 print("[Phase-3]: Early stopping triggered.")
                 break
 
