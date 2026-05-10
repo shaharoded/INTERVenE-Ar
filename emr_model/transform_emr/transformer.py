@@ -357,6 +357,19 @@ class GPT(nn.Module):
             persistent=True,
         )
 
+        # LM vocab IDs for outcome_names only (subset of _outcome_ids, rarity-filtered).
+        # Used by outcome_to_lm to scatter K additive corrections into the LM logit tensor.
+        self.register_buffer(
+            "_outcome_lm_ids",
+            torch.tensor([tok.token2id[n] for n in self.outcome_names], dtype=torch.long),
+            persistent=True,
+        )
+
+        # Outcome→LM coupling: zero-initialized K×K linear applied to detached outcome logits.
+        # Lets LM head become aware of outcome signal without allowing LM loss to flow into
+        # outcome_head (detach() blocks that path). Trained in Phase-3 by CE at outcome positions.
+        self.outcome_to_lm = nn.Linear(self.num_outcomes, self.num_outcomes, bias=True)
+
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
         # Head 2 (magnitude): regression of Δt magnitude for non-zero cases only
@@ -381,6 +394,11 @@ class GPT(nn.Module):
         for n, p in self.named_parameters():
             if n.endswith(("att.proj.weight", "mlp.w2.weight")):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg["n_layer"]))
+
+        # outcome_to_lm must be zero-initialized so Phase-2 starts with no LM coupling
+        # (the module is a no-op at init and only gains signal during Phase-3 training).
+        nn.init.zeros_(self.outcome_to_lm.weight)
+        nn.init.zeros_(self.outcome_to_lm.bias)
 
         print(f"[GPT]: Total params: {self.get_num_params()/1e6:.2f} M")
 
@@ -490,6 +508,12 @@ class GPT(nn.Module):
         # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
         outcome_logits = self.outcome_head(x)
 
+        # 4b. Outcome→LM coupling: scatter K additive corrections into LM logits at outcome positions.
+        # .detach() ensures LM loss does not backprop through outcome_head; outcome_to_lm is the
+        # only module trained by CE loss in Phase-3. Zero-init means no effect during Phase-2.
+        lm_bias = self.outcome_to_lm(outcome_logits.detach())           # [B, T, K]
+        logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)    # [B, T, V]
+
         # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
         mag_raw = self.dt_magnitude(x).squeeze(-1)     # [B,T]
@@ -565,6 +589,9 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
+
+        lm_bias = self.outcome_to_lm(outcome_logits.detach())
+        logits  = logits.index_add(2, self._outcome_lm_ids, lm_bias)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
@@ -643,7 +670,21 @@ class GPT(nn.Module):
                 f"but reconstructed model has {model.num_outcomes}."
             )
 
-        model.load_state_dict(ckpt["model_state"])
+        state_dict = ckpt["model_state"]
+        model_keys = set(model.state_dict().keys())
+        ckpt_keys  = set(state_dict.keys())
+        missing    = model_keys - ckpt_keys
+        unexpected = ckpt_keys - model_keys
+        # Keys introduced by outcome_to_lm — tolerated when loading pre-Task-A checkpoints.
+        compat_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids"}
+        non_compat  = missing - compat_keys
+        if non_compat:
+            raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(non_compat)}")
+        if unexpected:
+            raise RuntimeError(f"[GPT.load] Unexpected keys in checkpoint: {sorted(unexpected)}")
+        if missing:
+            print(f"[GPT.load] Backward compat — zero-initializing new keys: {sorted(missing)}")
+        model.load_state_dict(state_dict, strict=False)
 
         # Align device: the caller's embedder may already be on GPU while the checkpoint
         # was saved on CPU. Move the whole model to match the embedder's device so all
@@ -1131,8 +1172,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             param.requires_grad_(True)
 
     def _make_p3_optimizer(m):
-        backbone_params = [p for n, p in m.named_parameters() if "outcome_head" not in n]
-        head_params     = list(m.outcome_head.parameters())
+        head_names = {"outcome_head", "outcome_to_lm"}
+        backbone_params = [p for n, p in m.named_parameters()
+                           if not any(h in n for h in head_names)]
+        head_params = (list(m.outcome_head.parameters()) +
+                       list(m.outcome_to_lm.parameters()))
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1174,18 +1218,19 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
-        # outcome_head is set to train mode when updating.
+        # outcome_head and outcome_to_lm are set to train mode when updating.
         model.eval()
         if train_flag:
             model.outcome_head.train()
+            model.outcome_to_lm.train()
 
-        total_loss = 0.0
+        total_loss = total_outcome = total_ce = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
-                _, _, outcome_logits, _ = model(
+                logits, _, outcome_logits, _ = model(
                     parent_raw_ids=batch["parent_raw_ids"],
                     concept_ids=batch["concept_ids"],
                     value_ids=batch["value_ids"],
@@ -1193,11 +1238,13 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     abs_ts=batch["abs_ts"],
                     context_vec=batch["context_vec"],
                 )
+                logits         = logits.float()
                 outcome_logits = outcome_logits.float()
 
                 full_targets = batch["position_ids"]      # [B, T]
                 target_ids   = full_targets[:, 1:]        # [B, T-1]
                 outcome_pred = outcome_logits[:, :-1, :]  # [B, T-1, K]
+                pred_logits  = logits[:, :-1, :]          # [B, T-1, V]
 
                 outcome_targets = get_future_outcome_targets(
                     target_ids=full_targets,
@@ -1212,7 +1259,21 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 valid_pos = nonpad.unsqueeze(-1)                        # [B, T-1, 1]
 
                 loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
-                loss = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+                loss_outcome = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
+
+                # CE loss at outcome token positions: trains outcome_to_lm via index_add gradient.
+                # detach() in forward already blocks this CE gradient from reaching outcome_head.
+                outcome_lm_ids = model._outcome_lm_ids
+                outcome_pos = torch.zeros_like(nonpad)
+                for oid in outcome_lm_ids.tolist():
+                    outcome_pos |= (target_ids == oid)
+                valid_outcome = nonpad & outcome_pos
+                if valid_outcome.any():
+                    loss_ce = F.cross_entropy(pred_logits[valid_outcome], target_ids[valid_outcome])
+                else:
+                    loss_ce = torch.tensor(0.0, device=device)
+
+                loss = loss_outcome + loss_ce
 
                 if train_flag:
                     optimizer.zero_grad()
@@ -1220,9 +1281,14 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
 
-                total_loss += loss.item()
+                total_loss    += loss.item()
+                total_outcome += loss_outcome.item()
+                total_ce      += loss_ce.item()
 
-        return total_loss / max(len(loader), 1)
+        n = max(len(loader), 1)
+        if train_flag:
+            pass  # logged below
+        return total_loss / n
 
     n_epochs = training_settings["phase3_n_epochs"]
     patience = training_settings["early-stop-patience"]

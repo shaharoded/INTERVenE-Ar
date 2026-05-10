@@ -81,7 +81,7 @@ TRAINING_SETTINGS = {
         "ramp_epochs": {
             "ce":      0,  # No ramp (immediate full lambda after calibration)
             "dt":      0,  # No ramp
-            "outcome": 1,  # Faster ramp: compensate for 2-epoch delay from bce_only=4
+            "outcome": 3,  # Ramp over 3 epochs (confirmed optimal in exp30)
         },
         # Plateau detection settings (applied per stage transition, in order)
         "plateau_min_delta": 1e-3,
