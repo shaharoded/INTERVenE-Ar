@@ -874,7 +874,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     )
                 logits = logits.float()
                 abs_t_pred = abs_t_pred.float()
-                outcome_logits = outcome_logits.float()
+                outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
                 dt_gate_logit = dt_gate_logit.float()
 
                 # logits is [B, T, V]
@@ -1044,9 +1044,12 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.update()
+            flush_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if torch.isfinite(flush_norm):
+                optimizer.step()
+                scheduler.update()
+            else:
+                print(f"[WARNING] NaN/inf grad norm at epoch-end flush (epoch {epoch}), skipping.")
             optimizer.zero_grad()
 
         n_batches = len(loader)
@@ -1239,7 +1242,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     context_vec=batch["context_vec"],
                 )
                 logits         = logits.float()
-                outcome_logits = outcome_logits.float()
+                outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
 
                 full_targets = batch["position_ids"]      # [B, T]
                 target_ids   = full_targets[:, 1:]        # [B, T-1]
@@ -1276,10 +1279,13 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 loss = loss_outcome + loss_ce
 
                 if train_flag:
+                    if not torch.isfinite(loss):
+                        continue
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                    p3_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    if torch.isfinite(p3_norm):
+                        optimizer.step()
 
                 total_loss    += loss.item()
                 total_outcome += loss_outcome.item()
