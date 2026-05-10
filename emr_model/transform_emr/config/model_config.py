@@ -75,13 +75,13 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 11.00,   # Sweep: 9→10 improved (+0.0005) at bce_only=4; testing 11
+            "outcome": 10.00,   # Confirmed optimal at bce_only=4
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
             "ce":      0,  # No ramp (immediate full lambda after calibration)
             "dt":      0,  # No ramp
-            "outcome": 3,  # Gradual ramp over 3 epochs after unlocking
+            "outcome": 1,  # Faster ramp: compensate for 2-epoch delay from bce_only=4
         },
         # Plateau detection settings (applied per stage transition, in order)
         "plateau_min_delta": 1e-3,
