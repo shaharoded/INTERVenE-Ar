@@ -39,6 +39,11 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(cfg["dropout"])
         self.rope_t_scale = cfg.get("rope_t_scale", 24.0)
 
+        # Task 4A: learned scalar temporal bias added to pre-softmax attention logits.
+        # g(Δt_ij) = w * log1p(|Δt_ij| hours) + b  — initialized to zero (no-op at Phase-2 start).
+        self.time_bias_w = nn.Parameter(torch.zeros(1))
+        self.time_bias_b = nn.Parameter(torch.zeros(1))
+
     def _apply_temporal_rope(self, x, abs_ts):
         """Rotate Q/K by timestamp-dependent phases before dot-product attention.
 
@@ -90,6 +95,13 @@ class CausalSelfAttention(nn.Module):
                 q = self._apply_temporal_rope(q, abs_ts)
                 k = self._apply_temporal_rope(k, abs_ts)
 
+            # Task 4A: temporal bias matrix g(Δt_ij) = w*log1p(|Δt_ij|_hours) + b.
+            # Only computed in prefill/training paths (past_kv is None) where full abs_ts [B,T] is available.
+            time_bias = None
+            if abs_ts is not None and past_kv is None:
+                dt_hours = (abs_ts.unsqueeze(-1) - abs_ts.unsqueeze(-2)) * 336.0  # [B, T, T]
+                time_bias = (self.time_bias_w * torch.log1p(dt_hours.abs()) + self.time_bias_b).unsqueeze(1)  # [B, 1, T, T]
+
             # ── KV-cache decode path ──────────────────────────────────────────
             if past_kv is not None:
                 k_past, v_past = past_kv
@@ -137,6 +149,9 @@ class CausalSelfAttention(nn.Module):
                 # Using zeros_like ensures we match dtype (e.g. float16/bfloat16)
                 attn_mask = torch.zeros_like(combined_mask, dtype=q.dtype).masked_fill(combined_mask, float("-inf"))
 
+                if time_bias is not None:
+                    attn_mask = attn_mask + time_bias.to(q.dtype)
+
                 attn = F.scaled_dot_product_attention(
                     q, k, v,
                     attn_mask=attn_mask,
@@ -145,13 +160,26 @@ class CausalSelfAttention(nn.Module):
                 )
             else:
                 # --- Optimized Path (No padding, e.g. Inference) ---
-                # Here we can let SDPA handle the causal mask efficiently
-                attn = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=None,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    is_causal=True
-                )
+                if time_bias is not None:
+                    # Must build causal mask explicitly to add temporal bias.
+                    causal_mask = torch.ones((T, T), device=x.device, dtype=torch.bool).triu(1).view(1, 1, T, T)
+                    attn_mask = torch.zeros(B, 1, T, T, device=x.device, dtype=q.dtype)
+                    attn_mask.masked_fill_(causal_mask, float("-inf"))
+                    attn_mask = attn_mask + time_bias.to(q.dtype)
+                    attn = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=attn_mask,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                        is_causal=False
+                    )
+                else:
+                    # Here we can let SDPA handle the causal mask efficiently
+                    attn = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=None,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                        is_causal=True
+                    )
 
             y = attn.transpose(1, 2).contiguous().view(B, T, C)         # -> [B, T, C]
             y = self.proj(y)
@@ -650,6 +678,10 @@ class GPT(nn.Module):
         unexpected = ckpt_keys - model_keys
         # Tolerate stale keys from Task-A experiments (outcome_to_lm removed in exp37+).
         stale_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids"}
+        # Tolerate missing time_bias_w/b when loading pre-Task-4A checkpoints.
+        # These default to zeros (no-op) in __init__, so skipping them is safe.
+        new_keys = {k for k in missing if k.endswith(".time_bias_w") or k.endswith(".time_bias_b")}
+        missing = missing - new_keys
         unexpected_non_stale = unexpected - stale_keys
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
