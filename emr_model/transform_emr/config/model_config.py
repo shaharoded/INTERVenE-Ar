@@ -33,7 +33,7 @@ TRAINING_SETTINGS = {
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 3e-4,
     "phase3_learning_rate":       1e-4,
-    "phase3_backbone_lr_factor":  0.01,  # backbone LR = phase3_lr * factor (1e-6); 0.0 = fully frozen
+    "phase3_backbone_lr_factor":  0.05,  # backbone LR = phase3_lr * factor (5e-6); 0.0 = fully frozen
     "weight_decay": 1e-3,
 
     "batch_size": 16, # Number of patients processed concurrently (effective batch=64 via grad accumulation)
@@ -74,7 +74,7 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 10.00,   # Future-outcome auxiliary cap (sweeping past 9.0; cap=12 was too high)
+            "outcome": 9.00,    # Future-outcome auxiliary cap (peak confirmed at 9.0; 10 and 12 worse)
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
