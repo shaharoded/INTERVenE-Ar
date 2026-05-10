@@ -74,7 +74,7 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 9.00,    # Future-outcome auxiliary cap (peak confirmed at 9.0)
+            "outcome": 10.00,   # Future-outcome auxiliary cap (sweeping past 9.0; cap=12 was too high)
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
