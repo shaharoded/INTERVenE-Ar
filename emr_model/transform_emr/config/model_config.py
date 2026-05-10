@@ -75,7 +75,7 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 10.00,   # Re-test cap with bce_only=4 backbone (9 optimal at bce_only=2)
+            "outcome": 11.00,   # Sweep: 9→10 improved (+0.0005) at bce_only=4; testing 11
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
