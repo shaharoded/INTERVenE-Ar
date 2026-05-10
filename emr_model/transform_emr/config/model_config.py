@@ -71,11 +71,11 @@ TRAINING_SETTINGS = {
         # Run BCE alone first so auxiliary lambda calibration uses a trained BCE baseline.
         # This value is also used to align early curricula (CBM ramp from epoch 0 and LR warmup).
         # You can decouple these by setting a separate `warmup_epochs` for LR in the scheduler and keeping this as the BCE-only period for curriculum and lambda warmup.
-        "bce_only_epochs": 6,
+        "bce_only_epochs": 4,
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 9.00,    # Future-outcome auxiliary cap (peak confirmed at 9.0; 10 and 12 worse)
+            "outcome": 10.00,   # Re-test cap with bce_only=4 backbone (9 optimal at bce_only=2)
         },
         "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
