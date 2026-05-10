@@ -400,6 +400,11 @@ class GPT(nn.Module):
         nn.init.zeros_(self.outcome_to_lm.weight)
         nn.init.zeros_(self.outcome_to_lm.bias)
 
+        # Controls whether outcome_to_lm correction is applied in forward().
+        # Set False in pretrain_transformer (Phase-2) to avoid CE signal delaying
+        # plateau detection; set True in finetune_transformer (Phase-3) to test coupling.
+        self.coupling_active = True
+
         print(f"[GPT]: Total params: {self.get_num_params()/1e6:.2f} M")
 
 
@@ -508,12 +513,11 @@ class GPT(nn.Module):
         # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
         outcome_logits = self.outcome_head(x)
 
-        # 4b. Outcome→LM coupling: scatter K additive corrections into LM logits at outcome positions.
-        # .detach() ensures LM loss does not backprop through outcome_head; outcome_to_lm is the
-        # only module trained by CE loss in Phase-3. Zero-init means no effect during Phase-2.
-        # Clamp prevents BF16-overflowed outcome_logits from injecting extreme lm_bias values.
-        lm_bias = self.outcome_to_lm(outcome_logits.detach().clamp(-20.0, 20.0))  # [B, T, K]
-        logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)    # [B, T, V]
+        # 4b. Outcome→LM coupling: only active in Phase-3 (coupling_active=True).
+        # Disabled in Phase-2 to prevent CE signal from delaying plateau detection.
+        if self.coupling_active:
+            lm_bias = self.outcome_to_lm(outcome_logits.detach().clamp(-20.0, 20.0))  # [B, T, K]
+            logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)    # [B, T, V]
 
         # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
@@ -591,8 +595,9 @@ class GPT(nn.Module):
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
 
-        lm_bias = self.outcome_to_lm(outcome_logits.detach().clamp(-20.0, 20.0))
-        logits  = logits.index_add(2, self._outcome_lm_ids, lm_bias)
+        if self.coupling_active:
+            lm_bias = self.outcome_to_lm(outcome_logits.detach().clamp(-20.0, 20.0))
+            logits  = logits.index_add(2, self._outcome_lm_ids, lm_bias)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
@@ -759,6 +764,10 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         if pre_ckpt.get("training_settings") is not None:
             training_settings = pre_ckpt["training_settings"]
 
+    # Disable outcome→LM coupling in Phase-2 so CE signal doesn't delay plateau detection.
+    # Phase-3 (finetune_transformer) re-enables it.
+    model.coupling_active = False
+
     # Allow embedder weights to update starting epoch 1
     set_embedder_frozen(model, freeze=False)
     model.to(device)
@@ -823,6 +832,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         print(f"[Phase-2]: Resumed training at epoch {start_epoch} (best val_loss so far: {best_val:.4f})")
     else:
         print("[Phase-2]: Starting transformer training loop...")
+
+    # Re-apply after resume (GPT.load creates a new instance with coupling_active=True by default).
+    model.coupling_active = False
 
     schedule_controller = LambdaScheduleController(
         schedule_config=training_settings["phase2_scheduler"],
@@ -1192,6 +1204,10 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                  "weight_decay": p3_wd},
             ],
         )
+
+    # Enable outcome→LM coupling for Phase-3: outcome_to_lm now receives CE gradient
+    # at outcome token positions, training it to correct LM logits from outcome signal.
+    model.coupling_active = True
 
     _freeze_backbone_only(model)
     optimizer = _make_p3_optimizer(model)
