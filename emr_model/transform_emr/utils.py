@@ -266,6 +266,63 @@ def get_future_outcome_targets(
     return outcome_targets
 
 
+def get_hazard_targets(
+    target_ids: torch.Tensor,      # [B, T] full token id sequence
+    outcome_ids: list,             # [K] outcome token IDs
+    all_abs_ts: torch.Tensor,      # [B, T] absolute timestamps
+    query_abs_ts: torch.Tensor,    # [B, T_q] query timestamps
+    n_bins: int,                   # number of discrete time bins
+    horizon: float,                # max lookahead (same units as timestamps)
+) -> tuple:
+    """
+    Discrete-time survival targets for a hazard head.
+
+    For each (query position t, outcome k):
+      - Finds the FIRST occurrence of outcome k strictly after t within [0, horizon].
+      - Event at bin b*: target[:,b*]=1, mask[:,0..b*]=True (learn bins up to and including event).
+      - Censored (no event in horizon): target=all-zeros, mask=all-True (contribute censoring signal).
+
+    Returns:
+        targets : FloatTensor [B, T_q, K, n_bins]  — 1 at first-event bin, 0 elsewhere
+        mask    : BoolTensor  [B, T_q, K, n_bins]  — True for bins that contribute to loss
+    """
+    B, T_q = query_abs_ts.shape
+    K = len(outcome_ids)
+    bin_width = horizon / n_bins
+    device = query_abs_ts.device
+
+    targets = torch.zeros(B, T_q, K, n_bins, device=device)
+    mask    = torch.zeros(B, T_q, K, n_bins, device=device, dtype=torch.bool)
+
+    # dt[b, t, s] = abs_ts[b,s] - query_abs_ts[b,t] — positive means s is after t
+    dt = all_abs_ts.unsqueeze(1) - query_abs_ts.unsqueeze(2)  # [B, T_q, T]
+    in_future  = dt > 0
+    in_horizon = dt <= horizon
+    valid_future = in_future & in_horizon  # [B, T_q, T]
+
+    bin_range = torch.arange(n_bins, device=device)  # [n_bins]
+
+    for k_idx, oid in enumerate(outcome_ids):
+        is_k = (target_ids == oid)  # [B, T]
+
+        # First-event time: min dt where outcome k occurs in (0, horizon]
+        dt_k = dt.masked_fill(~(valid_future & is_k.unsqueeze(1)), float('inf'))  # [B, T_q, T]
+        first_dt, _ = dt_k.min(dim=2)  # [B, T_q]
+
+        has_event = first_dt.isfinite()
+        bin_idx = (first_dt.clamp(0.0, horizon) / bin_width).long().clamp(0, n_bins - 1)  # [B, T_q]
+
+        bin_idx_exp   = bin_idx.unsqueeze(-1)    # [B, T_q, 1]
+        has_event_exp = has_event.unsqueeze(-1)  # [B, T_q, 1]
+
+        # target: 1 at first-event bin
+        targets[:, :, k_idx, :] = (has_event_exp & (bin_range == bin_idx_exp)).float()
+        # mask: learn from bins 0..event_bin (event) or all bins (censored)
+        mask[:, :, k_idx, :] = (has_event_exp & (bin_range <= bin_idx_exp)) | ~has_event_exp
+
+    return targets, mask
+
+
 def build_mlm(ids, tokenizer, p=0.15):
     """
     Embedder MLM Mask Helper.

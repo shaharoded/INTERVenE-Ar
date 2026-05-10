@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from transform_emr.embedder import EMREmbedding
 from transform_emr.config.model_config import *
 from transform_emr.utils import *
+from transform_emr.utils import get_hazard_targets
 from transform_emr.loss import MaskedFocalBCE, MaskedSetCE
 from transform_emr.schedulers import LambdaScheduleController, LRScheduleController
 
@@ -385,6 +386,14 @@ class GPT(nn.Module):
             persistent=True,
         )
 
+        # Discrete-time hazard head: predicts P(first-event in bin b | survived to bin b).
+        # n_bins × 4h = 48h, aligned with outcome_horizon_hours.
+        # Initialised to near-zero so it starts as a no-op and learns gradually.
+        self.hazard_bins = cfg.get("hazard_bins", 12)
+        self.hazard_head = nn.Linear(cfg["embed_dim"], self.num_outcomes * self.hazard_bins)
+        nn.init.normal_(self.hazard_head.weight, std=0.01)
+        nn.init.zeros_(self.hazard_head.bias)
+
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
         # Head 2 (magnitude): regression of Δt magnitude for non-zero cases only
@@ -514,23 +523,22 @@ class GPT(nn.Module):
         logits = self.lm_head(x)             # [B, T, V]
 
         # 4. Outcome Prediction Head (Auxiliary Task)
-        # Input: Contextual embedding at step t (representing history 0..t)
-        # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
-        outcome_logits = self.outcome_head(x)
+        outcome_logits = self.outcome_head(x)           # [B, T, K]
 
-        # 5. Absolute time prediction (two-head: gate + magnitude)
+        # 5. Discrete-time hazard head
+        B_x, T_x, _ = x.shape
+        hazard_logits = self.hazard_head(x).view(B_x, T_x, self.num_outcomes, self.hazard_bins)
+
+        # 6. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
         mag_raw = self.dt_magnitude(x).squeeze(-1)     # [B,T]
         mag_pos = F.softplus(mag_raw)                  # non-negative magnitude
 
-        # Expected Δt = sigmoid(gate) * magnitude
         gate_prob = torch.sigmoid(gate_logit)
         delta_pos = gate_prob * mag_pos
-
-        # Autoregressive time prediction
         abs_t_pred = abs_ts + delta_pos                # [B, T]
 
-        return logits, abs_t_pred, outcome_logits, gate_logit
+        return logits, abs_t_pred, outcome_logits, gate_logit, hazard_logits
 
 
     @torch.no_grad()
@@ -593,13 +601,15 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
+        B_x, T_x, _ = x.shape
+        hazard_logits  = self.hazard_head(x).view(B_x, T_x, self.num_outcomes, self.hazard_bins)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
         delta_pos  = torch.sigmoid(gate_logit) * mag_pos
         abs_t_pred = abs_ts + delta_pos
 
-        return logits, abs_t_pred, outcome_logits, gate_logit, new_kvs
+        return logits, abs_t_pred, outcome_logits, gate_logit, hazard_logits, new_kvs
 
 
     def save(self, path, epoch=None, best_val=None, optimizer=None, scheduler=None,
@@ -678,9 +688,11 @@ class GPT(nn.Module):
         unexpected = ckpt_keys - model_keys
         # Tolerate stale keys from Task-A experiments (outcome_to_lm removed in exp37+).
         stale_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids"}
-        # Tolerate missing time_bias_w/b when loading pre-Task-4A checkpoints.
-        # These default to zeros (no-op) in __init__, so skipping them is safe.
-        new_keys = {k for k in missing if k.endswith(".time_bias_w") or k.endswith(".time_bias_b")}
+        # Tolerate missing time_bias_w/b (pre-Task-4A) and hazard_head (pre-exp41).
+        # Both default to zero-init (no-op) so skipping them on load is safe.
+        new_keys = {k for k in missing if
+                    k.endswith(".time_bias_w") or k.endswith(".time_bias_b")
+                    or k.startswith("hazard_head.")}
         missing = missing - new_keys
         unexpected_non_stale = unexpected - stale_keys
         if missing:
@@ -845,8 +857,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_outcome = total_dt = 0.0
-        total_ce_raw = total_outcome_raw = total_dt_raw = 0.0
+        total_loss = total_bce = total_ce = total_outcome = total_dt = total_hazard = 0.0
+        total_ce_raw = total_outcome_raw = total_dt_raw = total_hazard_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -869,7 +881,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
                 # === Original logits from Model ===
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
+                    logits, abs_t_pred, outcome_logits, dt_gate_logit, hazard_logits = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
@@ -881,6 +893,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 abs_t_pred = abs_t_pred.float()
                 outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
                 dt_gate_logit = dt_gate_logit.float()
+                hazard_logits = hazard_logits.float()
 
                 # logits is [B, T, V]
                 # abs_t_pred: [B, T]
@@ -1006,15 +1019,42 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
                 loss_outcome = lambdas["outcome"] * loss_outcome_raw
 
+                # === Loss: Discrete-time hazard (survival) ===
+                # For each position t and outcome k, predict which time bin (0-47h in 4h steps)
+                # the first future occurrence of k falls in. Properly conditions on survival.
+                _N_BINS = model.hazard_bins
+                hazard_tgt, hazard_loss_mask = get_hazard_targets(
+                    target_ids=full_targets,
+                    outcome_ids=outcome_token_ids,
+                    all_abs_ts=batch["abs_ts"],
+                    query_abs_ts=batch["abs_ts"][:, :-1],
+                    n_bins=_N_BINS,
+                    horizon=_HORIZON,
+                )  # [B, T-1, K, n_bins]
+
+                hazard_logits_q = hazard_logits[:, :-1, :, :]  # [B, T-1, K, n_bins]
+                # Apply padding mask: don't learn from pad positions
+                hazard_loss_mask &= nonpad.unsqueeze(-1).unsqueeze(-1)
+
+                if hazard_loss_mask.any():
+                    loss_hazard_raw = F.binary_cross_entropy_with_logits(
+                        hazard_logits_q[hazard_loss_mask],
+                        hazard_tgt[hazard_loss_mask],
+                        reduction="mean",
+                    )
+                else:
+                    loss_hazard_raw = hazard_logits_q.new_tensor(0.0)
+                loss_hazard = lambdas.get("hazard", 0.0) * loss_hazard_raw
+
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss
+                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_hazard
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "hazard": loss_hazard, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1046,9 +1086,11 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce      += loss_ce.item()
                 total_outcome += loss_outcome.item()
                 total_dt      += abs_t_loss.item()
+                total_hazard  += loss_hazard.item()
                 total_ce_raw      += loss_ce_raw.item()
                 total_outcome_raw += loss_outcome_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
+                total_hazard_raw  += loss_hazard_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1068,21 +1110,23 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_outcome / n_batches,
             total_dt      / n_batches,
+            total_hazard  / n_batches,
             total_ce_raw      / n_batches,
             total_outcome_raw / n_batches,
             total_dt_raw      / n_batches,
+            total_hazard_raw  / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_ce_raw, tr_outcome_raw, tr_dt_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_hazard, tr_ce_raw, tr_outcome_raw, tr_dt_raw, tr_hazard_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, vl_hazard, _, _, _, _                                          = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f})""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f}, Haz={tr_hazard:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f}, Haz={vl_hazard:.4f})""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1183,9 +1227,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             param.requires_grad_(True)
 
     def _make_p3_optimizer(m):
+        head_names = {"outcome_head", "hazard_head"}
         backbone_params = [p for n, p in m.named_parameters()
-                           if "outcome_head" not in n]
-        head_params = list(m.outcome_head.parameters())
+                           if not any(h in n for h in head_names)]
+        head_params = (list(m.outcome_head.parameters()) +
+                       list(m.hazard_head.parameters()))
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1230,14 +1276,15 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         model.eval()
         if train_flag:
             model.outcome_head.train()
+            model.hazard_head.train()
 
-        total_loss = total_outcome = 0.0
+        total_loss = total_outcome = total_hazard_p3 = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
-                logits, _, outcome_logits, _ = model(
+                logits, _, outcome_logits, _, hazard_logits_p3 = model(
                     parent_raw_ids=batch["parent_raw_ids"],
                     concept_ids=batch["concept_ids"],
                     value_ids=batch["value_ids"],
@@ -1268,17 +1315,38 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
                 loss_outcome = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
 
+                # Hazard loss in Phase-3
+                hazard_tgt_p3, hazard_mask_p3 = get_hazard_targets(
+                    target_ids=full_targets,
+                    outcome_ids=outcome_token_ids,
+                    all_abs_ts=batch["abs_ts"],
+                    query_abs_ts=batch["abs_ts"][:, :-1],
+                    n_bins=model.hazard_bins,
+                    horizon=_HORIZON,
+                )
+                hazard_logits_p3_q = hazard_logits_p3.float()[:, :-1, :, :]
+                hazard_mask_p3 &= nonpad.unsqueeze(-1).unsqueeze(-1)
+                if hazard_mask_p3.any():
+                    loss_hazard_p3 = F.binary_cross_entropy_with_logits(
+                        hazard_logits_p3_q[hazard_mask_p3], hazard_tgt_p3[hazard_mask_p3], reduction="mean"
+                    )
+                else:
+                    loss_hazard_p3 = loss_outcome.new_tensor(0.0)
+
+                loss = loss_outcome + loss_hazard_p3
+
                 if train_flag:
-                    if not torch.isfinite(loss_outcome):
+                    if not torch.isfinite(loss):
                         continue
                     optimizer.zero_grad()
-                    loss_outcome.backward()
+                    loss.backward()
                     p3_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     if torch.isfinite(p3_norm):
                         optimizer.step()
 
-                total_loss    += loss_outcome.item()
-                total_outcome += loss_outcome.item()
+                total_loss       += loss.item()
+                total_outcome    += loss_outcome.item()
+                total_hazard_p3  += loss_hazard_p3.item()
 
         n = max(len(loader), 1)
         if train_flag:

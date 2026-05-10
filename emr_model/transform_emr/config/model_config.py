@@ -15,7 +15,8 @@ MODEL_CONFIG = {
       "n_head": 4,
       "n_layer": 4,
       "dropout": 0.1,
-      "bias": True
+      "bias": True,
+      "hazard_bins": 12,   # discrete-time survival bins (12 × 4h = 48h, matches outcome_horizon)
     }
 
 TRAINING_SETTINGS = {
@@ -68,22 +69,20 @@ TRAINING_SETTINGS = {
     # once the current stage's ramp has completed.
     # Warmup ends after the outcome ramp completes (dynamic, set by scheduler).
     "phase2_scheduler": {
-        # Run BCE alone first so auxiliary lambda calibration uses a trained BCE baseline.
-        # This value is also used to align early curricula (CBM ramp from epoch 0 and LR warmup).
-        # You can decouple these by setting a separate `warmup_epochs` for LR in the scheduler and keeping this as the BCE-only period for curriculum and lambda warmup.
         "bce_only_epochs": 4,
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "outcome": 10.00,   # Confirmed optimal at bce_only=4
+            "hazard":  5.00,    # Discrete-time survival head; half of outcome cap
         },
-        "order": [["ce", "dt"], ["outcome"]],
+        "order": [["ce", "dt"], ["outcome", "hazard"]],
         "ramp_epochs": {
-            "ce":      0,  # No ramp (immediate full lambda after calibration)
-            "dt":      0,  # No ramp
+            "ce":      0,
+            "dt":      0,
             "outcome": 3,  # Ramp over 3 epochs (confirmed optimal in exp30)
+            "hazard":  3,  # Same ramp as outcome (activates together)
         },
-        # Plateau detection settings (applied per stage transition, in order)
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
     },
