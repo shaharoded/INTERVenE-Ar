@@ -357,19 +357,6 @@ class GPT(nn.Module):
             persistent=True,
         )
 
-        # LM vocab IDs for outcome_names only (subset of _outcome_ids, rarity-filtered).
-        # Used by outcome_to_lm to scatter K additive corrections into the LM logit tensor.
-        self.register_buffer(
-            "_outcome_lm_ids",
-            torch.tensor([tok.token2id[n] for n in self.outcome_names], dtype=torch.long),
-            persistent=True,
-        )
-
-        # Outcome→LM coupling: zero-initialized K×K linear applied to detached outcome logits.
-        # Lets LM head become aware of outcome signal without allowing LM loss to flow into
-        # outcome_head (detach() blocks that path). Trained in Phase-3 by CE at outcome positions.
-        self.outcome_to_lm = nn.Linear(self.num_outcomes, self.num_outcomes, bias=True)
-
         # Δt prediction: two-head gate + magnitude design
         # Head 1 (gate): binary classifier P(Δt > 0) — handles 78.6% simultaneous events
         # Head 2 (magnitude): regression of Δt magnitude for non-zero cases only
@@ -394,16 +381,6 @@ class GPT(nn.Module):
         for n, p in self.named_parameters():
             if n.endswith(("att.proj.weight", "mlp.w2.weight")):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg["n_layer"]))
-
-        # outcome_to_lm must be zero-initialized so Phase-2 starts with no LM coupling
-        # (the module is a no-op at init and only gains signal during Phase-3 training).
-        nn.init.zeros_(self.outcome_to_lm.weight)
-        nn.init.zeros_(self.outcome_to_lm.bias)
-
-        # Controls whether outcome_to_lm correction is applied in forward().
-        # Set False in pretrain_transformer (Phase-2) to avoid CE signal delaying
-        # plateau detection; set True in finetune_transformer (Phase-3) to test coupling.
-        self.coupling_active = True
 
         print(f"[GPT]: Total params: {self.get_num_params()/1e6:.2f} M")
 
@@ -513,12 +490,6 @@ class GPT(nn.Module):
         # Output: Unnormalized logits for each outcome class [B, T, Num_Outcomes]
         outcome_logits = self.outcome_head(x)
 
-        # 4b. Outcome→LM coupling: only active in Phase-3 (coupling_active=True).
-        # Disabled in Phase-2 to prevent CE signal from delaying plateau detection.
-        if self.coupling_active:
-            lm_bias = self.outcome_to_lm(outcome_logits.detach().clamp(-20.0, 20.0))  # [B, T, K]
-            logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)    # [B, T, V]
-
         # 5. Absolute time prediction (two-head: gate + magnitude)
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
         mag_raw = self.dt_magnitude(x).squeeze(-1)     # [B,T]
@@ -594,10 +565,6 @@ class GPT(nn.Module):
         # 3. Heads
         logits         = self.lm_head(x)
         outcome_logits = self.outcome_head(x)
-
-        if self.coupling_active:
-            lm_bias = self.outcome_to_lm(outcome_logits.detach().clamp(-20.0, 20.0))
-            logits  = logits.index_add(2, self._outcome_lm_ids, lm_bias)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
         mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
@@ -681,15 +648,15 @@ class GPT(nn.Module):
         ckpt_keys  = set(state_dict.keys())
         missing    = model_keys - ckpt_keys
         unexpected = ckpt_keys - model_keys
-        # Keys introduced by outcome_to_lm — tolerated when loading pre-Task-A checkpoints.
-        compat_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids"}
-        non_compat  = missing - compat_keys
-        if non_compat:
-            raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(non_compat)}")
-        if unexpected:
-            raise RuntimeError(f"[GPT.load] Unexpected keys in checkpoint: {sorted(unexpected)}")
+        # Tolerate stale keys from Task-A experiments (outcome_to_lm removed in exp37+).
+        stale_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids"}
+        unexpected_non_stale = unexpected - stale_keys
         if missing:
-            print(f"[GPT.load] Backward compat — zero-initializing new keys: {sorted(missing)}")
+            raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
+        if unexpected_non_stale:
+            raise RuntimeError(f"[GPT.load] Unexpected keys in checkpoint: {sorted(unexpected_non_stale)}")
+        if unexpected & stale_keys:
+            print(f"[GPT.load] Ignoring stale Task-A keys: {sorted(unexpected & stale_keys)}")
         model.load_state_dict(state_dict, strict=False)
 
         # Align device: the caller's embedder may already be on GPU while the checkpoint
@@ -764,10 +731,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         if pre_ckpt.get("training_settings") is not None:
             training_settings = pre_ckpt["training_settings"]
 
-    # Disable outcome→LM coupling in Phase-2 so CE signal doesn't delay plateau detection.
-    # Phase-3 (finetune_transformer) re-enables it.
-    model.coupling_active = False
-
     # Allow embedder weights to update starting epoch 1
     set_embedder_frozen(model, freeze=False)
     model.to(device)
@@ -832,9 +795,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         print(f"[Phase-2]: Resumed training at epoch {start_epoch} (best val_loss so far: {best_val:.4f})")
     else:
         print("[Phase-2]: Starting transformer training loop...")
-
-    # Re-apply after resume (GPT.load creates a new instance with coupling_active=True by default).
-    model.coupling_active = False
 
     schedule_controller = LambdaScheduleController(
         schedule_config=training_settings["phase2_scheduler"],
@@ -1191,11 +1151,9 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             param.requires_grad_(True)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head", "outcome_to_lm"}
         backbone_params = [p for n, p in m.named_parameters()
-                           if not any(h in n for h in head_names)]
-        head_params = (list(m.outcome_head.parameters()) +
-                       list(m.outcome_to_lm.parameters()))
+                           if "outcome_head" not in n]
+        head_params = list(m.outcome_head.parameters())
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
@@ -1204,10 +1162,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                  "weight_decay": p3_wd},
             ],
         )
-
-    # Enable outcome→LM coupling for Phase-3: outcome_to_lm now receives CE gradient
-    # at outcome token positions, training it to correct LM logits from outcome signal.
-    model.coupling_active = True
 
     _freeze_backbone_only(model)
     optimizer = _make_p3_optimizer(model)
@@ -1241,13 +1195,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
-        # outcome_head and outcome_to_lm are set to train mode when updating.
         model.eval()
         if train_flag:
             model.outcome_head.train()
-            model.outcome_to_lm.train()
 
-        total_loss = total_outcome = total_ce = 0.0
+        total_loss = total_outcome = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
@@ -1284,32 +1236,17 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 loss_raw = OutcomeCriterion(outcome_pred, outcome_targets)  # [B, T-1, K]
                 loss_outcome = (loss_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
 
-                # CE loss at outcome token positions: trains outcome_to_lm via index_add gradient.
-                # detach() in forward already blocks this CE gradient from reaching outcome_head.
-                outcome_lm_ids = model._outcome_lm_ids
-                outcome_pos = torch.zeros_like(nonpad)
-                for oid in outcome_lm_ids.tolist():
-                    outcome_pos |= (target_ids == oid)
-                valid_outcome = nonpad & outcome_pos
-                if valid_outcome.any():
-                    loss_ce = F.cross_entropy(pred_logits[valid_outcome], target_ids[valid_outcome])
-                else:
-                    loss_ce = torch.tensor(0.0, device=device)
-
-                loss = loss_outcome + loss_ce
-
                 if train_flag:
-                    if not torch.isfinite(loss):
+                    if not torch.isfinite(loss_outcome):
                         continue
                     optimizer.zero_grad()
-                    loss.backward()
+                    loss_outcome.backward()
                     p3_norm = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     if torch.isfinite(p3_norm):
                         optimizer.step()
 
-                total_loss    += loss.item()
+                total_loss    += loss_outcome.item()
                 total_outcome += loss_outcome.item()
-                total_ce      += loss_ce.item()
 
         n = max(len(loader), 1)
         if train_flag:
