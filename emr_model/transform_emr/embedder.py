@@ -185,6 +185,35 @@ class EMREmbedding(nn.Module):
         self.mlm_head = nn.Linear(embed_dim, len(tokenizer.token2id), bias=False)
         self.mlm_head.weight = self.position_embed.weight  # weight tying
 
+        # --- Token-type flag embeddings (Task 4B) ---
+        # 4 binary flags per token: is_outcome, is_interval_marker, is_trend, is_treatment.
+        # Each flag maps to a learned vector that is summed into the event embedding, giving
+        # the model explicit structural knowledge that outcome tokens are a special class.
+        self.token_type_embeds = nn.Embedding(4, embed_dim)
+        nn.init.normal_(self.token_type_embeds.weight, std=0.02)
+        self.register_buffer('_token_type_flags', self._compute_type_flags(tokenizer, embed_dim))
+
+    @staticmethod
+    def _compute_type_flags(tokenizer, embed_dim):
+        """
+        Build [V, 4] float buffer of binary token-type flags for token_type_embeds.
+        Flags: [is_outcome, is_interval_marker, is_trend, is_treatment_pattern].
+        """
+        from transform_emr.config.dataset_config import OUTCOMES, TERMINAL_OUTCOMES
+        outcome_names = set(OUTCOMES) | set(TERMINAL_OUTCOMES)
+        V = len(tokenizer.token2id)
+        flags = torch.zeros(V, 4)
+        for name, idx in tokenizer.token2id.items():
+            if name in outcome_names:
+                flags[idx, 0] = 1.0
+            if name.endswith('_START') or name.endswith('_END'):
+                flags[idx, 1] = 1.0
+            if 'TREND' in name:
+                flags[idx, 2] = 1.0
+            if 'BITZUA' in name:
+                flags[idx, 3] = 1.0
+        return flags
+
     def predict_time(self, abs_ts):
         """
         Helper used during Phase-1 to supervise Time2Vec.
@@ -281,6 +310,11 @@ class EMREmbedding(nn.Module):
         # --- Combine all token-wise pieces ---
         combined = torch.cat([r_emb, c_emb, v_emb, p_emb, t_emb], dim=-1)  # [B, T, 5D]
         ev_vec = self.final_proj(combined)                                 # [B, T, D]
+
+        # Token-type flag embeddings: additive structural signal (outcome / marker / trend / treatment)
+        type_flags = self._token_type_flags[position_ids]                  # [B, T, 4]
+        ev_vec = ev_vec + type_flags @ self.token_type_embeds.weight       # [B, T, D]
+
         ev_vec = self.dropout(ev_vec) / self.scale                         # [B, 1, D]
 
         # --- Sequence Norm ---
@@ -336,26 +370,20 @@ class EMREmbedding(nn.Module):
         return self.decoder(combined_embedding), seq  # [B,T,V] logits + [B,T,D] embeddings
     
 
-    def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None,
-                         masked_concept_ids=None, masked_value_ids=None, masked_raw_ids=None,
-                         context_dropout_prob=0.15):
+    def forward_with_mlm(self, batch: dict, mlm_mask=None, masked_pos_ids=None, context_dropout_prob=0.15):
         """
         Runs full forward pass + MLM (for training phase 1).
         Same inputs as forward_with_decoder, plus:
-            mlm_mask         - bool tensor [B,T] where True → this position was masked.
-            masked_pos_ids   - position_ids with masked positions replaced by [MASK].
-            masked_concept_ids / masked_value_ids / masked_raw_ids - hierarchy ids with masked
-                positions replaced by [MASK], so the model cannot trivially reconstruct
-                position_ids from concept+value hierarchy (Task 2B fix).
+            mlm_mask - bool tensor [B,T] where True → this position was masked.
 
         Context Dropout is applied here to improve robustness when patient context is missing.
         Returns:
             mlm_logits [B, T, vocab_size]
         """
         seq, cond = self.forward(
-        parent_raw_ids=masked_raw_ids if masked_raw_ids is not None else batch["parent_raw_ids"],
-        concept_ids=masked_concept_ids if masked_concept_ids is not None else batch["concept_ids"],
-        value_ids=masked_value_ids if masked_value_ids is not None else batch["value_ids"],
+        parent_raw_ids=batch["parent_raw_ids"],
+        concept_ids=batch["concept_ids"],
+        value_ids=batch["value_ids"],
         position_ids=masked_pos_ids,  # masked positions used here
         abs_ts=batch["abs_ts"],
         patient_contexts=batch["context_vec"],
@@ -566,15 +594,6 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 tokenizer=embedder.tokenizer,
                 p=0.15
             )  # MLM mask
-            # Task 2B fix: also mask concept/value/raw hierarchy ids at the same positions
-            # so the model cannot reconstruct position_ids trivially from concept+value.
-            mask_id = embedder.tokenizer.mask_token_id
-            masked_concept_ids = batch["concept_ids"].clone()
-            masked_value_ids   = batch["value_ids"].clone()
-            masked_raw_ids     = batch["parent_raw_ids"].clone()
-            masked_concept_ids[mlm_mask] = mask_id
-            masked_value_ids[mlm_mask]   = mask_id
-            masked_raw_ids[mlm_mask, :]  = mask_id
             
             # BCE Logits + Loss (also returns seq for seq-aware Δt head)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
@@ -628,10 +647,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                 mlm_logits = embedder.forward_with_mlm(
                                                     batch,
                                                     mlm_mask=mlm_mask,
-                                                    masked_pos_ids=masked_pos_ids,
-                                                    masked_concept_ids=masked_concept_ids,
-                                                    masked_value_ids=masked_value_ids,
-                                                    masked_raw_ids=masked_raw_ids)
+                                                    masked_pos_ids=masked_pos_ids)
             mlm_logits = mlm_logits.float()
             mlm_labels = batch["position_ids"][mlm_mask]          # ground truth
             mlm_raw = F.cross_entropy(

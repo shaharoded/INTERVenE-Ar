@@ -50,7 +50,7 @@ TRAINING_SETTINGS = {
     "phase1_scheduler": {
         "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
         "aux_fraction_caps": {
-            "mlm": 1.50,  # Task-2B fix: MLM now masks full hierarchy (concept/value/raw), real prediction task
+            "mlm": 1.50,  # Phase-1 MLM cap; trivially easy (no attention in P1) but neutral as regularizer
             "dt":  0.40,  # Time regression auxiliary capped to 40% of BCE at calibration epoch
         },
         "order": [["mlm", "dt"]],  # Single stage: both active together after bce_only_epochs
