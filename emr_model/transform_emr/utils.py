@@ -324,43 +324,6 @@ def get_hazard_targets(
     return targets, mask
 
 
-def build_mlm(ids, tokenizer, p=0.15):
-    """
-    Embedder MLM Mask Helper.
-    Logic: Mask (later predict) tokens important to position that won't hurt the general timeline.
-            Mask everything informative but admission, CTX or terminal tokens.
-    ids:  (B,T) tensor - concept_ids / value_ids / position_ids
-    returns masked_ids (same shape)
-    Masking strategy (BERT-style):
-        80% → replace with [MASK]
-        10% → keep original
-        10% → replace with random token (not PAD)
-    """
-    device = ids.device
-    never_mask_ids = {
-        tokenizer.pad_token_id,
-        tokenizer.null_token_id,
-        tokenizer.token2id.get(ADMISSION_TOKEN),
-        *[tokenizer.token2id[tok] for tok in TERMINAL_OUTCOMES],
-    }
-    keep = torch.zeros_like(ids, dtype=torch.bool)
-    for tid in never_mask_ids:
-        if tid is not None:
-            keep |= (ids == tid)
-    mask = (~keep) & (torch.rand_like(ids.float()) < p)
-    masked = ids.clone()
-    # 80 %
-    rand = torch.rand_like(ids.float())
-    mask80 = mask & (rand < 0.8)
-    masked[mask80] = tokenizer.mask_token_id
-    # 10 % random token
-    mask10 = mask & (rand >= 0.8) & (rand < 0.9)
-    vocab_size = len(tokenizer.token2id)
-    random_tokens = torch.randint(1, vocab_size, size=ids.shape, device=device)
-    masked[mask10] = random_tokens[mask10]
-    # 10 % keep original – already satisfied
-    return masked, mask        # mask is the bool tensor of *predict‑me* positions
-
 
 def set_embedder_frozen(model, freeze: bool):
     for p in model.embedder.parameters():
