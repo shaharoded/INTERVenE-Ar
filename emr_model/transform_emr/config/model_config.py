@@ -73,7 +73,7 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 10.00,   # Confirmed optimal at bce_only=4
+            "outcome": 12.00,   # exp48: 10→12 with shared hazard arch — push outcome harder since outcome head now gets hazard gradient too
             "hazard":  5.00,    # Discrete-time survival head; half of outcome cap (exp43 confirmed peak)
         },
         "order": [["ce", "dt"], ["outcome", "hazard"]],
