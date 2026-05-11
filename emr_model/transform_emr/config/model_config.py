@@ -73,13 +73,15 @@ TRAINING_SETTINGS = {
             "dt":      0.50,    # Time regression cap
             "outcome": 10.00,   # Confirmed peak across exp30/exp42/exp46; exp48 cap=12 hurt
             "hazard":  5.00,    # Discrete-time survival head; half of outcome cap (exp43 confirmed peak)
+            "ranking": 0.20,    # Task C: pairwise AUROC-proxy ranking loss; cap conservative
         },
-        "order": [["ce", "dt"], ["outcome", "hazard"]],
+        "order": [["ce", "dt"], ["outcome", "hazard", "ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
             "outcome": 3,  # Ramp over 3 epochs (confirmed optimal in exp30)
             "hazard":  3,  # Same ramp as outcome (exp42 confirmed; exp44 ramp=1 DISCARD)
+            "ranking": 3,  # Same ramp as outcome — Task C activates alongside outcome stage
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]

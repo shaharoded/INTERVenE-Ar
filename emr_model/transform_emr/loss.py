@@ -175,6 +175,62 @@ class MaskedFocalBCE(nn.Module):
         return loss, info
 
 
+def pairwise_ranking_loss(
+    outcome_logits: torch.Tensor,
+    pos_mask: torch.Tensor,
+    neg_mask: torch.Tensor,
+    max_pos: int = 256,
+    max_neg: int = 512,
+) -> torch.Tensor:
+    """
+    Direct AUROC-proxy pairwise ranking loss over outcome-head logits.
+
+    For each outcome k:
+      L_k = mean over (pos, neg) pairs of  softplus(logit_neg - logit_pos)
+    which is equivalent to BPR / pairwise logistic; minimising it raises the
+    probability that a positive position is ranked above a negative one — the
+    same quantity `evaluate_on_test_set` pools as AUROC.
+
+    Args:
+        outcome_logits ([B, T, K] float): outcome-head raw logits.
+        pos_mask       ([B, T, K] bool):  True at positions where outcome k
+            occurs within the (training) horizon — the "imminent" positions.
+        neg_mask       ([B, T, K] bool):  True at non-pad positions where
+            outcome k does not occur within the horizon — the "absent" cohort.
+        max_pos (int): per-outcome cap on positives sampled per batch.
+        max_neg (int): per-outcome cap on negatives sampled per batch.
+            Bounds the dense [Npos, Nneg] pair matrix.
+
+    Returns:
+        scalar mean loss across outcomes that have at least one (pos, neg) pair
+        available in the current batch. Outcomes with zero positives or zero
+        negatives contribute nothing (no gradient, no denominator).
+    """
+    B, T, K = outcome_logits.shape
+    device  = outcome_logits.device
+    losses  = []
+    for k in range(K):
+        logits_k = outcome_logits[..., k].reshape(-1)
+        p_idx = pos_mask[..., k].reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        n_idx = neg_mask[..., k].reshape(-1).nonzero(as_tuple=False).squeeze(-1)
+        if p_idx.numel() == 0 or n_idx.numel() == 0:
+            continue
+
+        if p_idx.numel() > max_pos:
+            p_idx = p_idx[torch.randperm(p_idx.numel(), device=device)[:max_pos]]
+        if n_idx.numel() > max_neg:
+            n_idx = n_idx[torch.randperm(n_idx.numel(), device=device)[:max_neg]]
+
+        pos_logits = logits_k[p_idx]                                   # [Npos]
+        neg_logits = logits_k[n_idx]                                   # [Nneg]
+        diff = neg_logits.unsqueeze(0) - pos_logits.unsqueeze(1)       # [Npos, Nneg]
+        losses.append(F.softplus(diff).mean())
+
+    if not losses:
+        return outcome_logits.new_tensor(0.0)
+    return torch.stack(losses).mean()
+
+
 class MaskedSetCE(nn.Module):
     """
     Soft 'set cross-entropy' over the allowed classes where at least 1 target is allowed. 

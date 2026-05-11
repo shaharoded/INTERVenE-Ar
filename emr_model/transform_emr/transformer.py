@@ -22,7 +22,7 @@ from transform_emr.embedder import EMREmbedding
 from transform_emr.config.model_config import *
 from transform_emr.utils import *
 from transform_emr.utils import get_hazard_targets
-from transform_emr.loss import MaskedFocalBCE, MaskedSetCE
+from transform_emr.loss import MaskedFocalBCE, MaskedSetCE, pairwise_ranking_loss
 from transform_emr.schedulers import LambdaScheduleController, LRScheduleController
 
 # ───────── components  ───────────────────────────────────────────────── #
@@ -880,8 +880,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_outcome = total_dt = total_hazard = 0.0
-        total_ce_raw = total_outcome_raw = total_dt_raw = total_hazard_raw = 0.0
+        total_loss = total_bce = total_ce = total_outcome = total_dt = total_hazard = total_ranking = 0.0
+        total_ce_raw = total_outcome_raw = total_dt_raw = total_hazard_raw = total_ranking_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -1069,15 +1069,30 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     loss_hazard_raw = hazard_logits_q.new_tensor(0.0)
                 loss_hazard = lambdas.get("hazard", 0.0) * loss_hazard_raw
 
+                # === Loss: Pairwise ranking (Task C — direct AUROC proxy) ===
+                # Positive positions: outcome_targets > 0 (outcome occurs within horizon).
+                # Negative positions: outcome_targets == 0 (no outcome within horizon).
+                # Both masked by non-pad. Independent of soft-BCE — direct AUROC signal.
+                lam_rank = lambdas.get("ranking", 0.0)
+                if lam_rank > 0.0:
+                    _rank_pos = (outcome_targets > 0.0) & valid_pos
+                    _rank_neg = (outcome_targets == 0.0) & valid_pos
+                    loss_ranking_raw = pairwise_ranking_loss(
+                        outcome_pred, _rank_pos, _rank_neg,
+                    )
+                else:
+                    loss_ranking_raw = outcome_pred.new_tensor(0.0)
+                loss_ranking = lam_rank * loss_ranking_raw
+
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_hazard
+                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_hazard + loss_ranking
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "hazard": loss_hazard, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "hazard": loss_hazard, "ranking": loss_ranking, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1110,10 +1125,12 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_outcome += loss_outcome.item()
                 total_dt      += abs_t_loss.item()
                 total_hazard  += loss_hazard.item()
+                total_ranking += loss_ranking.item()
                 total_ce_raw      += loss_ce_raw.item()
                 total_outcome_raw += loss_outcome_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
                 total_hazard_raw  += loss_hazard_raw.item()
+                total_ranking_raw += loss_ranking_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1134,22 +1151,24 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_outcome / n_batches,
             total_dt      / n_batches,
             total_hazard  / n_batches,
+            total_ranking / n_batches,
             total_ce_raw      / n_batches,
             total_outcome_raw / n_batches,
             total_dt_raw      / n_batches,
             total_hazard_raw  / n_batches,
+            total_ranking_raw / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_hazard, tr_ce_raw, tr_outcome_raw, tr_dt_raw, tr_hazard_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, vl_hazard, _, _, _, _                                          = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_hazard, tr_ranking, tr_ce_raw, tr_outcome_raw, tr_dt_raw, tr_hazard_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, vl_hazard, vl_ranking, _, _, _, _, _                                                       = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f}, Haz={tr_hazard:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f}, Haz={vl_hazard:.4f})""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f}, Haz={tr_hazard:.4f}, Rank={tr_ranking:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f}, Haz={vl_hazard:.4f}, Rank={vl_ranking:.4f})""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1159,6 +1178,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             dt=tr_dt_raw,
             outcome=tr_outcome_raw,
             hazard=tr_hazard_raw,
+            ranking=tr_ranking_raw,
         )
         for msg in schedule_events:
             print(msg)
