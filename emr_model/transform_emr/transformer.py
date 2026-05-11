@@ -369,8 +369,12 @@ class GPT(nn.Module):
         self.outcome_names = valid_outcomes
         self.num_outcomes = len(self.outcome_names)
 
-        # 2-layer MLP outcome classifier (exp24 confirmed deeper head doesn't help).
+        # exp50: 3-layer outcome head (was 2-layer); exp24 widening D→2D→D→K failed,
+        # but pure depth D→D→D→K hasn't been tried with shared hazard arch (exp46+).
         self.outcome_head = nn.Sequential(
+            nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
+            nn.ReLU(),
+            nn.Dropout(cfg["dropout"]),
             nn.Linear(cfg["embed_dim"], cfg["embed_dim"]),
             nn.ReLU(),
             nn.Dropout(cfg["dropout"]),
