@@ -385,22 +385,23 @@ Tasks are ordered by priority. Do not start Task N+1 until Task N is resolved.
 
 ---
 
-### Experiment history and settled findings (~51 experiments to date)
+### Experiment history and settled findings (~54 experiments to date)
 
 Read this before proposing anything — it records what has been tried and what conclusions were drawn. Re-read it every session.
 
-**Current best — exp49** (`672695b`): AUROC = 0.804, AUPRC = 0.282, MAE = 84.9. This is the new baseline. Any KEEP must come from here.
+**Current best — exp49** (`672695b`): AUROC = 0.804, AUPRC = 0.282, MAE = 84.9.
+**Current baseline (post-Task-A fix) — exp52** (`d4a94ec`): AUROC = 0.788, AUPRC = 0.239, MAE = 87.6. Baseline AUROC moved down from exp49 because exp52 retrained Phase-1 with a locked-in Δt fix; the regression is dominated by fresh-Phase-1 noise. Continue building from exp52.
 
 **Confirmed locked in (do not undo or roll back):**
 - `outcome_cap = 9–10` in `phase2_scheduler` — values <6 starve the gradient, >10 destabilise.
 - `bce_only_epochs = 4` (exp28) — stronger LM base before curriculum unlocks helps net.
 - `outcome ramp_epochs = 3` (exp32 reverted) — ramp=1 is a zero-sum tradeoff across outcomes.
-- `early-stop-patience = 10` (exp49) — longer P3 lets the outcome head converge through transient val plateaus. **This is locked.**
-- Phase-3 differential LR (`backbone 1e-6, head 1e-4`) — matches best AUROC across configs.
+- `early-stop-patience = 10` (exp49) — longer P3 lets the outcome head converge through transient val plateaus.
+- Phase-3 differential LR (`backbone 1e-6, head 1e-4`) — matches best AUROC across configs. **Costs ~13 GB of VRAM** (exp18 ~6 GB → exp21 ~19 GB); see Task D.
 - AMP/checkpoint fix (`loss.backward()` inside `torch.autocast`) — gradient stability confirmed (Task 1).
-- Temporal attention bias (Task 4B, exp40) — kept in the baseline.
-- Hierarchy-aware MLM masking (exp38 mechanism; kept in exp40 baseline).
-- Shared hazard head + per-bin bias (exp46) — `hazard_logit[k,b] = outcome_logit[k] + bias[k,b]` — locked.
+- Temporal attention bias (Task 4B, exp40) — kept in the baseline. **Costs ~6 GB of VRAM** (exp39 ~19 GB → exp40 ~25 GB); see Task D.
+- Shared hazard head + per-bin bias (exp46) — `hazard_logit[k,b] = outcome_logit[k] + bias[k,b]`.
+- **Time2Vec log-spaced freq init** (exp52, Task A fix) — frequencies span 12–25k rad / normalized-unit with alternating signs. Δt R² 0.024 → 0.083 (≥ 0.05 bar), `tr_dt` decreases monotonically. **Task A is fixed and locked.**
 
 **Confirmed failing — do not repeat:**
 - `n_layer 4→6`: regression both times.
@@ -408,71 +409,89 @@ Read this before proposing anything — it records what has been tried and what 
 - `outcome_cap > 10` / `< 6`: regression.
 - `outcome_ramp_epochs=0`: destabilises.
 - `time2vec_dim 32→64`: fresh P1 weaker, net regression.
-- Outcome→LM coupling (exp19, exp20, exp33–36, **exp51 even with shared hazard + patience=10**): coupling shifts the AR-generation trajectory distribution away from training and the outcome head ends up miscalibrated on the shifted trajectories. **This approach is structurally incompatible with the generation-based evaluation. Do not retry.**
+- Outcome→LM coupling (exp19, exp20, exp33–36, **exp51 even with shared hazard + patience=10**): coupling shifts the AR-generation trajectory distribution away from training and the outcome head ends up miscalibrated on the shifted trajectories. **Structurally incompatible with the generation-based evaluation. Do not retry.**
 - Wider outcome head (exp24, 2D hidden) / deeper outcome head (exp50, extra hidden layer): both delayed Stage 1 curriculum activation and hurt net AUROC. Outcome-head *capacity* is not the bottleneck.
 - Token-type flag embeddings (exp39): hurt or noise — abandoned.
 - Hazard cap >5 (exp43) and hazard bins=6 (exp45): both worse than exp42.
 - Phase-3 weight_decay=0 (exp26) and ReduceLROnPlateau in P3 (exp27): both hurt.
+- **Phase-1 MLM**: three honest variants all failed.
+  - exp37 (disabled): AUROC -0.015.
+  - exp38 (hierarchy-masked, all four token IDs masked): AUROC -0.035.
+  - exp53 (span-MLM, span=4): AUROC +0.005 but **broke locked Task A** — Δt R² regressed from 0.083 to -0.118, violating Rules #1.
+  - exp54 (running on the pod as of this writing): clean **removal** — `mlm_head`, `forward_with_mlm`, `build_mlm`, loss term, and scheduler entry all deleted. If exp54 lands within ±0.01 of exp52 AUROC, Task B is officially fail-removed. If it drops further, restore the simplest MLM variant (exp37 baseline, cap=1.5, no hierarchy masking) and proceed without trying to "fix" it.
 
-**Active open problem — the three aux tasks are still not fully learning.**
-- Phase-1 **MLM** loss is not meaningfully decreasing across training (exp37 disabled it and AUROC dropped; exp38 made it harder and it dropped more — neither is a fixed task).
-- Phase-1 **Δt** head has Pearson r ≈ 0.44 but R² ≈ 0.005 — predicts the mean slope of admission time, not per-event variance.
-- Phase-2 **outcome** loss is near-flat. The model ranks outcome tokens louder (AUROC ↑) but not more calibrated (AUPRC stuck around 0.25–0.28). The hazard auxiliary helps (exp42, exp46, exp49) but the *direct* outcome loss is still not optimising what evaluation measures (ranking on generated trajectories).
-
-These three are the only tasks open. Everything else is locked or rejected.
+**Active open problem — direct outcome loss is still not learning what evaluation measures.**
+- Phase-2 outcome head soft-BCE loss is near-flat during training. The hazard auxiliary (exp42, exp46) added structure and helped AUROC, but the soft-BCE itself doesn't track the generation-based pooled-window AUROC that `evaluation.py` reports.
+- AUPRC remains low (~0.25–0.28), confirming the head ranks outcome tokens but is not well-calibrated.
+- The remedy — a direct AUROC-proxy ranking loss — has not yet been attempted (Task C).
 
 ---
 
 ## Research directions
 
-Three aux tasks are broken. Fix them — or honestly remove them — one at a time. **No hyperparameter sweeps**; if your only proposed change is a number, you have not understood the task. Re-read this section before every experiment.
+Open tasks below. Work them **in the listed order**. Do not skip ahead. **No hyperparameter sweeps**; if your only proposed change is a number, you have not understood the task. Re-read this section before every experiment.
 
 ### Task 1 — COMPLETE
 Gradient stability. Done.
 
----
+### Task A — Phase-1 Δt head — LOCKED (exp52)
+Time2Vec log-spaced frequency init (12–25k rad/normalized-unit, alternating signs). Δt probe R² 0.024 → 0.083, `tr_dt` monotonically decreasing. Fixed. Locked. Do not undo.
 
-### Task A — Phase-1 Δt head
-
-**Failure mode**: r=0.44 / R²=0.005 — the head predicts a near-constant value (mean inter-event gap) and Pearson is driven by a weak global trend, not by actual per-event variance.
-
-**The training target is already local inter-event Δt** (`abs_ts[:,1:] - abs_ts[:,:-1]`, regressing `log1p(dt_hours)`) — that was previously suspected to be wrong but is fine. The failure is elsewhere.
-
-**Things to investigate / try (pick one per experiment):**
-1. **Gate saturation.** Run `probe_dt_components`. If `dt_gate_head` outputs are saturated (`gate_prob` always ≈1 or always ≈0), gradient is not flowing through the magnitude head — remove the gate entirely and regress `log1p(dt)` directly without gating.
-2. **Magnitude head capacity / bypass.** The current head is a small MLP plus a `time_skip` linear residual on raw `abs_ts`. If `time_skip` weight has grown to dominate while the MLP weight stayed near zero, the head is just learning a linear function of absolute time. Try zero-init *only* the skip and let the MLP learn from the Time2Vec features.
-3. **Time2Vec frequency init.** The current Time2Vec uses default-initialised periodic frequencies. Initialise frequencies on a log-spaced grid spanning minutes → days so the basis can actually represent multi-scale inter-event gaps.
-4. **Replace the head entirely** with a categorical Δt-bin classification (e.g. 16 log-spaced bins, cross-entropy) — easier optimisation surface than scalar regression, and a probe-able distribution per token.
-
-**Pass criterion (fixed task):** `tr_dt` decreases monotonically across Phase-1 (validate by tailing run.log Phase-1 epoch lines) **AND** `probe_dt_head` Pearson r ≥ 0.3 with `pred_std` close to `true_std` and R² ≥ 0.05. Once you hit this, the fix is locked.
-
-**Fail / remove option:** if no variant fixes the head after 2–3 honest attempts, *remove* the Δt loss entirely (set its cap to 0 and delete the head from the embedder) and report the resulting AUROC. A removed broken task is honest; a flat aux loss masquerading as a learning signal is not.
+### Task B — Phase-1 MLM — DECIDED BY EXP54
+exp37 (disabled), exp38 (hierarchy-masked), exp53 (span-MLM) all failed honestly. exp54 is the **fail/remove path**: delete the head and the loss term cleanly. When exp54 finishes:
+- **If AUROC is within ±0.01 of exp52 (0.788):** Task B is fail-removed. Codebase stays as exp54. Proceed to Task D.
+- **If AUROC drops more than 0.01 below exp52:** revert to exp37-style baseline (MLM head present, cap=1.5, no hierarchy masking) and proceed to Task D *with that baseline*. Do not try a fourth MLM variant.
 
 ---
 
-### Task B — Phase-1 MLM
+### Task D — Memory and time efficiency (NEXT — DO BEFORE TASK C)
 
-**Failure mode**: MLM loss is essentially flat across Phase-1 training; the embedder linear probe (Report 7) AUROC has not moved with any MLM variant. exp37 (disabled) and exp38 (hierarchy-masked) both regressed AUROC slightly — disabling was less harmful than the harder version, indicating the current MLM is neither learning nor useful.
+**Why this is now the priority:** peak VRAM jumped from ~6 GB (exp1–18) to ~19 GB at exp21 (Phase-3 differential LR), then to ~25 GB at exp40 (temporal attention bias). The model is currently using almost all of a 48 GB A40. Task C will add a ranking-loss tensor of shape `[B, T, K, pairs]` or similar — without efficiency work first, that experiment will OOM. The same applies to any future architectural addition. Equally, fixing this unlocks running on smaller cards (24 GB, etc.) for the rest of the project.
 
-**Validation method**: tail `run.log` during Phase-1 and confirm `tr_mlm` actually decreases epoch over epoch. If it is flat from epoch 1, the task is broken — not poorly tuned.
+The two memory pressure points are well-localised. Investigate them in this order:
 
-**Things to try (pick one per experiment):**
-1. **Verify the mask is real.** When a position is selected for MLM, *all four* of its token embeddings (`parent_raw`, `concept`, `value`, `position`) and its time encoding must be replaced with `[MASK]` / zero before being fed to the encoder. If any of them leak through, the task is trivial. Audit `forward_with_mlm` in `embedder.py`.
-2. **Masked-span prediction.** Mask a contiguous span of 3–5 tokens at a time instead of single tokens. Forces the model to use real context.
-3. **Predict only the `concept` (or only `value`) head**, not the full `position_id`. The current task may be either too easy (concept) or too hard (position_id with thousands of classes). Pick the right granularity.
-4. **Replace MLM with a next-event classification** auxiliary on the embedder: given the last N tokens, predict the concept class of token N+1. This is closer to what Phase-2 needs from the embedder.
+#### D1 — Temporal attention bias kernel fallback
 
-**Pass criterion (fixed task):** `tr_mlm` decreases visibly across Phase-1 **AND** Report 7 (embedder linear probe) AUROC ≥ 0.60 on at least one complication that previously was at 0.5. Once you hit this, the fix is locked.
+`CausalSelfAttention.forward` adds a learned bias `g(Δt_ij)` to attention. This likely forces `F.scaled_dot_product_attention` (SDPA) off its memory-efficient or flash-attention backend onto the math fallback, which materialises the full `[B, n_head, T, T]` attention-weight matrix in fp32 and saves it for backward. At `B=16, n_head=4, T~500, n_layer=4`, that matches the observed ~6 GB jump from exp39→exp40.
 
-**Fail / remove option:** if no variant fixes it after 2–3 honest attempts, delete the MLM head and loss term entirely. Report the AUROC with MLM removed and lock that as the new baseline. Do not leave a flat-loss MLM in the codebase.
+**Steps:**
+1. Audit how the bias is applied — is it added manually to `q @ k.T` before a hand-written softmax, or passed via `attn_mask=` to SDPA?
+2. Construct the bias as a `[1, n_head, T, T]` (or broadcastable) **bf16** tensor and pass it via `attn_mask=` to `F.scaled_dot_product_attention`. Check whether SDPA selects the memory-efficient backend (use `torch.nn.attention.sdpa_kernel(...)` context manager or set `enable_math=False, enable_flash=True, enable_mem_efficient=True` and verify no fallback warning).
+3. If the bias depends only on per-position values (Δt) and not on i,j independently, factor it as a low-rank approximation that flash-attention will accept — or precompute once per batch and broadcast.
+4. Measure VRAM and step time before and after.
+
+**Pass criterion:** peak VRAM drops by ≥3 GB **and** Phase-2 step time does not regress more than 10%, **and** AUROC stays within ±0.01 of exp52 baseline. Lock the fix.
+
+#### D2 — Phase-3 differential LR activation cost
+
+Storing backbone activations for backward through 4 transformer layers is the dominant cost in Phase 3, accounting for the ~13 GB jump from exp18→exp21. The improvement from differential LR is genuine (matched best AUROC across configs) and remains locked — but the activation-memory cost can be cut without changing the optimisation.
+
+**Steps:**
+1. Apply **gradient checkpointing** to the backbone *in Phase 3* (not just Phase 2). Each `AdaLNBlock` recomputes its forward during backward — trades ~30% compute for ~50% activation memory.
+2. Reduce Phase-3 `batch_size` to half (e.g. 16 → 8) and double `grad_accumulation_steps` so the effective batch stays the same. P3 only has 21 epochs in exp49 — the wall-time cost is small.
+3. Use AMP/bf16 in Phase 3's backward pass too (verify `loss.backward()` is inside `torch.autocast` for P3, not just P2).
+
+**Pass criterion:** peak Phase-3 VRAM drops by ≥5 GB **and** AUROC stays within ±0.01 of exp52 baseline. Lock the fix.
+
+#### D3 — Phase-2 step time
+
+If D1/D2 free up VRAM headroom, also try:
+1. **`torch.compile(model)`** after Phase-1 load, before Phase-2 training. 10–30% throughput on supported PyTorch versions, no accuracy cost. Verify with a smoke test first — `torch.compile` occasionally hits graph-break issues with custom attention.
+2. Check whether `bucket_batching=True` is actually clustering by length effectively at the current sample distribution. If most batches are mostly-padded, switch to a tighter bucket size.
+
+#### D4 — Probe / smoke-test the OOM bound
+
+After D1/D2, attempt one experiment that *adds* a small dummy `[B, T, K]` tensor to the Phase-2 forward (size-matched to what Task C will introduce). Confirm no OOM at the current batch size. This validates that Task C has headroom.
+
+**Stop criterion for Task D:** peak VRAM is ≤ 18 GB across all phases (giving ~30 GB headroom on a 48 GB card and fitting comfortably on 24 GB cards), **and** AUROC is within ±0.01 of exp52, **and** total runtime has not regressed more than 15%. Move on.
 
 ---
 
 ### Task C — Phase-2 outcome loss (survival / ranking loss)
 
-**Failure mode**: outcome loss is near-flat during Phase-2 training even at correct lambda. AUPRC has not recovered above 0.28. The hazard auxiliary (exp42, exp46, exp49) added structure and helped AUROC, but the *outcome-head soft-BCE* itself is still not optimising what evaluation measures.
+**Failure mode**: outcome head soft-BCE loss is near-flat during Phase-2 training even at correct lambda. AUPRC has not recovered above 0.28. The hazard auxiliary (exp42, exp46, exp49) added structure and helped AUROC, but the *outcome-head soft-BCE* itself is still not optimising what evaluation measures.
 
-**This is the only task the agent has NOT yet honestly attempted.** Coupling (exp33–exp51) was repeatedly tried instead — coupling is rejected. **The survival / pairwise ranking loss has not been implemented yet.** Do it.
+**This is the only learning-task the agent has NOT yet honestly attempted.** Coupling (exp33–exp51) was repeatedly tried instead — coupling is rejected. **The survival / pairwise ranking loss has not been implemented yet.** Do it after Task D unblocks the VRAM budget.
 
 **The mechanism:**
 For each outcome k and each patient, sample positive positions (within the eval window of the outcome) and negative positions (outside the window, or any position from a patient where k never occurs). Apply a pairwise margin loss on `outcome_head[k]` logits:
@@ -489,7 +508,7 @@ This is a direct AUROC proxy — minimising it directly raises the probability t
 3. Watch `tr_ranking` and `tr_outcome` both during Phase-2 training. If `tr_ranking` decreases visibly and AUROC + AUPRC improve, the task is alive.
 4. **Replacement second (only if additive works)**: drop soft-BCE entirely and run with ranking-only outcome loss. Cleaner gradient, no `tau` / `cap` calibration coupling.
 
-**Pass criterion (fixed task):** `tr_ranking` decreases across Phase-2 **AND** AUROC ≥ 0.804 (current best) **AND** AUPRC ≥ 0.282. Once you hit this, the ranking loss is locked in.
+**Pass criterion (fixed task):** `tr_ranking` decreases across Phase-2 **AND** AUROC ≥ 0.804 (the exp49 mark) **AND** AUPRC ≥ 0.282. Once you hit this, the ranking loss is locked in.
 
 **Fail option:** if both additive and replacement variants fail to improve AUROC after honest attempts, document the failure precisely (what `tr_ranking` did, what AUROC did) and remove the ranking loss. **Do not** fall back to coupling — that is rejected.
 
@@ -497,17 +516,18 @@ This is a direct AUROC proxy — minimising it directly raises the probability t
 
 ### Order and rules
 
-1. Work the three tasks **in order: A, B, C**. Do not move to the next until the current one is either fixed and locked or honestly removed.
+1. Work the open tasks **in order: finish B (exp54) → D (efficiency) → C (ranking loss)**. Do not move to the next until the current one is either fixed and locked or honestly removed. Task A is locked.
 2. Once a task is fixed (loss decreases + probe passes the bar above), it is **locked**. The codebase moves forward with the fix in place. You may not silently regress to a pre-fix version even if it gives a higher AUROC — variance from random init is ±0.01 and does not justify rolling back a real structural fix. You may *replace* a fixed task with a different method, or *remove* it entirely (and report the consequence) — both are fine.
-3. **No hyperparameter sweeps.** No "tune LR / cap / ramp / patience / batch size" experiments. Every experiment must change *what is being learned* or *how it is being learned*, not what number is in the config.
+3. **No hyperparameter sweeps.** No "tune LR / cap / ramp / patience / batch size" experiments. Every experiment must change *what is being learned*, *how it is being learned*, or *how efficiently it is being computed* (Task D) — not just what number is in the config.
 4. **Re-read this `program.md` and `diagnose.py` output between every experiment.** If you skip this, you will drift.
 5. **Smoke test (sample=50, 1 epoch per phase) before every full run.** Confirm the summary block appears. Pipeline crashes on full runs are wasted hours.
+6. **Memory and time efficiency are first-class research targets.** Adding code that genuinely improves either, without hurting AUROC, is a KEEP — same status as an AUROC improvement. Removing code while maintaining performance is always a win.
 
 ### When to stop
 
 Stop and report to the user when:
-- All three tasks (A, B, C) are either fixed and locked, or have been honestly attempted and removed, **and**
+- Tasks B, D, and C are each either fixed and locked, or have been honestly attempted and removed/concluded, **and**
 - The only remaining levers are hyperparameter tuning.
 
-Write a final summary: the state of each task (fixed / removed / failed), the current best AUROC/AUPRC/MAE, and what is still open.
+Write a final summary: the state of each task (fixed / removed / failed), the current best AUROC/AUPRC/MAE, peak VRAM, and what is still open.
 
