@@ -1073,16 +1073,15 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 # Positive positions: outcome_targets > 0 (outcome occurs within horizon).
                 # Negative positions: outcome_targets == 0 (no outcome within horizon).
                 # Both masked by non-pad. Independent of soft-BCE — direct AUROC signal.
-                lam_rank = lambdas.get("ranking", 0.0)
-                if lam_rank > 0.0:
-                    _rank_pos = (outcome_targets > 0.0) & valid_pos
-                    _rank_neg = (outcome_targets == 0.0) & valid_pos
-                    loss_ranking_raw = pairwise_ranking_loss(
-                        outcome_pred, _rank_pos, _rank_neg,
-                    )
-                else:
-                    loss_ranking_raw = outcome_pred.new_tensor(0.0)
-                loss_ranking = lam_rank * loss_ranking_raw
+                # Always compute the raw loss so the lambda scheduler can calibrate it
+                # at the stage-1-unlock-minus-1 epoch (gating on lam > 0 created a
+                # deadlock — exp55 ranking stayed pending across all 50 P2 epochs).
+                _rank_pos = (outcome_targets > 0.0) & valid_pos
+                _rank_neg = (outcome_targets == 0.0) & valid_pos
+                loss_ranking_raw = pairwise_ranking_loss(
+                    outcome_pred, _rank_pos, _rank_neg,
+                )
+                loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
                 loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_hazard + loss_ranking
