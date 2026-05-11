@@ -44,17 +44,19 @@ TRAINING_SETTINGS = {
     "phase2_bce_window_hours": 12.0,
 
     # Phase-1 auxiliary scheduler.
-    # Single stage: dt activates after bce_only_epochs of pure BCE training.
+    # Single stage: mlm and dt activate after bce_only_epochs of pure BCE training.
     # Lambda max is calibrated ONCE from training losses at the first active epoch,
     # then kept fixed. Weighted contribution is capped to `fraction` of training BCE.
-    # (MLM removed in exp54 — Task B fail/remove after exp37/exp38/exp53.)
+    # Increase fractions if loss doesn't change during training (e.g. if MLM loss is very small, increase its fraction to give it more weight).
     "phase1_scheduler": {
         "bce_only_epochs": 3,     # Run BCE alone first so calibration uses a trained model
         "aux_fraction_caps": {
+            "mlm": 1.50,  # Phase-1 MLM cap; trivially easy (no attention in P1) but neutral as regularizer
             "dt":  0.40,  # Time regression auxiliary capped to 40% of BCE at calibration epoch
         },
-        "order": [["dt"]],  # Single stage: dt active after bce_only_epochs
+        "order": [["mlm", "dt"]],  # Single stage: both active together after bce_only_epochs
         "ramp_epochs": {
+            "mlm": 0,  # No ramp (immediate full lambda after calibration)
             "dt":  0,
         },
     },
