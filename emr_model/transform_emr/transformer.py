@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+from torch.nn.attention import sdpa_kernel, SDPBackend
 from pathlib import Path
 from tqdm.auto import tqdm
 
@@ -98,10 +99,21 @@ class CausalSelfAttention(nn.Module):
 
             # Task 4A: temporal bias matrix g(Δt_ij) = w*log1p(|Δt_ij|_hours) + b.
             # Only computed in prefill/training paths (past_kv is None) where full abs_ts [B,T] is available.
+            # Compute log1p in BF16 with autocast disabled so the saved-for-backward tensor
+            # stays BF16 (PyTorch autocast otherwise promotes log1p to FP32, doubling memory
+            # for the [B, T, T] intermediate at every layer).
             time_bias = None
             if abs_ts is not None and past_kv is None:
-                dt_hours = (abs_ts.unsqueeze(-1) - abs_ts.unsqueeze(-2)) * 336.0  # [B, T, T]
-                time_bias = (self.time_bias_w * torch.log1p(dt_hours.abs()) + self.time_bias_b).unsqueeze(1)  # [B, 1, T, T]
+                with torch.autocast(device_type=x.device.type, enabled=False):
+                    dt_hours = ((abs_ts.unsqueeze(-1) - abs_ts.unsqueeze(-2)) * 336.0).to(q.dtype).abs()  # [B, T, T]
+                    dt_log   = torch.log1p(dt_hours)                                                       # BF16
+                    time_bias = (self.time_bias_w.to(q.dtype) * dt_log + self.time_bias_b.to(q.dtype)).unsqueeze(1)  # [B, 1, T, T]
+
+            # SDPA backend preference: mem-efficient first (avoids materialising the
+            # full [B, h, T, T] attention-weight matrix for backward), math as fallback.
+            # Flash is excluded because it does not accept attn_mask (we always have one
+            # in training due to padding + temporal bias).
+            _sdpa_backends = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
             # ── KV-cache decode path ──────────────────────────────────────────
             if past_kv is not None:
@@ -117,15 +129,17 @@ class CausalSelfAttention(nn.Module):
                     pad_m     = (~key_pad_mask).unsqueeze(1).unsqueeze(2)    # [B,1,1,T_kv]
                     attn_mask = torch.zeros(B, 1, T, T_kv, device=x.device, dtype=q.dtype)
                     attn_mask.masked_fill_(pad_m, float("-inf"))
-                    attn = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=attn_mask, is_causal=False,
-                        dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    )
+                    with sdpa_kernel(_sdpa_backends):
+                        attn = F.scaled_dot_product_attention(
+                            q, k, v, attn_mask=attn_mask, is_causal=False,
+                            dropout_p=self.attn_dropout.p if self.training else 0.0,
+                        )
                 else:
-                    attn = F.scaled_dot_product_attention(
-                        q, k, v, attn_mask=None, is_causal=False,
-                        dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    )
+                    with sdpa_kernel(_sdpa_backends):
+                        attn = F.scaled_dot_product_attention(
+                            q, k, v, attn_mask=None, is_causal=False,
+                            dropout_p=self.attn_dropout.p if self.training else 0.0,
+                        )
 
             # ── Normal (prefill / training) path ─────────────────────────────
             elif key_pad_mask is not None:
@@ -151,14 +165,15 @@ class CausalSelfAttention(nn.Module):
                 attn_mask = torch.zeros_like(combined_mask, dtype=q.dtype).masked_fill(combined_mask, float("-inf"))
 
                 if time_bias is not None:
-                    attn_mask = attn_mask + time_bias.to(q.dtype)
+                    attn_mask = attn_mask + time_bias
 
-                attn = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=attn_mask,
-                    dropout_p=self.attn_dropout.p if self.training else 0.0,
-                    is_causal=False  # We handled causality manually in the mask
-                )
+                with sdpa_kernel(_sdpa_backends):
+                    attn = F.scaled_dot_product_attention(
+                        q, k, v,
+                        attn_mask=attn_mask,
+                        dropout_p=self.attn_dropout.p if self.training else 0.0,
+                        is_causal=False  # We handled causality manually in the mask
+                    )
             else:
                 # --- Optimized Path (No padding, e.g. Inference) ---
                 if time_bias is not None:
@@ -166,13 +181,14 @@ class CausalSelfAttention(nn.Module):
                     causal_mask = torch.ones((T, T), device=x.device, dtype=torch.bool).triu(1).view(1, 1, T, T)
                     attn_mask = torch.zeros(B, 1, T, T, device=x.device, dtype=q.dtype)
                     attn_mask.masked_fill_(causal_mask, float("-inf"))
-                    attn_mask = attn_mask + time_bias.to(q.dtype)
-                    attn = F.scaled_dot_product_attention(
-                        q, k, v,
-                        attn_mask=attn_mask,
-                        dropout_p=self.attn_dropout.p if self.training else 0.0,
-                        is_causal=False
-                    )
+                    attn_mask = attn_mask + time_bias
+                    with sdpa_kernel(_sdpa_backends):
+                        attn = F.scaled_dot_product_attention(
+                            q, k, v,
+                            attn_mask=attn_mask,
+                            dropout_p=self.attn_dropout.p if self.training else 0.0,
+                            is_causal=False
+                        )
                 else:
                     # Here we can let SDPA handle the causal mask efficiently
                     attn = F.scaled_dot_product_attention(
@@ -499,9 +515,14 @@ class GPT(nn.Module):
         x = self.drop(x)
 
         # 2. Blocks with Conditioning (AdaLN)
-        # We pass cond_emb to every block to modulate the normalization layers
+        # We pass cond_emb to every block to modulate the normalization layers.
+        # Gradient checkpointing is gated on torch.is_grad_enabled() rather than
+        # self.training so Phase-3 fine-tune (backbone in eval() but params still
+        # requires_grad=True with backbone_lr_factor>0) also gets the activation-memory
+        # benefit. With dropout off (eval mode), recomputation is deterministic.
+        _ckpt_active = torch.is_grad_enabled() and self.use_checkpoint
         for blk in self.blocks:
-            if self.training and self.use_checkpoint:
+            if _ckpt_active:
                 # use_reentrant=True: reentrant checkpoint, no tensor-count consistency check.
                 # use_reentrant=False triggers CheckpointError on this model regardless of AMP
                 # state (confirmed: amp=True for all 8 forward+recomp calls, counts still differ).
@@ -1273,6 +1294,8 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     _TAU     = training_settings.get("outcome_decay_tau_hours", 12.0) / _ABS_TS_SCALE
     _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
 
+    use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
         model.eval()
@@ -1286,14 +1309,18 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
                 batch = {k: v.to(device) for k, v in batch.items()}
 
-                logits, _, outcome_logits, _, hazard_logits_p3 = model(
-                    parent_raw_ids=batch["parent_raw_ids"],
-                    concept_ids=batch["concept_ids"],
-                    value_ids=batch["value_ids"],
-                    position_ids=batch["position_ids"],
-                    abs_ts=batch["abs_ts"],
-                    context_vec=batch["context_vec"],
-                )
+                # BF16 autocast wraps the forward (and gradient-checkpointed recompute
+                # inside GPT.forward also re-enters autocast for backward). Matches
+                # Phase-2 precision regime and cuts activation memory roughly in half.
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    logits, _, outcome_logits, _, hazard_logits_p3 = model(
+                        parent_raw_ids=batch["parent_raw_ids"],
+                        concept_ids=batch["concept_ids"],
+                        value_ids=batch["value_ids"],
+                        position_ids=batch["position_ids"],
+                        abs_ts=batch["abs_ts"],
+                        context_vec=batch["context_vec"],
+                    )
                 logits         = logits.float()
                 outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
 
