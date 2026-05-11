@@ -74,14 +74,14 @@ TRAINING_SETTINGS = {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "outcome": 10.00,   # Confirmed optimal at bce_only=4
-            "hazard":  7.50,    # Discrete-time survival head; 75% of outcome cap (exp43: cap 5.0→7.5)
+            "hazard":  5.00,    # Discrete-time survival head; half of outcome cap (exp43 confirmed peak)
         },
         "order": [["ce", "dt"], ["outcome", "hazard"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
             "outcome": 3,  # Ramp over 3 epochs (confirmed optimal in exp30)
-            "hazard":  3,  # Same ramp as outcome (activates together)
+            "hazard":  1,  # Faster ramp than outcome (exp44: 3→1; hazard converges faster, more full-active epochs before P2 end)
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
