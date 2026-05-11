@@ -605,9 +605,77 @@ This is a direct AUROC proxy — minimising it directly raises the probability t
 
 ### When to stop
 
-Stop and report to the user when:
-- Tasks B, D, and C are each either fixed and locked, or have been honestly attempted and removed/concluded, **and**
-- The only remaining levers are hyperparameter tuning.
+**Do NOT stop after B/D/C are resolved.** When the scripted list above is
+exhausted, switch into "open-ended" mode (next section) and keep the loop
+going.
 
-Write a final summary: the state of each task (fixed / removed / failed), the current best AUROC/AUPRC/MAE, peak VRAM, and what is still open.
+Stop and report to the user ONLY when:
+- B, D, and C are each fixed/locked or honestly attempted and removed/concluded,
+- Open-ended experiments (next section) have also been honestly attempted, **and**
+- The only remaining levers are hyperparameter tuning *and* you have no
+  architectural / auxiliary-task / inference-fix idea worth trying.
+
+Write a final summary: the state of each task (fixed / removed / failed), the
+current best AUROC/AUPRC/MAE, peak VRAM, and what is still open.
+
+---
+
+## Open-ended directions (after B/D/C are resolved)
+
+Two priorities, ordered:
+
+### Priority 1 — Add learnable proper auxiliaries
+
+"Proper" = the aux loss visibly decreases across epochs AND a probe of its
+head shows it learned something non-trivial (Δt R², AUROC, etc.). Same bar as
+Rules of the road #1. A new aux that does not learn is noise dressed as
+supervision — same fate as MLM (exp54-removed). Candidates worth proposing:
+- Next-event-token prediction (a focused CE on the *immediately* next token,
+  separate from the multi-hot temporal BCE window).
+- Contrastive over event types (pull tokens in the same concept group
+  closer in embedding space, push others apart).
+- Survival / hazard variants beyond the current discrete-time bins
+  (continuous-time intensity, competing-risks formulation, etc.).
+- Trajectory-ordering tasks (predict whether two events in a patient's
+  history are in the correct order — gives Phase-1 a sequence signal).
+
+For every new aux: log `tr_<name>` per epoch and confirm a probe before
+declaring KEEP. If `tr_<name>` is flat, remove it; do not patch with cap
+tweaks.
+
+### Priority 2 — Improve AUROC and MAE on specific weaknesses
+
+**RELEASE_EVENT is weak.** AUROC ~0.61 vs CARDIO 0.87, DEATH 0.97. It's a
+terminal outcome for *healthy* patients — distinct distribution from
+clinical complications. Experiments that explicitly help this outcome are in
+scope: contrastive separation of healthy-discharge trajectories from
+complication-trajectories, a dedicated discharge-prediction head with its
+own loss, RELEASE-conditioned pos_weight in the outcome BCE, etc.
+
+**Inference termination is broken.** Eval logs show ~65% of generated
+trajectories hit `max_len=500` without emitting a natural terminal token
+(DEATH/RELEASE) → forced terminal injected, generated streams clipped to a
+uniform length. This corrupts the AR-generation distribution that
+`evaluation.py` depends on. Candidates:
+- Heavier `pos_weight` on terminal tokens in Phase-2 BCE.
+- A "trajectory-length / will-terminate" classification head with its own
+  loss in Phase-2.
+- Audit `inference.py`'s legality state machine: maybe terminals are being
+  suppressed at late steps by `compute_legality_masks_tf` even when they
+  should be legal.
+- Repetition-penalty or temperature adjustment in `generate(...)` is **not**
+  a structural fix — only attempt if you have evidence the model *wants* to
+  emit a terminal but generation logic suppresses it.
+
+### Loop discipline reminder
+
+ALWAYS:
+1. Re-read `program.md` between every experiment.
+2. Append the completed run to `results.tsv` immediately after the run
+   finishes, BEFORE moving to the next experiment. Never batch up logging.
+3. Smoke-test → commit → full run → log → KEEP/DISCARD per rules above.
+4. One architectural idea per commit (Task D's compound D1+D2 commit was
+   an exception because both fixes were needed to fit the 24 GB A5000).
+
+The user is away and trusts the loop. Keep it running.
 
