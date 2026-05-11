@@ -28,7 +28,7 @@ TRAINING_SETTINGS = {
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
     "lr_warmup_epochs": 5,
-    "early-stop-patience": 5,
+    "early-stop-patience": 10,  # exp49: 5→10; P3 in exp46 cut short at 9 ep (vs exp42's 25) — shared hazard arch plateaus val faster, need more patience
     "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,
@@ -73,7 +73,7 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 12.00,   # exp48: 10→12 with shared hazard arch — push outcome harder since outcome head now gets hazard gradient too
+            "outcome": 10.00,   # Confirmed peak across exp30/exp42/exp46; exp48 cap=12 hurt
             "hazard":  5.00,    # Discrete-time survival head; half of outcome cap (exp43 confirmed peak)
         },
         "order": [["ce", "dt"], ["outcome", "hazard"]],
