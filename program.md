@@ -173,34 +173,64 @@ commit	outcome_auroc	outcome_auprc	onset_mae_hrs	peak_vram_gb	status	description
 
 **LOOP FOREVER — do NOT stop to ask for permission. The user is away.**
 
-**Before the first experiment of any session: run the gradient diagnosis below.**
+**Before every experiment: re-read this `program.md`.** The task list and rules are updated between sessions. If you operate from memory you will drift back toward hyperparameter sweeps. Re-read the *Research directions* section in full at the start of every iteration.
+
+**Before every full run: run a smoke test** (sample=50, 1 epoch per phase). If the smoke test crashes, fix the bug before burning GPU hours on a 90-minute run.
+
+**Before every experiment: run `diagnose.py` on the current best checkpoint** to inspect what is actually broken in the model you are trying to improve. Propose your experiment from the diagnostic output, not from speculation.
 
 ```
 LOOP:
-1. Inspect git state (branch, last commit, results.tsv)
-2. cd emr_model && python -m transform_emr.diagnose > ../diag.log 2>&1 && cd ..
-3. Read diag.log. Gate on these questions before proposing anything:
-   a. Report 4 — what are the actual lambda_max values for ce and outcome?
-      Any lambda_max < 0.001 is near-silent — fix its cap before any architecture work.
+1. RE-READ program.md (especially "Research directions" and "Rules of the road").
+2. Inspect git state (branch, last commit, results.tsv tail).
+3. cd emr_model && python -m transform_emr.diagnose > ../diag.log 2>&1 && cd ..
+4. Read diag.log. Gate on these questions before proposing anything:
+   a. Report 4 — what are the actual lambda_max values for ce, outcome, hazard?
+      Any lambda_max < 0.001 is near-silent — that aux loss is not learning.
    b. Report 5 — where do outcome tokens rank by grad/occ?
       Bottom half of vocab = the loss is not reaching them.
    c. Report 2 — what is sigmoid[pos] - sigmoid[neg] (logit separation)?
       < 0.05 means the model barely distinguishes outcome-positive from negative positions.
-   d. PROBE Δt HEAD — what is Pearson r?
+   d. PROBE Δt HEAD — what is Pearson r and R²?
       r < 0.1 or pred_std < 0.05h means the time head has collapsed to a constant.
-   e. PROBE OUTCOME HEAD LABEL ALIGNMENT — any flip=True rows?
-      A flip means the outcome head predicts higher logits when the outcome is ABSENT.
-      That is a sign error — fix label construction before changing anything else.
-   If any of (a–e) are unhealthy, fix that first.
-4. Propose and implement ONE experiment targeting the highest-priority issue.
-5. git commit
-6. python api.py > run.log 2>&1
-7. grep "^outcome_auroc:\|^outcome_auprc:\|^onset_mae_hrs:\|^peak_vram_mb:" run.log
-8. If empty: crash — tail -n 50 run.log, fix once if it's a bug, else log CRASH and move on
-9. Append to results.tsv
-10. If outcome_auroc improved: KEEP
-11. If equal or worse: DISCARD — git reset --hard HEAD~1
+   e. PROBE OUTCOME HEAD LABEL ALIGNMENT — any flip=True rows? Fix sign error first.
+   Inspect the Phase-1 training log too: is `tr_mlm` and `tr_dt` actually decreasing
+   across epochs? If a loss is flat across all of Phase-1, the corresponding head is
+   not learning — that is the failure to fix, not lambda calibration.
+5. Propose ONE experiment that targets the highest-priority broken aux task. No
+   hyperparameter-only changes. If your only idea is "tune X up/down", stop and
+   re-read Research directions for a structural alternative.
+6. SMOKE TEST: set sample=50, epochs=1, run `python api.py > smoke.log 2>&1`.
+   Confirm the summary block appears. Restore the full config.
+7. git commit (description: what changed + diagnostic that motivated it + what you expect)
+8. python api.py > run.log 2>&1
+9. grep "^outcome_auroc:\|^outcome_auprc:\|^onset_mae_hrs:\|^peak_vram_mb:" run.log
+10. If empty: crash — tail -n 50 run.log, fix once if it's a bug, else log CRASH and move on.
+11. Append to results.tsv with a 3-part description (change / diagnostic / observation).
+12. Decide KEEP vs DISCARD using the rules below.
 ```
+
+### Rules of the road (KEEP / DISCARD)
+
+These rules supersede a simple AUROC comparison.
+
+1. **A fixed auxiliary task cannot be un-fixed.** Once a Phase-1 or Phase-2 aux loss
+   genuinely starts decreasing across training (where it was previously flat), and a
+   probe confirms the head has learned something non-trivial (e.g. Δt Pearson r ≥ 0.3,
+   MLM probe AUROC ≥ 0.6), **that fix is locked in**. You cannot roll the codebase back
+   to a version where that task is broken, even if AUROC dips slightly. AUROC variance
+   from random init alone is ~±0.01 — that is not a reason to undo a real structural fix.
+2. A fixed aux task can be **replaced** (different loss / different target) or **removed
+   entirely** (delete the head and its loss term) — both are honest changes. See exp37
+   (disable MLM) and exp38 (replace MLM masking) for examples of legitimate removals/
+   replacements. What is forbidden is silently regressing to a known-broken version
+   while pretending it is a new experiment.
+3. **AUROC is still the primary KEEP signal** once aux tasks are healthy. Among
+   experiments where the aux tasks are all in their fixed state, KEEP the one with
+   higher AUROC. If two are tied within ±0.005, prefer the simpler one (less code).
+4. **CRASH** = log the row with NaNs and `DISCARD`, then `git reset --hard HEAD~1`.
+5. **DISCARD** = `git reset --hard HEAD~1` so the next experiment starts from the
+   current best, not from the failed one.
 
 **Embedder caching**: Phase 1 is skipped automatically when the checkpoint matches `(embed_dim, time2vec_dim, ctx_dim)`. Verify "Config unchanged — loading cached embedder" appears in run.log to confirm the cache was hit.
 
@@ -355,136 +385,129 @@ Tasks are ordered by priority. Do not start Task N+1 until Task N is resolved.
 
 ---
 
-### Task 1 — Validate Phase-2 gradient stability
+### Experiment history and settled findings (~51 experiments to date)
 
-**Status**: the underlying `CheckpointError` fix has already been applied (`loss.backward()` wrapped inside `torch.autocast` so gradient checkpointing recomputes under the same AMP context as the forward pass). This task is to confirm the fix is working and that gradients are stable in practice.
+Read this before proposing anything — it records what has been tried and what conclusions were drawn. Re-read it every session.
 
-**What to verify on the first training run**:
-- No `CheckpointError` in run.log
-- No NaN or inf in any loss term across epochs (scan run.log for `nan`, `inf`, `loss=nan`)
-- Phase-2 val loss curve is smooth and decreasing — not spiking then recovering
-- `phase2_best_val` is meaningfully lower than the starting loss
+**Current best — exp49** (`672695b`): AUROC = 0.804, AUPRC = 0.282, MAE = 84.9. This is the new baseline. Any KEEP must come from here.
 
-**If gradients are still unstable** after the autocast fix:
-- Check whether gradient clipping is active (`nn.utils.clip_grad_norm_`) and at what threshold. If the norm is being clipped every step, the model is at the clipping boundary — reduce LR or tighten the clip.
-- Scan run.log for per-epoch grad norm logs. A norm that is flat and high (e.g. consistently 5–10×) means clipping is masking explosion, not curing it.
-- Check loss components individually: if `outcome_loss` or `ce_loss` spikes while `bce_loss` is stable, the aux loss itself has a numerical issue (e.g. log(0) in CE or extreme logits feeding into BCE).
+**Confirmed locked in (do not undo or roll back):**
+- `outcome_cap = 9–10` in `phase2_scheduler` — values <6 starve the gradient, >10 destabilise.
+- `bce_only_epochs = 4` (exp28) — stronger LM base before curriculum unlocks helps net.
+- `outcome ramp_epochs = 3` (exp32 reverted) — ramp=1 is a zero-sum tradeoff across outcomes.
+- `early-stop-patience = 10` (exp49) — longer P3 lets the outcome head converge through transient val plateaus. **This is locked.**
+- Phase-3 differential LR (`backbone 1e-6, head 1e-4`) — matches best AUROC across configs.
+- AMP/checkpoint fix (`loss.backward()` inside `torch.autocast`) — gradient stability confirmed (Task 1).
+- Temporal attention bias (Task 4B, exp40) — kept in the baseline.
+- Hierarchy-aware MLM masking (exp38 mechanism; kept in exp40 baseline).
+- Shared hazard head + per-bin bias (exp46) — `hazard_logit[k,b] = outcome_logit[k] + bias[k,b]` — locked.
 
----
+**Confirmed failing — do not repeat:**
+- `n_layer 4→6`: regression both times.
+- `bce_window 12→6h` and `12→24h`: both worse.
+- `outcome_cap > 10` / `< 6`: regression.
+- `outcome_ramp_epochs=0`: destabilises.
+- `time2vec_dim 32→64`: fresh P1 weaker, net regression.
+- Outcome→LM coupling (exp19, exp20, exp33–36, **exp51 even with shared hazard + patience=10**): coupling shifts the AR-generation trajectory distribution away from training and the outcome head ends up miscalibrated on the shifted trajectories. **This approach is structurally incompatible with the generation-based evaluation. Do not retry.**
+- Wider outcome head (exp24, 2D hidden) / deeper outcome head (exp50, extra hidden layer): both delayed Stage 1 curriculum activation and hurt net AUROC. Outcome-head *capacity* is not the bottleneck.
+- Token-type flag embeddings (exp39): hurt or noise — abandoned.
+- Hazard cap >5 (exp43) and hazard bins=6 (exp45): both worse than exp42.
+- Phase-3 weight_decay=0 (exp26) and ReduceLROnPlateau in P3 (exp27): both hurt.
 
-### Task 2 — Diagnose and fix Phase-1 MLM and Δt auxiliary tasks
+**Active open problem — the three aux tasks are still not fully learning.**
+- Phase-1 **MLM** loss is not meaningfully decreasing across training (exp37 disabled it and AUROC dropped; exp38 made it harder and it dropped more — neither is a fixed task).
+- Phase-1 **Δt** head has Pearson r ≈ 0.44 but R² ≈ 0.005 — predicts the mean slope of admission time, not per-event variance.
+- Phase-2 **outcome** loss is near-flat. The model ranks outcome tokens louder (AUROC ↑) but not more calibrated (AUPRC stuck around 0.25–0.28). The hazard auxiliary helps (exp42, exp46, exp49) but the *direct* outcome loss is still not optimising what evaluation measures (ranking on generated trajectories).
 
-**Symptom**: MLM and Δt loss do not decrease during Phase-1 training. Adjusting calibrated weights had no effect. Either the tasks are architecturally mis-wired or the gradient signal is structurally wrong.
-
-**Diagnose first** — before changing anything:
-- **PROBE Δt HEAD** in diag.log: Pearson r and R² between predicted and actual inter-event gaps. r < 0.1 or pred_std < 0.05h = the time head outputs a constant. It has learned nothing.
-- **PROBE outcome head label alignment** and **Report 7** (embedder linear probe): if the Phase-1 embeddings carry no outcome signal (probe AUROC ≈ 0.5), the auxiliary tasks are not helping the embedding space.
-- **`probe_dt_components`** (callable directly, not in standard run): check `gate_prob` distribution. If > 95% of gate probabilities are > 0.99 or < 0.01, the gate is saturated — Δt head has degenerated to always-on or always-off.
-
-**Investigate in this order**:
-
-**A. Δt head wiring**: confirm that the MSE loss is computed against `abs_ts[:, 1:]` (true next timestamp) and that the gradient actually flows back. If the gate is always-on, the gate branch is never trained. If `abs_t_pred` is being computed from the wrong variable, MSE will be noisy random regardless of learning.
-
-**B. MLM masking**: verify that masked token positions are zeroed/replaced in the input embedding *before* the forward pass, and that the loss is computed **only** at masked positions. If unmasked positions leak into the MLM target, the task teaches the model to copy input rather than predict from context — it will appear to converge to a low loss but learn nothing.
-
-**C. Task conflict check**: temporarily disable MLM or Δt in Phase-1 (set their lambda caps to 0) and check if the remaining BCE loss improves. If removing an auxiliary improves BCE, the task is hurting Phase-1 rather than helping. In that case, the auxiliary should either be fixed or removed.
-
-**D. If both tasks are broken**: consider replacing them with simpler, verifiably correct alternatives:
-- Δt regression → Δt bin classification (e.g. 8 bins covering 0–336h): more stable gradient, easier to verify.
-- MLM → next-token prediction on a masked subsequence (i.e. standard causal LM on a local window): better aligned with Phase-2 objective.
+These three are the only tasks open. Everything else is locked or rejected.
 
 ---
 
-### Task 3 — Make outcome loss move in Phase-2; implement outcome→LM coupling
+## Research directions
 
-This has two sub-tasks. Do them in order.
+Three aux tasks are broken. Fix them — or honestly remove them — one at a time. **No hyperparameter sweeps**; if your only proposed change is a number, you have not understood the task. Re-read this section before every experiment.
 
-#### 3a — Confirm and address outcome gradient starvation
+### Task 1 — COMPLETE
+Gradient stability. Done.
 
-After Task 1 is resolved, run a full training pass and check diag.log:
-- **Report 4**: if `lambda_outcome < 0.001`, the gradient is near-silent. This is the primary suspect.
-- **Report 5**: if outcome tokens rank in the bottom half by `grad/occ`, the loss is not reaching them even if the lambda looks reasonable.
-- **Report 2**: if logit separation < 0.05, the LM head hasn't learned outcome timing at all.
+---
 
-If starvation persists after fixing Task 1, increase `aux_fraction_caps["outcome"]` in `phase2_scheduler`. Try 0.5 → 2.0 → 5.0 in separate experiments, checking Report 4 lambdas each time to confirm the actual lambda_max changed proportionally.
+### Task A — Phase-1 Δt head
 
-If increasing the cap does not change the lambda (because BCE at calibration epoch is very small), the calibration formula `lambda_max = cap × bce / aux` is the bottleneck. In that case, consider bypassing calibration for the outcome term and setting an absolute lambda directly in `TRAINING_SETTINGS` — this breaks the relative-scale dependency.
+**Failure mode**: r=0.44 / R²=0.005 — the head predicts a near-constant value (mean inter-event gap) and Pearson is driven by a weak global trend, not by actual per-event variance.
 
-#### 3b — Implement outcome→LM coupling (after 3a and Task 1 are stable)
+**The training target is already local inter-event Δt** (`abs_ts[:,1:] - abs_ts[:,:-1]`, regressing `log1p(dt_hours)`) — that was previously suspected to be wrong but is fine. The failure is elsewhere.
 
-**The problem this solves**: the outcome head and LM head are uncoupled siblings. Both read from the same hidden state `x`, but the LM head has no architectural path to the outcome head's signal. The outcome head may have a good AUROC (0.6–0.9) — meaning it IS calibrated — yet the LM head independently must rediscover "outcome is imminent" through BCE/CE dominated by 30+ ambient tokens per position. This is an architectural gap, not a hyperparameter problem.
+**Things to investigate / try (pick one per experiment):**
+1. **Gate saturation.** Run `probe_dt_components`. If `dt_gate_head` outputs are saturated (`gate_prob` always ≈1 or always ≈0), gradient is not flowing through the magnitude head — remove the gate entirely and regress `log1p(dt)` directly without gating.
+2. **Magnitude head capacity / bypass.** The current head is a small MLP plus a `time_skip` linear residual on raw `abs_ts`. If `time_skip` weight has grown to dominate while the MLP weight stayed near zero, the head is just learning a linear function of absolute time. Try zero-init *only* the skip and let the MLP learn from the Time2Vec features.
+3. **Time2Vec frequency init.** The current Time2Vec uses default-initialised periodic frequencies. Initialise frequencies on a log-spaced grid spanning minutes → days so the basis can actually represent multi-scale inter-event gaps.
+4. **Replace the head entirely** with a categorical Δt-bin classification (e.g. 16 log-spaced bins, cross-entropy) — easier optimisation surface than scalar regression, and a probe-able distribution per token.
 
-Additionally, at positions where the next token is an outcome/terminal event, the multi-hot BCE targets contain ~30 co-occurring window tokens. The model is never given a clear unambiguous signal: "the next token is RELEASE, rank it above everything else." Fix 1 (one-hot override in multi-hot targets) addresses this — it is already implemented in `utils.py` and `embedder.py`. The coupling (Fix 2) addresses the head separation.
+**Pass criterion (fixed task):** `tr_dt` decreases monotonically across Phase-1 (validate by tailing run.log Phase-1 epoch lines) **AND** `probe_dt_head` Pearson r ≥ 0.3 with `pred_std` close to `true_std` and R² ≥ 0.05. Once you hit this, the fix is locked.
 
-**Architecture** (`transformer.py`):
+**Fail / remove option:** if no variant fixes the head after 2–3 honest attempts, *remove* the Δt loss entirely (set its cap to 0 and delete the head from the embedder) and report the resulting AUROC. A removed broken task is honest; a flat aux loss masquerading as a learning signal is not.
+
+---
+
+### Task B — Phase-1 MLM
+
+**Failure mode**: MLM loss is essentially flat across Phase-1 training; the embedder linear probe (Report 7) AUROC has not moved with any MLM variant. exp37 (disabled) and exp38 (hierarchy-masked) both regressed AUROC slightly — disabling was less harmful than the harder version, indicating the current MLM is neither learning nor useful.
+
+**Validation method**: tail `run.log` during Phase-1 and confirm `tr_mlm` actually decreases epoch over epoch. If it is flat from epoch 1, the task is broken — not poorly tuned.
+
+**Things to try (pick one per experiment):**
+1. **Verify the mask is real.** When a position is selected for MLM, *all four* of its token embeddings (`parent_raw`, `concept`, `value`, `position`) and its time encoding must be replaced with `[MASK]` / zero before being fed to the encoder. If any of them leak through, the task is trivial. Audit `forward_with_mlm` in `embedder.py`.
+2. **Masked-span prediction.** Mask a contiguous span of 3–5 tokens at a time instead of single tokens. Forces the model to use real context.
+3. **Predict only the `concept` (or only `value`) head**, not the full `position_id`. The current task may be either too easy (concept) or too hard (position_id with thousands of classes). Pick the right granularity.
+4. **Replace MLM with a next-event classification** auxiliary on the embedder: given the last N tokens, predict the concept class of token N+1. This is closer to what Phase-2 needs from the embedder.
+
+**Pass criterion (fixed task):** `tr_mlm` decreases visibly across Phase-1 **AND** Report 7 (embedder linear probe) AUROC ≥ 0.60 on at least one complication that previously was at 0.5. Once you hit this, the fix is locked.
+
+**Fail / remove option:** if no variant fixes it after 2–3 honest attempts, delete the MLM head and loss term entirely. Report the AUROC with MLM removed and lock that as the new baseline. Do not leave a flat-loss MLM in the codebase.
+
+---
+
+### Task C — Phase-2 outcome loss (survival / ranking loss)
+
+**Failure mode**: outcome loss is near-flat during Phase-2 training even at correct lambda. AUPRC has not recovered above 0.28. The hazard auxiliary (exp42, exp46, exp49) added structure and helped AUROC, but the *outcome-head soft-BCE* itself is still not optimising what evaluation measures.
+
+**This is the only task the agent has NOT yet honestly attempted.** Coupling (exp33–exp51) was repeatedly tried instead — coupling is rejected. **The survival / pairwise ranking loss has not been implemented yet.** Do it.
+
+**The mechanism:**
+For each outcome k and each patient, sample positive positions (within the eval window of the outcome) and negative positions (outside the window, or any position from a patient where k never occurs). Apply a pairwise margin loss on `outcome_head[k]` logits:
 
 ```
-x ──┬── lm_head ──────────────────────────── logits [B, T, V]
-    │                                               ↑ index_add at K positions
-    └── outcome_head ── .detach() ── outcome_to_lm ── bias [B, T, K]
+L_rank_k = mean over (pos, neg) pairs of  softplus( logit_neg - logit_pos )
 ```
 
-- `self._outcome_lm_ids`: register as buffer — 1-D LongTensor of LM vocab ids for each name in `outcome_names` (narrower than `_outcome_ids`, which covers all outcomes+terminals)
-- `self.outcome_to_lm = nn.Linear(num_outcomes, num_outcomes)`, **zero-initialized** — this makes it a no-op at Phase-3 start, so Phase-2 quality is fully preserved
-- In `forward()` and `forward_with_cache()`, after `logits = self.lm_head(x)`:
-  ```python
-  lm_bias = self.outcome_to_lm(outcome_logits.detach())  # [B, T, num_outcomes]
-  logits = logits.index_add(2, self._outcome_lm_ids, lm_bias)
-  ```
-- `.detach()` is mandatory — it blocks LM loss from flowing back through `outcome_head` (outcome_head is only updated by outcome loss, not LM loss)
+This is a direct AUROC proxy — minimising it directly raises the probability that a positive position is ranked above a negative one, which is exactly what `evaluate_on_test_set` measures (pooled window AUROC).
 
-**Why this works without retraining the backbone**: `outcome_to_lm` is an additive logit correction, not a feature injected into LM weights. Example: if `lm_head(x)[RELEASE] = −3` (underestimates RELEASE) but the outcome head has learned P_RELEASE is high, `outcome_to_lm` can add +5 to RELEASE logit → final = +2 → RELEASE wins sampling. The LM head itself doesn't need to re-learn; the correction is post-hoc and additive. No Phase-4 or backbone re-training needed.
+**Implementation steps:**
+1. Add a `pairwise_ranking_loss` in `loss.py` operating on `outcome_logits` of shape `[B, T, K]` with the same positive/negative position mask used by the current soft-BCE.
+2. **Additive first**: keep the existing soft-BCE outcome loss, add the ranking loss with its own cap entry in `phase2_scheduler.aux_fraction_caps` (e.g. `ranking: 0.2`), schedule it in the same stage as `outcome`.
+3. Watch `tr_ranking` and `tr_outcome` both during Phase-2 training. If `tr_ranking` decreases visibly and AUROC + AUPRC improve, the task is alive.
+4. **Replacement second (only if additive works)**: drop soft-BCE entirely and run with ranking-only outcome loss. Cleaner gradient, no `tau` / `cap` calibration coupling.
 
-**Gradient isolation** — each parameter is updated by exactly one loss:
+**Pass criterion (fixed task):** `tr_ranking` decreases across Phase-2 **AND** AUROC ≥ 0.804 (current best) **AND** AUPRC ≥ 0.282. Once you hit this, the ranking loss is locked in.
 
-| Parameter       | Updated by outcome loss | Updated by LM loss   |
-|-----------------|------------------------|----------------------|
-| `outcome_head`  | ✓ (Phase 2 + 3)        | ✗ (detach blocks it) |
-| `outcome_to_lm` | ✗                      | ✓ (Phase 3 only)     |
-| `lm_head`       | ✗                      | ✓ (Phase 2 only)     |
-| Backbone `x`    | ✓ (Phase 2)            | ✓ (Phase 2)          |
-
-**Why Phase-3 only for `outcome_to_lm`**: if trained in Phase-2, early stopping is driven by total val loss dominated by ambient BCE/CE. The coupling's contribution at rare outcome positions is too small to move that loss, so early stopping fires before `outcome_to_lm` converges. Phase-3 trains only `outcome_head` + `outcome_to_lm` with backbone frozen, and early stops on outcome val loss — no conflict.
-
-**Phase-3 changes in `finetune_transformer`**:
-- Unfreeze `outcome_to_lm` alongside `outcome_head`: `for p in model.outcome_to_lm.parameters(): p.requires_grad_(True)`
-- Add both to the Phase-3 optimizer parameter group
-- In `run_epoch`, add CE loss at outcome/terminal positions:
-  ```python
-  is_outcome = torch.isin(target_ids, torch.tensor(outcome_token_ids, device=device))
-  if is_outcome.any():
-      outcome_ce = F.cross_entropy(pred_logits[is_outcome], target_ids[is_outcome])
-      loss = outcome_bce_loss + outcome_ce_weight * outcome_ce
-  ```
-
-**Repetition risk**: terminals (RELEASE/DEATH) — no risk, `finished` flag set immediately after sampling. Clinical outcomes — the forward-looking soft label formula means after an outcome occurs, the outcome head target at t+1 drops toward zero (looks forward, past events not counted). Existing repetition penalty in `generate()` is a second line of defence.
-
-**Checkpoint compatibility**: a Phase-2 checkpoint won't have `outcome_to_lm` weights. Handle the missing key in `GPT.load` (use `strict=False` or explicit key check) so old checkpoints load cleanly — `outcome_to_lm` initialises fresh at Phase-3 start.
-
-**After implementing**: re-add `probe_outcome_lm_coupling` to `diagnose.py`. It should check: (a) `outcome_to_lm` weight norms — if near zero, the coupling didn't activate; (b) per-outcome correlation between outcome head logit and the lm bias it produces; (c) mean lm logit at outcome positions before vs after coupling. This is a straightforward probe once the model attributes exist.
+**Fail option:** if both additive and replacement variants fail to improve AUROC after honest attempts, document the failure precisely (what `tr_ranking` did, what AUROC did) and remove the ranking loss. **Do not** fall back to coupling — that is rejected.
 
 ---
 
-### Task 4 — General architecture improvements (after Tasks 1–3 are stable)
+### Order and rules
 
-Only start this after the gradient and outcome coupling issues are resolved. Architecture experiments give unreliable signal when the training loop has gradient bugs.
-
-**Constraint**: no hyperparameter tuning here. Width, depth, dropout, LR — those are for later. Only structural changes that add or fix an inductive bias.
-
-**A. Temporal attention bias**
-`abs_ts` is encoded in token embeddings via Time2Vec, but Q·K attention weights have no direct path to the real-time gap between positions i and j. Add a scalar learned bias `g(Δt_ij)` to pre-softmax attention logits inside `CausalSelfAttention.forward`. Use `abs_ts` deltas (already available), not token-index differences. This is independent of and complementary to temporal RoPE.
-
-**B. Token-type flag embeddings**
-Small additive embeddings in `embedder.py` for `is_outcome`, `is_interval_marker`, `is_trend`, `is_treatment_pattern`. ~3–4 learned vectors of size `embed_dim`, summed into the token embedding. Gives the model explicit structural knowledge that outcome tokens are a special class — cheap (~4×embed_dim params) and straightforward to verify via Report 8 (do outcome tokens move to a distinct region of embedding space?).
-
-**C. Phase-1 auxiliary redesign** (if Task 2 concludes the tasks are fundamentally broken)
-If MLM and Δt are structurally unfixable, replace rather than patch:
-- Δt regression → bin classification over 8–10 logarithmically-spaced bins (0–1h, 1–3h, 3–12h, 12–48h, etc.)
-- MLM → masked-span prediction (mask a contiguous run of 3–5 tokens, predict them all from context), which better matches the clinical "predict the next episode" objective
-
----
+1. Work the three tasks **in order: A, B, C**. Do not move to the next until the current one is either fixed and locked or honestly removed.
+2. Once a task is fixed (loss decreases + probe passes the bar above), it is **locked**. The codebase moves forward with the fix in place. You may not silently regress to a pre-fix version even if it gives a higher AUROC — variance from random init is ±0.01 and does not justify rolling back a real structural fix. You may *replace* a fixed task with a different method, or *remove* it entirely (and report the consequence) — both are fine.
+3. **No hyperparameter sweeps.** No "tune LR / cap / ramp / patience / batch size" experiments. Every experiment must change *what is being learned* or *how it is being learned*, not what number is in the config.
+4. **Re-read this `program.md` and `diagnose.py` output between every experiment.** If you skip this, you will drift.
+5. **Smoke test (sample=50, 1 epoch per phase) before every full run.** Confirm the summary block appears. Pipeline crashes on full runs are wasted hours.
 
 ### When to stop
 
-Stop the loop and report to the user when there are no remaining architectural changes to make — i.e. all of Tasks 1–4 have been attempted and the only remaining levers are hyperparameter tuning (learning rate, embed_dim, n_layer, n_head, dropout, batch size, epoch counts, lambda caps after the gradient is confirmed healthy). Do not start hyperparameter sweeps autonomously. When you reach that point, write a summary of what was tried, what is now stable, and what the current best metric is.
+Stop and report to the user when:
+- All three tasks (A, B, C) are either fixed and locked, or have been honestly attempted and removed, **and**
+- The only remaining levers are hyperparameter tuning.
+
+Write a final summary: the state of each task (fixed / removed / failed), the current best AUROC/AUPRC/MAE, and what is still open.
 
