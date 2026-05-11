@@ -437,10 +437,13 @@ Gradient stability. Done.
 ### Task A — Phase-1 Δt head — LOCKED (exp52)
 Time2Vec log-spaced frequency init (12–25k rad/normalized-unit, alternating signs). Δt probe R² 0.024 → 0.083, `tr_dt` monotonically decreasing. Fixed. Locked. Do not undo.
 
-### Task B — Phase-1 MLM — DECIDED BY EXP54
-exp37 (disabled), exp38 (hierarchy-masked), exp53 (span-MLM) all failed honestly. exp54 is the **fail/remove path**: delete the head and the loss term cleanly. When exp54 finishes:
-- **If AUROC is within ±0.01 of exp52 (0.788):** Task B is fail-removed. Codebase stays as exp54. Proceed to Task D.
-- **If AUROC drops more than 0.01 below exp52:** revert to exp37-style baseline (MLM head present, cap=1.5, no hierarchy masking) and proceed to Task D *with that baseline*. Do not try a fourth MLM variant.
+### Task B — Phase-1 MLM — REMOVE (no learning across three honest attempts)
+
+exp37 (disabled), exp38 (hierarchy-masked), exp53 (span-MLM) all failed to make MLM learn: `tr_mlm` flat across Phase-1 in every variant, embedder linear probe (Report 7) unchanged in every variant, and exp53 additionally broke the locked Task A by destabilising Δt training. **A loss term that does not learn is not a learning signal — it is noise dressed as supervision, and it stays in the codebase only out of inertia.** Three attempts is enough; remove it.
+
+The MLM fail/remove path was committed as exp54 but the pod was shut down before evaluation, so the AUROC was never measured. The removal commit has been **reverted** so the codebase is back at the exp52 baseline. **Task D will run on exp52** for clean attribution. After Task D is locked, redo exp54 (delete `mlm_head`, `forward_with_mlm`, `build_mlm`, the loss term, and the `phase1_scheduler` MLM entry) on top of D-fixed code. Log the resulting AUROC.
+
+**The removal is not contingent on AUROC outcome.** Per Rule #1 (a broken aux is not a learning signal), MLM stays removed even if AUROC drops — that drop is then a free signal that *Phase-1 needs a different self-supervised task*, which becomes the new follow-up question, not a reason to put a flat-loss MLM back. If AUROC drops more than ~0.015 below the post-D exp52-equivalent, log it and proceed to Task C anyway; if Task C still falls short of the exp49 mark, you may then propose a *different* Phase-1 self-supervised task (next-event prediction, contrastive over event types, or similar) — not a re-introduction of MLM.
 
 ---
 
