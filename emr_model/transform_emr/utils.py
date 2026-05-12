@@ -296,11 +296,13 @@ def get_future_outcome_targets(
         outcome_targets = torch.bmm(decay_weights, matches).clamp(0.0, 1.0)
     else:
         # Per-outcome decay: bmm in a loop over K to keep memory bounded.
-        # Each iter: decay_k [B,T_q,T] x matches_k [B,T,1] -> [B,T_q,1]
+        # Use masked_fill (NOT multiplication) to suppress out-of-horizon entries —
+        # multiplication 0 * inf = NaN when exp(-dt/tau) overflows on out-of-horizon
+        # dt values, while masked_fill replaces inf with 0 cleanly. (Bug seen in
+        # exp62: P2 ep 0 NaN'd because dt values from pad positions overflowed exp.)
         outcome_cols = []
-        in_horizon_f = in_horizon.float()
         for k_idx in range(K):
-            decay_k = torch.exp(-dt / tau[k_idx]) * in_horizon_f  # [B,T_q,T]
+            decay_k = torch.exp(-dt / tau[k_idx]).masked_fill(~in_horizon, 0.0)  # [B,T_q,T]
             col = torch.bmm(decay_k, matches[..., k_idx:k_idx + 1]).clamp(0.0, 1.0)  # [B,T_q,1]
             outcome_cols.append(col)
         outcome_targets = torch.cat(outcome_cols, dim=-1)
