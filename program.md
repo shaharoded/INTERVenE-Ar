@@ -215,21 +215,73 @@ LOOP:
 These rules supersede a simple AUROC comparison.
 
 1. **A fixed auxiliary task cannot be un-fixed.** Once a Phase-1 or Phase-2 aux loss
-   genuinely starts decreasing across training (where it was previously flat), and a
-   probe confirms the head has learned something non-trivial (e.g. Δt Pearson r ≥ 0.3,
-   MLM probe AUROC ≥ 0.6), **that fix is locked in**. You cannot roll the codebase back
-   to a version where that task is broken, even if AUROC dips slightly. AUROC variance
-   from random init alone is ~±0.01 — that is not a reason to undo a real structural fix.
-2. A fixed aux task can be **replaced** (different loss / different target) or **removed
-   entirely** (delete the head and its loss term) — both are honest changes. See exp37
-   (disable MLM) and exp38 (replace MLM masking) for examples of legitimate removals/
-   replacements. What is forbidden is silently regressing to a known-broken version
-   while pretending it is a new experiment.
-3. **AUROC is still the primary KEEP signal** once aux tasks are healthy. Among
+   genuinely meets the *learning bar* below and a probe confirms the head has learned
+   something non-trivial, that fix is locked in. You cannot roll the codebase back to a
+   version where that task is broken, even if AUROC dips slightly. AUROC variance from
+   random init alone is ~±0.01 — that is not a reason to undo a real structural fix.
+
+2. **The learning bar (this is what "locked" means).** An aux is "learning" only if
+   **both** of these hold:
+   - **(a) Honest raw-loss drop.** The *raw* (un-weighted) loss decreases by ≥30%
+     between its calibration epoch and the end of training, measured at ≥6-decimal
+     precision. λ is fixed after calibration, so a weighted-loss curve that is flat
+     at 4-decimal display can still hide a 5% raw drop or a 0% raw drop — log raw
+     values to disambiguate. A weighted-loss "decrease" smaller than the 4-decimal
+     display step is not evidence of anything.
+   - **(b) Non-trivial ablation cost.** Disabling the aux (set its λ to 0 at config
+     time, fully retrain through the same phases) costs ≥0.005 AUROC vs the
+     ablated-otherwise-identical run. An aux whose ablation lies within the ±0.01
+     random-init noise floor is decorative — it cannot be called "locked" and should
+     be removed unless it is a *mandatory aux* per Rule 6.
+
+3. **A fixed aux task can be replaced or removed.** Replacement (different loss /
+   different target) and removal (delete the head and its loss term) are both honest
+   changes. What is forbidden is silently regressing to a known-broken version while
+   pretending it is a new experiment.
+
+4. **The agent must distinguish AUROC gains from architecture vs from data shape.**
+   If a KEEP run made multiple changes at once (e.g. added an aux *and* widened a BCE
+   window *and* added a head), attribute the gain by ablating each component
+   individually before claiming the architectural change is responsible. Data-shape
+   changes (BCE window per token class, oversampling, masking strategy) frequently
+   account for ≥+0.05 AUPRC while the headline architecture change does nothing —
+   examples seen on this project. Log honest attribution in the description.
+
+5. **AUROC is still the primary KEEP signal** once aux tasks are healthy. Among
    experiments where the aux tasks are all in their fixed state, KEEP the one with
    higher AUROC. If two are tied within ±0.005, prefer the simpler one (less code).
-4. **CRASH** = log the row with NaNs and `DISCARD`, then `git reset --hard HEAD~1`.
-5. **DISCARD** = `git reset --hard HEAD~1` so the next experiment starts from the
+   A run that "wins" by +0.003 on a single seed is **not a real win** — re-run with
+   a fresh Phase-1 (delete `checkpoints/phase1/`) before logging KEEP if the margin
+   is below 0.005.
+
+6. **Mandatory auxiliaries that must be solved properly (not removed).**
+   The following are **required** in the codebase and must meet the learning bar
+   (Rule 2). They are not eligible for the "fail/remove" option. If they appear
+   broken, fix them — do not delete them.
+   - **Phase 1**: one primary loss (multi-hot temporal BCE) + one time loss
+     (Δt regression / Time2Vec supervision). Phase 1 has no other purpose;
+     removing the time loss leaves no incentive to learn the time encoding.
+   - **Phase 2**: primary BCE + next-token CE (confirmed learning across exps) +
+     time loss (Δt gate + magnitude). These are the three signals that make the
+     LM able to generate plausible future trajectories — without all three, the
+     autoregressive trajectory used by `evaluate_on_test_set` degrades regardless
+     of any outcome aux.
+   - **Phase 2 outcome-direction signal**: **at least one** of
+     {outcome soft-BCE, pairwise ranking loss, discrete-time hazard} must remain
+     active and meet the learning bar. The agent may choose which one and may
+     drop the others, but it may not run with all three silenced. The purpose is
+     a head that explicitly pushes the model toward outcome-aware predictions in
+     the natural-distribution Phase-3 fine-tune.
+
+   For each mandatory aux that fails the learning bar today: the next experiments
+   on that aux must focus on **fixing** it (better target, better head design,
+   calibration of λ, different loss family) — not on patching the AUROC by
+   piling on new heads elsewhere. A flat raw loss is the signal to dig in, not
+   ignore.
+
+7. **CRASH** = log the row with NaNs and `DISCARD`, then `git reset --hard HEAD~1`.
+
+8. **DISCARD** = `git reset --hard HEAD~1` so the next experiment starts from the
    current best, not from the failed one.
 
 **Embedder caching**: Phase 1 is skipped automatically when the checkpoint matches `(embed_dim, time2vec_dim, ctx_dim)`. Verify "Config unchanged — loading cached embedder" appears in run.log to confirm the cache was hit.
@@ -420,16 +472,37 @@ Read this before proposing anything — it records what has been tried and what 
   - exp53 (span-MLM, span=4): AUROC +0.005 but **broke locked Task A** — Δt R² regressed from 0.083 to -0.118, violating Rules #1.
   - exp54 (running on the pod as of this writing): clean **removal** — `mlm_head`, `forward_with_mlm`, `build_mlm`, loss term, and scheduler entry all deleted. If exp54 lands within ±0.01 of exp52 AUROC, Task B is officially fail-removed. If it drops further, restore the simplest MLM variant (exp37 baseline, cap=1.5, no hierarchy masking) and proceed without trying to "fix" it.
 
-**Active open problem — direct outcome loss is still not learning what evaluation measures.**
-- Phase-2 outcome head soft-BCE loss is near-flat during training. The hazard auxiliary (exp42, exp46) added structure and helped AUROC, but the soft-BCE itself doesn't track the generation-based pooled-window AUROC that `evaluation.py` reports.
-- AUPRC remains low (~0.25–0.28), confirming the head ranks outcome tokens but is not well-calibrated.
-- The remedy — a direct AUROC-proxy ranking loss — has not yet been attempted (Task C).
+**Active open problems.**
+- **Per-token-class BCE windows is the live research lead.** exp59 widened the BCE window to 168 h for terminal tokens (RELEASE / death) and gained +0.10 AUPRC and dropped `max_len` 89%→12%. This is a data-shape change, not an architectural one — and it dwarfs every aux-loss gain the project has logged. The direction to push: BCE windows tuned per event family to its natural timescale (lab values ~3 h, vitals ~6 h, treatments ~12 h, complications ~24 h, terminals ~168 h). Investigate after Task 0 confirms exp59's gain.
+- **The mandatory aux losses still need to be solved properly, not propped up.** Phase-1 Δt is "locked" at R²=0.083 — better than nothing but small. Phase-2 outcome soft-BCE / hazard / ranking are flat or near-floor. At least one of the three Phase-2 outcome-direction signals must be brought to a genuine learning state per Rule 6. The agent is required to find which works — but is not required to keep all three.
 
 ---
 
 ## Research directions
 
 Open tasks below. Work them **in the listed order**. Do not skip ahead. **No hyperparameter sweeps**; if your only proposed change is a number, you have not understood the task. Re-read this section before every experiment.
+
+### Task 0 — Honest audit (DO THIS FIRST, BEFORE ANY NEW EXPERIMENT)
+
+The session through exp60 racked up several "locked" aux tasks (ranking, hazard, outcome, dt) whose weighted-loss curves are flat at 4-decimal precision and whose AUROC gains are inside the ±0.01 random-init noise floor. Before launching any new experiment, run the following audit against the current best codebase and update results.tsv with the findings:
+
+1. **Raw-loss probe at 6+ decimals.** Re-log every aux (phase-1 Δt, phase-2 ce / dt / outcome / ranking / hazard) at ≥6 decimal places across all curriculum epochs. Compute the raw drop fraction `(raw_first_active - raw_final) / raw_first_active`. Any aux with < 30% raw drop fails the Rule-2(a) bar.
+
+2. **Per-aux ablation.** Take the current best (exp59 or exp60 if it KEEPs) as the codebase. For each aux that is *not* mandatory under Rule 6, run a single experiment with that aux's λ forced to 0 from the start (no curriculum unlock; equivalent to deleting it). Compare AUROC/AUPRC vs the un-ablated run on the same fresh Phase-1.
+   - Ablation cost ≥ 0.005 AUROC → aux is real, keep it.
+   - Ablation cost within ±0.005 AUROC → aux is decorative, remove it.
+   - Order: ablate hazard first (flat at 4-decimal display is the strongest suspect), then ranking, then outcome soft-BCE.
+   - Rule 6 floor: at least one of {outcome soft-BCE, ranking, hazard} must remain. If the first two ablations both come back "decorative", do not ablate the third — it stays by mandate.
+
+3. **Re-run any ±0.005 KEEP on a fresh Phase-1** to confirm the gain is not single-seed noise. Specifically: exp56 (Task C lock, +0.003 AUROC) needs re-confirmation. If it does not survive a fresh Phase-1, downgrade its status from "locked" to "neutral".
+
+4. **Attribute exp59's +0.10 AUPRC gain.** exp59 widened the BCE window for terminal tokens to 168 h and gained AUPRC 0.282→0.386 alongside max_len 89→12 %. Ablate that change in isolation (keep all aux as in exp59, revert BCE window to exp58's setting) to confirm the data-shape change — not the aux losses — drove the AUPRC win. This is the live research lead; understanding *why* it worked unlocks the next direction.
+
+5. **Update results.tsv with the audit outcome.** For each aux re-classified as "decorative" by ablation, add a row noting: `<commit>  <auroc_with>  <auroc_without>  <delta>  AUDIT  removed <aux> per Rule 2(b)`.
+
+Only after Task 0 is complete may the agent launch a new experimental direction. The point of this audit is to stop calling near-zero deltas "learning" and stop attributing data-shape AUPRC gains to architecture.
+
+---
 
 ### Task 1 — COMPLETE
 Gradient stability. Done.
