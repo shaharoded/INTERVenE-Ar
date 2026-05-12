@@ -744,37 +744,66 @@ head can divert backbone capacity from the primary objectives. Mitigations:
 
 ---
 
-### Direction C — Learn the BCE window at the LM-head level
+### Direction C — Soft-kernel BCE targets at the LM head (learn the window)
 
 **The intent.** The single biggest gain this project has logged (exp59:
 +0.10 AUPRC, −74 pp max_len) came from a *data-shape* change: widening the
-BCE window from 12 h to 168 h for terminal tokens. Per your caveat, we
-abandoned hand-picking windows per event family — that risks overfitting to
-MIMIC-III's specific event distribution. The principled version is to
-**make the window a learned parameter** rather than a hand-coded number.
+BCE window from 12 h to 168 h for terminal tokens. Per the overfitting
+caveat we will not hand-pick more windows per event family. The principled
+version is to replace the hard window with a **soft kernel** whose decay
+constant is learned per token class — symmetric with the outcome head's
+existing `exp(−Δt / tau)` soft target.
 
-**The mechanism.**
-1. In `get_temporal_multi_hot_targets` (or wherever the BCE labels are
-   built), replace the hard time window with a *soft* weighting:
-   `weight[t, k] = exp(−Δt(t, next_k) / softplus(log_tau[k]))`
-   where `log_tau[k]` is a learnable per-token-class parameter.
-2. Keep the two-tier hard split (terminals 168 h, everything else 12 h) as
-   an *upper bound* so `tau` doesn't blow up to 1000 h. Inside the bound,
-   the model learns each event family's natural scale.
-3. Initialise all `log_tau[k]` at the current hard value (`log(12)` for most
-   tokens, `log(168)` for terminals). Smoke test that the gradient is
-   non-zero across tokens.
+**The mechanism (Phase 2 first).**
+1. In `get_temporal_multi_hot_targets`, replace the binary in-window check
+   with a continuous weight:
+   `target[t, k] = max_s exp(−|Δt(t, s)| / softplus(log_tau[k])) * 1[token_s == k]`
+   (or `sum_s … .clamp(0, 1)` — same formula as `get_future_outcome_targets`).
+   `log_tau[k]` is a learnable per-token-class parameter, size `[V]`.
+2. Initialise `log_tau[k]` at the current hard-window value: `log(12 / 336)`
+   for most tokens, `log(168 / 336)` for terminals.
+3. Optional safety cap: apply `softplus` with an upper bound so `tau` cannot
+   blow up to absurd values (e.g. cap at the current terminal value).
+4. The hard-window two-tier split goes away entirely; the model learns the
+   right scale per class.
+
+**Why this is the right reframing of the user's "weighted-positive BCE" idea.**
+The user proposed: instead of a hard binary positive label inside a window,
+use a continuous positive weight that decays with distance from the actual
+target. That is exactly the formula above. The outcome head already does
+this for outcome tokens; Direction C is "apply the same idea to the LM head
+across the full vocab". The discontinuity at the hard-window edge
+(`12h: 1, 12h+ε: 0`) disappears, and tokens closer in time get stronger
+supervision than tokens further out — which both the user's intuition and
+the symmetry with the outcome head support.
 
 **Why it's not just a sweep.** A sweep would mean re-running with different
-window values until something wins. Here, *the model learns the window* —
-no human picks it. The gain transfers across datasets because the model
-re-fits the window automatically.
+window values until something wins. Here, the model learns the kernel scale
+per class. No human picks it, and the gain transfers across datasets
+because the model re-fits the kernel automatically.
 
-**Risk.** This touches a locked-in data-shape gain. If the learned-window
-implementation is wrong it could break exp59's signal. Mitigation: run
-this as additive first (keep the hard 12 h/168 h two-tier; add learnable
-*per-token within-bound modulation*), and only replace the hard split if
-the additive version provably wins.
+**Risk.** This touches a locked-in data-shape gain. If the learned-kernel
+implementation is wrong it could break exp59's signal. Mitigation order:
+1. Implement in Phase 2 only.
+2. Smoke test that `tr_bce` doesn't explode and that `log_tau[k]` actually
+   moves during training for at least the terminal classes.
+3. Compare to exp63 baseline: AUROC must stay within ±0.01, AUPRC must not
+   regress more than 0.02, `max_len%` must stay below 15.
+4. Only if Phase 2 soft-kernel wins (or ties cleanly), consider extending
+   to Phase 1 BCE as a follow-up. Phase 1's 3 h window is already narrow,
+   so the gain is smaller and the risk of disturbing the foundational
+   embedder is higher. Defer.
+
+**Fallback if Direction C fails.** If learnable per-class kernels don't beat
+the current two-tier hard window, fall back to a single structural rule:
+**all outcome-class tokens (terminals + clinical complications) use the
+outcome_horizon_hours window (48 h); everything else stays at 12 h.** This
+keeps two tiers, but the split is principled by horizon alignment (lm-head
+window matches outcome-head supervision horizon and the eval window family)
+rather than per-family hand-picking. Exp60 tested this configuration and
+gave +0.008 AUROC over exp59 before being reverted on per-family-caveat
+grounds; under the "horizon alignment" justification it is a defensible
+single-rule extension.
 
 ---
 
