@@ -415,6 +415,16 @@ class GPT(nn.Module):
             persistent=True,
         )
 
+        # exp60: clinical complication ids (OUTCOMES minus TERMINAL_OUTCOMES) —
+        # second wide-window tier for the LM-head BCE. Same mechanism that worked
+        # for terminals in exp59, applied to under-supported complication tokens.
+        _complication_names = [n for n in OUTCOMES if n not in TERMINAL_OUTCOMES and n in tok.token2id]
+        self.register_buffer(
+            "_complication_ids",
+            torch.tensor([tok.token2id[n] for n in _complication_names], dtype=torch.long),
+            persistent=True,
+        )
+
         # Discrete-time hazard: shares weights with outcome_head; per-(outcome, bin) bias
         # adds temporal structure on top of the outcome head's base logit.
         # hazard_logit[k, b] = outcome_logit[k] + hazard_time_bias[k, b]
@@ -991,6 +1001,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 _BCE_WIN = training_settings.get("phase2_bce_window_hours", 12.0) / _ABS_TS_SCALE
                 _TERM_WIN_H = training_settings.get("phase2_terminal_bce_window_hours", 168.0)
                 _TERM_WIN = _TERM_WIN_H / _ABS_TS_SCALE
+                _COMP_WIN_H = training_settings.get("phase2_complication_bce_window_hours", 48.0)
+                _COMP_WIN = _COMP_WIN_H / _ABS_TS_SCALE
                 multi_hot = get_temporal_multi_hot_targets(
                     target_ids=full_targets,
                     all_abs_ts=batch["abs_ts"],
@@ -1000,8 +1012,10 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     window_size=_BCE_WIN,
                     outcome_ids=model._outcome_ids,
                     next_token_ids=full_targets[:, 1:],
-                    wide_token_ids=model._terminal_ids,
-                    wide_window_size=_TERM_WIN,
+                    wide_tiers=[
+                        (model._terminal_ids,     _TERM_WIN),
+                        (model._complication_ids, _COMP_WIN),
+                    ],
                 )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 

@@ -111,6 +111,7 @@ def get_temporal_multi_hot_targets(
     next_token_ids: Optional[torch.Tensor] = None,
     wide_token_ids: Optional[torch.Tensor] = None,
     wide_window_size: Optional[float] = None,
+    wide_tiers: Optional[list] = None,
 ) -> torch.Tensor:
     """
     Build temporal multi-hot targets over a future time window using GPU-efficient
@@ -173,19 +174,29 @@ def get_temporal_multi_hot_targets(
     if 0 <= padding_idx < vocab_size:
         multi_hot[..., padding_idx] = 0.0
 
-    # exp59: optionally use a wider future window for a specific subset of tokens
-    # (e.g. DEATH/RELEASE). Re-uses the same prefix sums — one extra searchsorted +
-    # gather. Goal: provide denser positive signal for rare/critical tokens so the
-    # LM head learns to assign them higher logits at pre-event positions, addressing
-    # the 83% max_len inference-termination miss rate.
+    # exp59/exp60: optionally use wider future windows for specific subsets of tokens.
+    # Single-tier: pass wide_token_ids + wide_window_size.
+    # Two-tier (exp60): the legacy single-tier path is wrapped into the same overlay
+    # loop. Each tier reuses the same prefix sums — one extra searchsorted + gather
+    # per tier. Goal: provide denser positive signal for rare/critical tokens
+    # (terminals = 168 h, clinical outcomes = 48 h) so the LM head learns to assign
+    # them higher logits at pre-event positions, addressing the inference-termination
+    # miss-rate and under-supported complication-token training.
+    _wide_specs = []
     if wide_token_ids is not None and wide_window_size is not None and wide_token_ids.numel() > 0 and wide_window_size > window_size:
-        right_wide_idx = torch.searchsorted(all_abs_ts, query_abs_ts + wide_window_size, right=True)
+        _wide_specs.append((wide_token_ids, wide_window_size))
+    if wide_tiers is not None:
+        for _tier_ids, _tier_w in wide_tiers:
+            if _tier_ids is not None and _tier_w is not None and _tier_ids.numel() > 0 and _tier_w > window_size:
+                _wide_specs.append((_tier_ids, _tier_w))
+    for _wide_ids, _w_size in _wide_specs:
+        right_wide_idx = torch.searchsorted(all_abs_ts, query_abs_ts + _w_size, right=True)
         right_wide = right_wide_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
         future_counts_wide = prefix.gather(1, right_wide) - prefix.gather(1, left)
         wide_multi_hot = (future_counts_wide > 0).to(torch.float32)
         if 0 <= padding_idx < vocab_size:
             wide_multi_hot[..., padding_idx] = 0.0
-        wide_ids = wide_token_ids.to(target_ids.device)
+        wide_ids = _wide_ids.to(target_ids.device)
         multi_hot[:, :, wide_ids] = wide_multi_hot[:, :, wide_ids]
 
     # Outcome 1-hot override: replace the broad window multi-hot with a strict 1-hot at

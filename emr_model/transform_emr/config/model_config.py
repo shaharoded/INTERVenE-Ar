@@ -47,6 +47,10 @@ TRAINING_SETTINGS = {
     # to assign higher terminal logits hours-to-days before the actual event.
     # 168h = 7 days, well within the 336h training horizon.
     "phase2_terminal_bce_window_hours": 168.0,
+    # exp60: clinical complications (CARDIO/KIDNEY/HYPO/HYPER) also get a wider
+    # window — matched to the outcome_horizon_hours (48 h) so the lm_head BCE
+    # signal for complications aligns with the outcome head's training horizon.
+    "phase2_complication_bce_window_hours": 48.0,
 
     # Phase-1 auxiliary scheduler.
     # Single stage: dt activates after bce_only_epochs of pure BCE training.
