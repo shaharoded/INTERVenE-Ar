@@ -425,6 +425,16 @@ class GPT(nn.Module):
             persistent=True,
         )
 
+        # exp62: per-outcome learnable log-tau for the outcome-head soft target.
+        # get_future_outcome_targets currently uses a fixed scalar tau (12h). Letting
+        # each outcome learn its own tau means RELEASE (distinct healthy-patient
+        # dynamics) can pick a different decay constant from clinical complications.
+        # Aligned with f770850's "learn the window" guidance, scoped to the outcome
+        # head (not the lm-head BCE — terminals' hard 168h split is principled per
+        # the same caveat). K = num_outcomes new parameters.
+        _init_log_tau = math.log(12.0 / 336.0)
+        self.outcome_log_tau = nn.Parameter(torch.full((self.num_outcomes,), _init_log_tau))
+
         # Discrete-time hazard: shares weights with outcome_head; per-(outcome, bin) bias
         # adds temporal structure on top of the outcome head's base logit.
         # hazard_logit[k, b] = outcome_logit[k] + hazard_time_bias[k, b]
@@ -734,7 +744,10 @@ class GPT(nn.Module):
         # Also tolerate stale hazard_x_bias.* keys from exp47 (DISCARD).
         new_keys = {k for k in missing if
                     k.endswith(".time_bias_w") or k.endswith(".time_bias_b")
-                    or k == "hazard_time_bias"}
+                    or k == "hazard_time_bias"
+                    or k == "outcome_log_tau"
+                    or k == "_complication_ids"
+                    or k == "_terminal_ids"}
         missing = missing - new_keys
         stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_x_bias.")}
         # Stale hazard_head weights (pre-exp46 Linear) are ignored — replaced by hazard_time_bias.
@@ -1066,8 +1079,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 # Maximum gradient right before an outcome; decays to zero for distant/absent
                 # outcomes. No hard window boundaries — decay handles separation naturally.
                 _ABS_TS_SCALE = 336.0
-                _TAU     = training_settings.get("outcome_decay_tau_hours", 12.0) / _ABS_TS_SCALE
                 _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
+                # exp62: per-outcome learnable tau (init log(12h/336)).
+                _TAU = model.outcome_log_tau.exp()
                 outcome_targets = get_future_outcome_targets(
                     target_ids=full_targets,
                     outcome_ids=outcome_token_ids,
@@ -1351,8 +1365,9 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     train_losses, val_losses = [], []
 
     _ABS_TS_SCALE = 336.0
-    _TAU     = training_settings.get("outcome_decay_tau_hours", 12.0) / _ABS_TS_SCALE
     _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
+    # exp62: read learnable per-outcome tau from the model. In Phase 3 the param
+    # continues to be trained alongside the outcome head.
 
     use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
 
@@ -1394,7 +1409,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                     outcome_ids=outcome_token_ids,
                     all_abs_ts=batch["abs_ts"],
                     query_abs_ts=batch["abs_ts"][:, :-1],
-                    tau=_TAU,
+                    tau=model.outcome_log_tau.exp(),
                     horizon=_HORIZON,
                 )  # [B, T-1, K]
 

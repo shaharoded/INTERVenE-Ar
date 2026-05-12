@@ -224,7 +224,7 @@ def get_future_outcome_targets(
     outcome_ids: list,        # [K] list of outcome token IDs
     all_abs_ts: Optional[torch.Tensor] = None,  # [B, T] absolute timestamps
     query_abs_ts: Optional[torch.Tensor] = None, # [B, T_q] query timestamps
-    tau: Optional[float] = None,      # decay time constant (hours / 336)
+    tau = None,        # scalar OR [K] tensor — decay constant in normalised units
     horizon: Optional[float] = None,  # max lookahead horizon (hours / 336)
 ) -> torch.Tensor:
     """
@@ -282,16 +282,29 @@ def get_future_outcome_targets(
     # T_q = query_abs_ts.size(1)
     # Compute time differences: [B, T_q, T]
     dt = all_abs_ts.unsqueeze(1) - query_abs_ts.unsqueeze(2)
-    
+
     # Horizon filtering: 0 < dt <= horizon
     in_horizon = (dt > 0) & (dt <= horizon)
-    
-    # Decay weights: exp(-dt / tau), masked to horizon
-    decay_weights = torch.exp(-dt / tau).masked_fill(~in_horizon, 0.0)  # [B, T_q, T]
-    
-    # Aggregate outcomes via batch matrix multiply: [B, T_q, T] x [B, T, K] -> [B, T_q, K]
-    outcome_targets = torch.bmm(decay_weights, matches).clamp(0.0, 1.0)
-    
+
+    # tau may be scalar or [K]. Per-outcome (exp62) lets each outcome adapt its
+    # own decay timescale. RELEASE-type events have different dynamics than
+    # clinical complications, so a fixed scalar undersupervises one or the other.
+    is_per_k_tau = torch.is_tensor(tau) and tau.dim() == 1 and tau.numel() == K
+
+    if not is_per_k_tau:
+        decay_weights = torch.exp(-dt / tau).masked_fill(~in_horizon, 0.0)  # [B, T_q, T]
+        outcome_targets = torch.bmm(decay_weights, matches).clamp(0.0, 1.0)
+    else:
+        # Per-outcome decay: bmm in a loop over K to keep memory bounded.
+        # Each iter: decay_k [B,T_q,T] x matches_k [B,T,1] -> [B,T_q,1]
+        outcome_cols = []
+        in_horizon_f = in_horizon.float()
+        for k_idx in range(K):
+            decay_k = torch.exp(-dt / tau[k_idx]) * in_horizon_f  # [B,T_q,T]
+            col = torch.bmm(decay_k, matches[..., k_idx:k_idx + 1]).clamp(0.0, 1.0)  # [B,T_q,1]
+            outcome_cols.append(col)
+        outcome_targets = torch.cat(outcome_cols, dim=-1)
+
     return outcome_targets
 
 
