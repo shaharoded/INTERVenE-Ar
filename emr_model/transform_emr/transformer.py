@@ -1200,7 +1200,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
         --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f}, Haz={tr_hazard:.4f}, Rank={tr_ranking:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f}, Haz={vl_hazard:.4f}, Rank={vl_ranking:.4f})""")
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f}, Haz={vl_hazard:.4f}, Rank={vl_ranking:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} outcome={tr_outcome_raw:.7f} hazard={tr_hazard_raw:.7f} ranking={tr_ranking_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,

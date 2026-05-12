@@ -690,7 +690,8 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
 
         print(f"""[Phase-1] Epoch {epoch:03d}
             --> Train={tr_tot:.4f} (BCE={tr_bce:.4f}  Δt={tr_dt:.4f})
-            --> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  Δt={vl_dt:.4f})""")
+            --> Val={vl_tot:.4f} (BCE={vl_bce:.4f}  Δt={vl_dt:.4f})
+            --> RawTrain dt={tr_dt_raw:.7f}""")
 
         # Save best model only after aux-scheduler warmup is complete.
         warmup_gate = schedule_controller.current_warmup_end_epoch()
