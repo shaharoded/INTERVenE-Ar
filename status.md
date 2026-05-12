@@ -1,4 +1,4 @@
-# autoresearch — loop status (UTC 2026-05-12)
+# autoresearch — loop status (UTC 2026-05-12 ~22:30)
 
 ## TL;DR
 
@@ -9,71 +9,79 @@ DEATH 0.988   CARDIO 0.863   HYPERGLY 0.843   HYPOGLY 0.805
 KIDNEY 0.802  RELEASE 0.694                  peak VRAM 8.3 GB
 ```
 
-Loop resumed after the previous pause. Diagnose ran clean on exp63 (fix:
-6 call-sites in `diagnose.py` were still unpacking 5-tuples post hazard
-removal). Outcome head is healthy on all 6 active outcomes (no flips,
-LM-probe AUROC 0.81–0.99); Δt head R²=0.18, r=0.49.
-
 ## Status — in flight
 
-**exp64 — Direction D (skip Phase 3)** — single-config-change ablation.
+**exp66 — P3 ranking loss, methodology-fixed retry** (`82387ca`).
 
-`phase3_n_epochs: 50 → 0`. Eval falls back to the Phase-2 best checkpoint.
-This is the cheapest, most-informative single experiment in the queue per
-program.md: it tests whether Phase 3 has been net-negative since the
-data-shape gains landed. exp62 (P3 NaN'd → P2 fallback) hit RELEASE=0.813,
-which is the *real* upper-bound the audit revealed; skipping P3 cleanly
-should reproduce or beat it.
+This is exp65 with the val-selection bug fixed. exp65 added the
+pairwise ranking loss to Phase 3 but watched `val_total` for
+early-stop. Because λ_ranking calibrates at the end of epoch 1
+(λ goes 0 → λ_cal), val_total jumps at the epoch-1/2 boundary and the
+selector locks onto epoch 1 — so the saved checkpoint never saw a
+ranking gradient. Despite that, RELEASE moved +0.038 just from
+P3-shortening to 1 epoch.
 
-Sub-questions this experiment answers:
-- If AUROC ≥ exp63 → P3 is net-negative, remove it.
-- If AUROC drops > 0.01 → P3 is contributing on average, then move to
-  Direction A and reshape P3's loss.
-- If RELEASE jumps but AUROC drops → P3 over-fits the head to outcomes
-  other than RELEASE.
+exp66 fix: track `val_outcome_raw` separately, use it for early-stop.
+It is stable across the λ-transition and is the metric the
+generation-based eval ultimately measures (outcome head calibration on
+natural distribution). The ranking term still affects training; it
+just doesn't pollute the selector.
+
+Sub-questions exp66 answers:
+- AUROC ≥ exp63 + AUPRC ≥ 0.434 + HYPOGLY recovers → KEEP.
+- AUROC drops > 0.005 → ranking isn't the right P3 fix; move to
+  sub-2 (replace BCE with ranking-only) or Direction G (project-wide).
 
 ## Last completed
 
 | Exp | Commit | AUROC | AUPRC | RELEASE | max_len% | Status |
 |---|---|---|---|---|---|---|
-| exp60 | `c2f3856` | 0.833 | 0.396 | 0.756 | 8.7 | KEEP (later: per-family caveat) |
-| audit_0.4b | `71ddbe9` | 0.825 | 0.427 | 0.681 | 8.9 | KEEP (principled split) |
 | audit_0.2a | `083bfdb` | 0.828 | 0.401 | 0.698 | 14.9 | KEEP (hazard removed) |
 | audit_0.2c | `b0cabac` | 0.819 | 0.428 | 0.651 | 12.7 | AUDIT (outcome BCE borderline) |
-| **exp63** | **`033e019`** | **0.833** | **0.434** | **0.694** | **8.5** | **KEEP (current best)** |
+| exp62 | `c56108c` | 0.842 | 0.435 | 0.813 | 13.9 | DISCARD (P3 NaN'd → fluke) |
+| exp62b | `aa267eb` | 0.831 | 0.419 | 0.674 | 13.9 | DISCARD (P3 destroyed RELEASE) |
+| **exp63** | **`033e019`** | **0.833** | **0.434** | **0.694** | **8.5** | **KEEP — current** |
+| exp64 | `2c60c2a` | 0.797 | 0.364 | 0.688 | 14.9 | DISCARD (skip-P3: P3 IS net-positive +0.036 AUROC) |
+| exp65 | `12ce6fe` | 0.829 | 0.409 | 0.732 | 12.6 | DISCARD (methodology bug — ckpt never saw ranking grad) |
 
-## Open directions (post-exp63)
+## What we now know
 
-- **D (in flight)** — skip P3. Cheapest probe. Single config change.
-- **A** — reshape P3 loss (add ranking, swap to ranking-only, oversample
-  DataLoader in P3, P2-wins checkpoint selection). Run if D shows P3 is
-  contributing on average but damaging RELEASE.
-- **G** — remove outcome soft-BCE, keep ranking-only (one commit, audit
-  0.2c already showed AUPRC +0.027 cost-free). Easy after D.
-- **C** (refreshed) — soft-kernel BCE at LM head, learnable per-class tau.
-  Replaces the hard 168h-vs-12h two-tier with a model-learned kernel.
-  Bigger change, comes after D/A/G land.
-- **B** — patient-trajectory contrastive aux for RELEASE. Biggest new
-  surface area; defer until simpler RELEASE attacks are exhausted.
-- **E** — inference-side hazard boost (now that hazard head is un-trained).
-  Cheap; opportunistic.
+- exp64 (skip P3) cost AUROC −0.036, AUPRC −0.070. P3 is net-positive
+  on average; HYPOGLY (−0.121) and HYPERGLY (−0.050) are the
+  outcomes that lean on P3. Only CARDIO benefited from skipping.
+- exp65 (P3 + ranking, buggy selector) hit RELEASE 0.732 even though
+  the ranking gradient never trained the saved checkpoint. The
+  +0.038 RELEASE gain came from running P3 for just 1 epoch — that
+  alone is a useful diagnostic about P3 over-fitting RELEASE.
+- The "exp62 RELEASE = 0.813" story is officially retired (exp64
+  ran cleanly without P3 and RELEASE stayed at 0.688 — that number
+  was a NaN-fallback fluke).
 
-## Notable observations
+## Open directions (post-exp65)
 
-- The model's outcome-head logit distribution shows a clean two-cluster
-  split: 6 active outcomes have logit means in [-10, -3] with stds 1.6–3.8;
-  the 10 never-occurring outcomes are pushed to ~ -29 with std ~ 5.2. The
-  outcome head has correctly learnt to silence non-occurring outcomes.
-- DEATH gap = 10.8 at LM-probe (auroc 0.991) — the one-hot override
-  mechanism is dominant for DEATH, consistent with the Direction-F caveat.
-- RELEASE has the smallest "active" gap (3.26) — still the weakness.
+- **A sub-1 (in flight as exp66)** — add ranking loss to P3 with
+  stable val selection.
+- **A sub-2** — replace P3's BCE entirely with ranking-only. Run if
+  exp66 KEEPs but AUPRC doesn't move; sharper test.
+- **A sub-3** — use P2's oversampled DataLoader in P3 (natural→
+  oversampled). Different angle if loss-shape doesn't fix it.
+- **A sub-4** — explicitly limit P3 epochs (the exp65 accidental
+  evidence). Smaller change than skipping P3, tests "less is more".
+- **G** — remove outcome soft-BCE project-wide, keep ranking-only.
+  Bigger surgery; informed by A sub-1 / sub-2 outcomes.
+- **C** (refreshed) — soft-kernel BCE at LM head, learnable per-class
+  tau. Comes after the P3-loss work lands.
+- **B** — patient-trajectory contrastive aux for RELEASE. Defer.
+- **E** — inference-side hazard boost (un-trained hazard head in
+  model). Cheap; opportunistic.
 
 ## Process discipline
 
-- `results.tsv` is untracked; survives `git reset --hard`. 70 data rows
-  + header through exp63.
-- 6-decimal raw aux logging is committed (`39c3896`). Any "flat aux"
-  claim from here on must check raw values first.
-- DISCARD = `git reset --hard HEAD~1`. CRASH = log row with NaNs +
-  DISCARD.
-- Committing locally only; user pulls from root.
+- `results.tsv`: 72 data rows + header. Untracked; survives reset.
+- DISCARDed exp64 and exp65 with `git reset --hard`. inference.py
+  hazard-removal fix preserved as standalone bug-fix commit
+  (`c0a8ed0`); transformer.py reverted along with exp65.
+- 7-decimal raw aux logging now also in Phase 3 (every epoch logs
+  `raw_out` and `raw_rank`). exp65's "best-val locked at epoch 1"
+  was visible in the run.log; making this loud helps future audits.
+- Committing locally only.
