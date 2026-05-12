@@ -620,52 +620,215 @@ current best AUROC/AUPRC/MAE, peak VRAM, and what is still open.
 
 ---
 
-## Open-ended directions (after B/D/C are resolved)
+## Open-ended directions (current — May 2026, post-exp63)
 
-Two priorities, ordered:
+Tasks A, B, C, D, and the Task-0 honest audit are all complete. The headline
+numbers are:
 
-### Priority 1 — Add learnable proper auxiliaries
+```
+Current best — exp63  (commit 033e019)
+AUROC    0.833       AUPRC   0.434       MAE      81.6
+RELEASE  0.694       DEATH   0.988       CARDIO   0.863
+HYPERGLY 0.843       HYPOGLY 0.805       KIDNEY   0.802
+max_len  8.5 %       peak VRAM 8.3 GB
+```
 
-"Proper" = the aux loss visibly decreases across epochs AND a probe of its
-head shows it learned something non-trivial (Δt R², AUROC, etc.). Same bar as
-Rules of the road #1. A new aux that does not learn is noise dressed as
-supervision — same fate as MLM (exp54-removed). Candidates worth proposing:
-- Next-event-token prediction (a focused CE on the *immediately* next token,
-  separate from the multi-hot temporal BCE window).
-- Contrastive over event types (pull tokens in the same concept group
-  closer in embedding space, push others apart).
-- Survival / hazard variants beyond the current discrete-time bins
-  (continuous-time intensity, competing-risks formulation, etc.).
-- Trajectory-ordering tasks (predict whether two events in a patient's
-  history are in the correct order — gives Phase-1 a sequence signal).
+Five suspected real issues remain. Pick one direction at a time. None of
+these are hyperparameter sweeps — every entry is a structural / loss /
+architectural change with a hypothesis and a falsifiable probe.
 
-For every new aux: log `tr_<name>` per epoch and confirm a probe before
-declaring KEEP. If `tr_<name>` is flat, remove it; do not patch with cap
-tweaks.
+---
 
-### Priority 2 — Improve AUROC and MAE on specific weaknesses
+### Direction A — Phase 3 is damaging RELEASE. Replace its loss, not its LR.
 
-**RELEASE_EVENT is weak.** AUROC ~0.61 vs CARDIO 0.87, DEATH 0.97. It's a
-terminal outcome for *healthy* patients — distinct distribution from
-clinical complications. Experiments that explicitly help this outcome are in
-scope: contrastive separation of healthy-discharge trajectories from
-complication-trajectories, a dedicated discharge-prediction head with its
-own loss, RELEASE-conditioned pos_weight in the outcome BCE, etc.
+**The evidence.** RELEASE is the only outcome that gets worse in Phase 3:
+- exp62: P3 NaN'd → eval used the P2 checkpoint → RELEASE = **0.813**.
+- exp62b: same setup, P3 fixed → RELEASE = **0.674**. Drop of 0.139.
+- exp63: same setup, P3 frozen `outcome_log_tau` → RELEASE = **0.694**. P3 only
+  partly recovered RELEASE — the tau drift was *some* of the problem, not all.
+- audit_0.2c: removing outcome soft-BCE in P3 → AUPRC **+0.027**, suggesting
+  P3's loss surface actively miscalibrates the head on the natural distribution.
 
-**Inference termination is broken.** Eval logs show ~65% of generated
-trajectories hit `max_len=500` without emitting a natural terminal token
-(DEATH/RELEASE) → forced terminal injected, generated streams clipped to a
-uniform length. This corrupts the AR-generation distribution that
-`evaluation.py` depends on. Candidates:
-- Heavier `pos_weight` on terminal tokens in Phase-2 BCE.
-- A "trajectory-length / will-terminate" classification head with its own
-  loss in Phase-2.
-- Audit `inference.py`'s legality state machine: maybe terminals are being
-  suppressed at late steps by `compute_legality_masks_tf` even when they
-  should be legal.
-- Repetition-penalty or temperature adjustment in `generate(...)` is **not**
-  a structural fix — only attempt if you have evidence the model *wants* to
-  emit a terminal but generation logic suppresses it.
+**The hypothesis.** P3 trains the outcome head on natural-distribution data
+with **outcome soft-BCE only** — no ranking loss. The audit confirmed ranking
+is the *dominant* AUROC driver in P2 (ablation cost −0.044). When P3 removes
+that signal, the head re-learns a calibration that's wrong for the
+generation-based eval, and RELEASE — the majority terminal whose positives
+dominate the BCE — suffers most.
+
+**Not a hyperparameter problem.** Tuning LR/weight-decay won't fix a loss
+that's optimising the wrong objective.
+
+**Things to try (pick one per experiment):**
+
+1. **Add the ranking loss to P3.** Currently P3 has only soft-BCE; the
+   pairwise ranking loss that's locked in P2 is dropped. Mirror the P2
+   curriculum at a lower lambda — keep the head in the same loss landscape
+   it converged into during P2.
+2. **Replace P3's soft-BCE with ranking-only.** More aggressive: the AUROC
+   metric is rank-based, and ranking is what wins in P2. Soft-BCE may be
+   strictly net-negative in P3.
+3. **Use Phase-2's DataLoader in Phase 3.** Currently P2 oversamples rare
+   outcomes; P3 uses natural distribution. That swap is what changes between
+   the two phases — and it changes everything about what the loss "sees".
+   Try P3-with-oversampling (same data shape as P2) and see if RELEASE
+   recovers.
+4. **Use P2 best when P3 doesn't improve validation.** Today `api.py` prefers
+   the P3 checkpoint over P2 unconditionally. Change the selection logic so
+   the *better-on-val* checkpoint wins. This is a structural change to
+   checkpoint selection, not LR tuning.
+5. **Skip P3 entirely** (formally Direction D below). Strongest test of "is
+   P3 net-positive at all?" If skipping P3 ties or beats exp63 except on
+   max_len%, P3 has been carrying nothing and can be removed.
+
+Pick one. The user asked specifically that this *not* become an LR sweep —
+no `phase3_learning_rate` changes; only loss-shape, data-shape, or
+checkpoint-selection changes.
+
+---
+
+### Direction B — Contrastive patient-trajectory aux for RELEASE
+
+**The intent.** Every loss in the current codebase is *local*: BCE is
+per-position, ranking is per-(pos, neg) pair, hazard was per-bin. There is no
+loss that says *"this entire patient's trajectory looks like a healthy
+discharge"* or *"this trajectory looks like a cardio complication"*. RELEASE
+is the outcome that should benefit most from such a global signal — a
+released patient's signature is structural across the whole sequence
+(declining vitals abnormalities, fewer treatments, stable trends), not a
+local "outcome-token is coming next" pattern.
+
+**The mechanism.** Add a small contrastive head in Phase 2:
+1. After the last AdaLN block, attention-pool or mean-pool the hidden states
+   into a single `[B, embed_dim]` patient representation.
+2. Project through a 2-layer MLP to a smaller contrastive space, e.g. 128-d
+   with L2 normalisation.
+3. SimCLR-style loss within each batch: pairs of patients with the same
+   *terminal outcome* are positive pairs, different terminal = negative.
+   Use InfoNCE with a temperature parameter (kept frozen — Rule 3, no
+   sweeping).
+4. Train this head's loss alongside the others in P2 with its own λ cap.
+
+**Why it could be the RELEASE fix.** It is the only loss in the codebase
+that explicitly tells the model "patients-released-alive cluster together
+and apart from patients-with-cardio". The current local losses can't
+articulate this; they just chase per-position outcome timing.
+
+**Risk and mitigation.** Per Rule 6, any new aux must meet the learning bar
+or be removed — same fate as MLM. Risk specifically (exp58 lesson): a new
+head can divert backbone capacity from the primary objectives. Mitigations:
+- Start with a very small λ cap (e.g. 0.1) and confirm the primary BCE
+  doesn't regress.
+- If contrastive learns (probe AUROC on linear classifier over the
+  contrastive embeddings ≥ 0.7 for RELEASE) but primary BCE regresses,
+  detach the gradient to backbone (`pooled.detach()`) and let the
+  contrastive head learn alone on frozen-backbone representations — useful
+  signal for downstream inference even if it doesn't reshape Phase-2.
+
+---
+
+### Direction C — Learn the BCE window at the LM-head level
+
+**The intent.** The single biggest gain this project has logged (exp59:
++0.10 AUPRC, −74 pp max_len) came from a *data-shape* change: widening the
+BCE window from 12 h to 168 h for terminal tokens. Per your caveat, we
+abandoned hand-picking windows per event family — that risks overfitting to
+MIMIC-III's specific event distribution. The principled version is to
+**make the window a learned parameter** rather than a hand-coded number.
+
+**The mechanism.**
+1. In `get_temporal_multi_hot_targets` (or wherever the BCE labels are
+   built), replace the hard time window with a *soft* weighting:
+   `weight[t, k] = exp(−Δt(t, next_k) / softplus(log_tau[k]))`
+   where `log_tau[k]` is a learnable per-token-class parameter.
+2. Keep the two-tier hard split (terminals 168 h, everything else 12 h) as
+   an *upper bound* so `tau` doesn't blow up to 1000 h. Inside the bound,
+   the model learns each event family's natural scale.
+3. Initialise all `log_tau[k]` at the current hard value (`log(12)` for most
+   tokens, `log(168)` for terminals). Smoke test that the gradient is
+   non-zero across tokens.
+
+**Why it's not just a sweep.** A sweep would mean re-running with different
+window values until something wins. Here, *the model learns the window* —
+no human picks it. The gain transfers across datasets because the model
+re-fits the window automatically.
+
+**Risk.** This touches a locked-in data-shape gain. If the learned-window
+implementation is wrong it could break exp59's signal. Mitigation: run
+this as additive first (keep the hard 12 h/168 h two-tier; add learnable
+*per-token within-bound modulation*), and only replace the hard split if
+the additive version provably wins.
+
+---
+
+### Direction D — Audit Phase 3 entirely (skip-P3 as the headline experiment)
+
+**The intent.** Several signals suggest Phase 3 is doing more harm than
+good — but we haven't tested the cleanest hypothesis: just turn it off.
+
+**Single experiment, single config change.** Set `phase3_n_epochs = 0` (or
+add an `api.py` branch that skips the entire `finetune_transformer` call).
+Eval uses the Phase-2 best checkpoint.
+
+**What it tells us.**
+- If AUROC ≥ exp63 with P3 skipped → Phase 3 has been net-negative for some
+  time and should be removed from the pipeline entirely. Headline finding.
+- If AUROC drops > 0.01 with P3 skipped → Phase 3 *is* contributing on
+  average, the RELEASE damage is real but offset elsewhere. Then go back
+  to Direction A to find the right P3-loss structure.
+- If RELEASE *jumps* but AUROC drops → P3 over-fits the head to outcomes
+  other than RELEASE. Direction A subdirection: investigate per-outcome
+  P3 effects.
+
+This is the **cheapest, most informative single experiment** in the queue.
+It is not a hyperparameter sweep; it is a structural ablation of an entire
+pipeline phase. Strongly recommend running it first, then deciding A vs B
+vs C from the result.
+
+---
+
+### Direction E — Inference-side hazard boost (cheap, opportunistic)
+
+**The intent.** The hazard head was removed from *training* in audit_0.2a
+(Rule 2(b) — its ablation cost only +0.003 AUROC). But the head still
+exists architecturally with un-trained weights. Earlier exp57 tried a
+hazard-based logit boost at inference time and saw no effect — at that
+point the hazard *was* trained, but its predictions were dominated by
+near-zero logits that produced suppression rather than boost. With the
+head un-trained now, its predictions are different (essentially noise
+around zero rather than a calibrated near-zero distribution).
+
+**Why bother.** This is a near-free experiment: only `inference.py` and
+`eval_only.py` change; no retraining. If a small hazard-based modulation
+adds anything at all (e.g. via the hazard logits' geometry, which depends
+on the position in the sequence even with random weights), we get a free
+gain. If it doesn't, we lose ten minutes.
+
+**The bound.** Cap the time budget at one experiment. If inference-side
+boost doesn't move AUROC by ≥0.003 it's dead — and we've confirmed the
+hazard head can be physically removed from the model (not just zeroed) to
+save parameters.
+
+---
+
+### Status of historical "open-ended" priorities
+
+**Priority 1 — Learnable proper auxiliaries:** Two attempted, both honest:
+- Pairwise ranking loss (Task C) → KEPT (LOCKED, ablation cost −0.044).
+- `outcome_log_tau` per-K learnable (exp62/63) → KEPT (borderline, +0.005
+  AUROC at noise threshold but +0.033 AUPRC).
+Future candidates still in scope: contrastive (Direction B), next-event CE
+(separate from current ce), trajectory-ordering at Phase-1.
+
+**Priority 2 — RELEASE weakness:** Lifted from 0.601 to 0.694 by the
+combined wide-BCE-window-for-terminals + ranking-loss + learnable-tau
+stack. Still the weakest outcome. Direction B is the targeted attack.
+
+**Priority 2 — Inference termination:** Solved. `max_len%` dropped from
+~83% to 8.5% via wide-BCE-window-for-terminals (exp59 → audit_0.4b). No
+further work needed unless this regresses.
+
+---
 
 ### Loop discipline reminder
 
@@ -676,6 +839,11 @@ ALWAYS:
 3. Smoke-test → commit → full run → log → KEEP/DISCARD per rules above.
 4. One architectural idea per commit (Task D's compound D1+D2 commit was
    an exception because both fixes were needed to fit the 24 GB A5000).
+5. **No hyperparameter sweeps.** This is in Rule 3 for a reason: every
+   experiment must change *what* is learned or *how* it is learned, not
+   just what number is in the config. If your only proposed change is a
+   single number in a config dict, sit with it longer until you see the
+   structural question behind it.
 
 The user is away and trusts the loop. Keep it running.
 
