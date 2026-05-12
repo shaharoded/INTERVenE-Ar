@@ -920,6 +920,22 @@ ALWAYS:
    just what number is in the config. If your only proposed change is a
    single number in a config dict, sit with it longer until you see the
    structural question behind it.
+6. **Maintain a running `status.md` at the repo root.** The user reads this
+   file externally to track progress without trusting terminal output that
+   may be lost on SSH drops or tmux kills. Update it after every meaningful
+   event — every commit, every KEEP/DISCARD verdict, every phase boundary
+   in long runs — and `git add status.md && git commit && git push` it
+   each time so the user can `git pull` and read the latest. Always
+   *overwrite* the file in place; never append history into it.
+   Content (kept tight, one to two screens):
+   - `## TL;DR` — current best (commit / AUROC / AUPRC / MAE / RELEASE / max_len%).
+   - `## Status` — what experiment is in flight (commit + phase + epoch + ETA).
+   - `## Last completed` — last 3–5 experiments with status + one-line description.
+   - `## Open directions` — which of Directions A–H is next, with one-line "why now".
+   - `## Notable observations` — anything since the last status update that
+     might change the user's mind on prioritisation (e.g. "MAE jumped, suspect
+     X", "ranking loss decoupled from BCE in raw audit").
+   - Timestamp the file at the top in UTC.
 
 The user is away and trusts the loop. Keep it running.
 
