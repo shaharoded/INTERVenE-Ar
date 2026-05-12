@@ -81,15 +81,14 @@ TRAINING_SETTINGS = {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "outcome": 10.00,   # Confirmed peak across exp30/exp42/exp46; exp48 cap=12 hurt
-            # hazard: REMOVED for audit_0.2a — flat at 4-decimal weighted suspect; ablate to measure cost per Task 0.2.
-            "ranking": 0.20,    # Task C: pairwise AUROC-proxy ranking loss; cap conservative
+            # hazard: REMOVED in audit_0.2a (decorative per Rule 2(b)).
+            # ranking: REMOVED for audit_0.2b — measure Task-C contribution (was +0.014 AUROC in exp56).
         },
-        "order": [["ce", "dt"], ["outcome", "ranking"]],
+        "order": [["ce", "dt"], ["outcome"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
             "outcome": 3,  # Ramp over 3 epochs (confirmed optimal in exp30)
-            "ranking": 3,  # Same ramp as outcome — Task C activates alongside outcome stage
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
