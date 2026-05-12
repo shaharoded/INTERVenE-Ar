@@ -80,15 +80,14 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 10.00,   # Confirmed peak across exp30/exp42/exp46; exp48 cap=12 hurt
-            # hazard: REMOVED for audit_0.2a — flat at 4-decimal weighted suspect; ablate to measure cost per Task 0.2.
+            # hazard: REMOVED for audit_0.2a — Rule 2(b) decorative.
+            # outcome: REMOVED for audit_0.2c — Rule 2(b) ablation test. Ranking stays as Rule-6 floor.
             "ranking": 0.20,    # Task C: pairwise AUROC-proxy ranking loss; cap conservative
         },
-        "order": [["ce", "dt"], ["outcome", "ranking"]],
+        "order": [["ce", "dt"], ["ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
-            "outcome": 3,  # Ramp over 3 epochs (confirmed optimal in exp30)
             "ranking": 3,  # Same ramp as outcome — Task C activates alongside outcome stage
         },
         "plateau_min_delta": 1e-3,

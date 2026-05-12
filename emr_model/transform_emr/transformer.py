@@ -1080,7 +1080,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 # Only learn from valid (non-pad) time steps.
                 loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T-1, K]
                 loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
-                loss_outcome = lambdas["outcome"] * loss_outcome_raw
+                loss_outcome = lambdas.get("outcome", 0.0) * loss_outcome_raw
 
                 # === Loss: Discrete-time hazard (survival) ===
                 # For each position t and outcome k, predict which time bin (0-47h in 4h steps)
