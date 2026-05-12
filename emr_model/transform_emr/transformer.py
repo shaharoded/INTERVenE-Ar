@@ -1320,9 +1320,16 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     p3_wd = training_settings.get("phase3_weight_decay", training_settings["weight_decay"])
 
     def _freeze_backbone_only(m):
-        """Enable gradients for all params; optimizer LR controls effective freeze."""
+        """Enable gradients for all params; optimizer LR controls effective freeze.
+        exp63: outcome_log_tau is HARD-frozen in P3 — exp62b showed P3 drift in
+        tau destroys the P2-built RELEASE signal (RELEASE 0.813 P2-only →
+        0.674 with P3 trained). The soft-label horizon should be a Phase-2
+        decision; P3 only refines the outcome head's classifier weights.
+        """
         for param in m.parameters():
             param.requires_grad_(True)
+        if hasattr(m, "outcome_log_tau"):
+            m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
         head_names = {"outcome_head", "hazard_time_bias"}
