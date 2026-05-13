@@ -245,11 +245,12 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     val_dl, tokenizer = _load_validation_data(sample=sample, batch_size=batch_size)
 
     print("[Diag] Loading checkpoints...")
+    # Need Phase 1 (embedder) and at least one of Phase 2 / Phase 3.
     missing = []
     if not Path(PHASE1_CHECKPOINT).exists():
         missing.append(PHASE1_CHECKPOINT)
-    if not Path(PHASE2_CHECKPOINT).exists():
-        missing.append(PHASE2_CHECKPOINT)
+    if not Path(PHASE2_CHECKPOINT).exists() and not Path(PHASE3_CHECKPOINT).exists():
+        missing.append(f"{PHASE2_CHECKPOINT} OR {PHASE3_CHECKPOINT}")
     if missing:
         print("[Diag] Missing checkpoint(s). Run training first to generate them:")
         for ckpt in missing:
