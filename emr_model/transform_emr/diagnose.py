@@ -276,8 +276,11 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     labels_by_outcome = {tid: [] for _, tid in outcome_list}
     head_scores_by_outcome = {tid: [] for _, tid in outcome_list}
 
-    bce_win_h = float(training_settings.get("phase2_bce_window_hours", 12.0))
-    eval_win_h = float(training_settings.get("outcome_window_hi_hours", 48.0))
+    # Diagnostic comparison windows. The Phase-2 LM-head BCE is now driven by a
+    # learnable per-class soft kernel (no single global window), but a fixed 12 h
+    # comparison window remains a useful probe of the model's short-horizon signal.
+    bce_win_h  = 12.0
+    eval_win_h = float(training_settings.get("outcome_horizon_hours", 48.0))
     scale = 336.0
     bce_norm = bce_win_h / scale
     eval_norm = eval_win_h / scale

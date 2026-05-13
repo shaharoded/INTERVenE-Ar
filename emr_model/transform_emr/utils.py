@@ -99,123 +99,8 @@ def logger(func):
     return wrapper
 
 
-@torch.no_grad()
-def get_temporal_multi_hot_targets(
-    target_ids: torch.Tensor,
-    all_abs_ts: torch.Tensor,
-    padding_idx: int,
-    vocab_size: int,
-    window_size: float,
-    query_abs_ts: Optional[torch.Tensor] = None,
-    outcome_ids: Optional[torch.Tensor] = None,
-    next_token_ids: Optional[torch.Tensor] = None,
-    wide_token_ids: Optional[torch.Tensor] = None,
-    wide_window_size: Optional[float] = None,
-    wide_tiers: Optional[list] = None,
-) -> torch.Tensor:
-    """
-    Build temporal multi-hot targets over a future time window using GPU-efficient
-    searchsorted + prefix-sum approach.
 
-    For each query step t, marks token ids that appear at any future step s such that:
-        0 < (all_abs_ts[s] - query_abs_ts[t]) <= window_size
 
-    Outcome override: when ``outcome_ids`` and ``next_token_ids`` are both provided,
-    any query position whose immediate next token is an outcome/terminal token has its
-    entire multi-hot row replaced with a 1-hot on just that token. This eliminates
-    gradient dilution at exactly the positions where precise supervision matters most.
-
-    IMPORTANT: This function assumes all_abs_ts is NON-DECREASING (sorted) per batch.
-    The dataset MUST maintain this ordering. See dataset.py for sorting guarantees.
-
-    Args:
-        target_ids: [B, T_all] token ids whose occurrences will be marked as positives.
-        all_abs_ts: [B, T_all] absolute timestamps, MUST be non-decreasing per batch.
-        padding_idx: Token id used for PAD. PAD is excluded from targets.
-        vocab_size: Vocabulary size V for output shape.
-        window_size: Future window size (same normalized units as ``all_abs_ts``).
-        query_abs_ts: [B, T_q] optional query timestamps. If omitted, uses ``all_abs_ts``.
-        outcome_ids: 1-D LongTensor of outcome + terminal token ids. When provided
-            together with ``next_token_ids``, enables the 1-hot override.
-        next_token_ids: [B, T_q] immediate next token at each query position.
-            Use ``padding_idx`` where no next token exists (e.g. last position in phase-1).
-
-    Returns:
-        FloatTensor [B, T_q, V] with 0/1 multi-hot labels.
-    """
-    if query_abs_ts is None:
-        query_abs_ts = all_abs_ts
-
-    B, T_all = target_ids.shape
-    T_q = query_abs_ts.size(1)
-
-    # GPU-friendly searchsorted + prefix-sum approach (O(B * T * log T) instead of O(B * T^2)).
-    # Assumes timestamps are sorted; violation will produce incorrect results silently.
-    all_abs_ts = all_abs_ts.contiguous()
-    query_abs_ts = query_abs_ts.contiguous()
-    left_idx = torch.searchsorted(all_abs_ts, query_abs_ts, right=True)
-    right_idx = torch.searchsorted(all_abs_ts, query_abs_ts + window_size, right=True)
-
-    oh = F.one_hot(target_ids.clamp(min=0), num_classes=vocab_size).to(torch.float32)  # [B, T_all, V]
-    csum = oh.cumsum(dim=1)
-
-    # Prefix a zero row so window sum is prefix[right] - prefix[left].
-    prefix = torch.cat(
-        [torch.zeros(B, 1, vocab_size, device=target_ids.device, dtype=csum.dtype), csum],
-        dim=1,
-    )  # [B, T_all+1, V]
-
-    left = left_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
-    right = right_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
-
-    future_counts = prefix.gather(1, right) - prefix.gather(1, left)
-    multi_hot = (future_counts > 0).to(torch.float32)
-
-    if 0 <= padding_idx < vocab_size:
-        multi_hot[..., padding_idx] = 0.0
-
-    # Optionally apply wider future windows to specific subsets of tokens. Two entry
-    # points are supported:
-    #   - single-tier: pass wide_token_ids + wide_window_size
-    #   - multi-tier:  pass wide_tiers = [(ids, window), ...]
-    # Each tier reuses the same prefix sums — one extra searchsorted + gather per
-    # tier. The wider window provides denser positive signal for rare/critical
-    # tokens (e.g. terminals), so the LM head learns to assign higher logits at
-    # pre-event positions instead of only the immediate-next position.
-    _wide_specs = []
-    if wide_token_ids is not None and wide_window_size is not None and wide_token_ids.numel() > 0 and wide_window_size > window_size:
-        _wide_specs.append((wide_token_ids, wide_window_size))
-    if wide_tiers is not None:
-        for _tier_ids, _tier_w in wide_tiers:
-            if _tier_ids is not None and _tier_w is not None and _tier_ids.numel() > 0 and _tier_w > window_size:
-                _wide_specs.append((_tier_ids, _tier_w))
-    for _wide_ids, _w_size in _wide_specs:
-        right_wide_idx = torch.searchsorted(all_abs_ts, query_abs_ts + _w_size, right=True)
-        right_wide = right_wide_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
-        future_counts_wide = prefix.gather(1, right_wide) - prefix.gather(1, left)
-        wide_multi_hot = (future_counts_wide > 0).to(torch.float32)
-        if 0 <= padding_idx < vocab_size:
-            wide_multi_hot[..., padding_idx] = 0.0
-        wide_ids = _wide_ids.to(target_ids.device)
-        multi_hot[:, :, wide_ids] = wide_multi_hot[:, :, wide_ids]
-
-    # Outcome 1-hot override: replace the broad window multi-hot with a strict 1-hot at
-    # positions where the immediate next token is an outcome or terminal. Outcome tokens
-    # are never illegal so the legality mask does not conflict with this override.
-    if outcome_ids is not None and next_token_ids is not None and outcome_ids.numel() > 0:
-        assert next_token_ids.shape == (B, T_q), (
-            f"next_token_ids shape {next_token_ids.shape} must match (B={B}, T_q={T_q})"
-        )
-        oids = outcome_ids.to(target_ids.device)
-        # is_outcome_next[b, q] = True iff next_token_ids[b, q] is in outcome_ids
-        is_outcome_next = (next_token_ids.unsqueeze(-1) == oids.view(1, 1, -1)).any(-1)  # [B, T_q]
-        if is_outcome_next.any():
-            bi, qi = is_outcome_next.nonzero(as_tuple=True)
-            tok = next_token_ids[bi, qi]   # [N] the specific outcome token ids
-            multi_hot[bi, qi] = 0.0        # wipe window
-            multi_hot[bi, qi, tok] = 1.0   # replace with 1-hot
-
-    return multi_hot
 
 
 def get_temporal_soft_targets(
@@ -1160,7 +1045,7 @@ def compute_soft_outcome_labels(gen_abs_ts_hours, gt_df, outcome_names,
                        Expected to have a 'PositionToken' (or 'Token') column and
                        a 'TimePoint' column (normalised to [0,1] by /336).
     outcome_names    : list of outcome token strings (model.outcome_names).
-    tau_hours        : decay constant in hours (TRAINING_SETTINGS['outcome_decay_tau_hours']).
+    tau_hours        : decay constant in hours.
     horizon_hours    : max lookahead in hours (TRAINING_SETTINGS['outcome_horizon_hours']).
     device           : torch device for the returned tensor.
 
@@ -1282,3 +1167,128 @@ def audit_generated_stream(
     print("\n=== Full trajectory with annotations ===")
     print(df_out[['Token', 'IsInput', 'Note']]
           .to_string(index=True, col_space={'Token': token_w}))
+
+
+# ---------------------------------------------------------------------------
+# UNUSED — kept for reference only.
+# The Phase-2 LM-head BCE now uses get_temporal_soft_targets (learnable
+# per-class soft kernel). This hard-window multi-hot builder is no longer
+# called by any active code path. Retained for reference / future ablation.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def get_temporal_multi_hot_targets(
+    target_ids: torch.Tensor,
+    all_abs_ts: torch.Tensor,
+    padding_idx: int,
+    vocab_size: int,
+    window_size: float,
+    query_abs_ts: Optional[torch.Tensor] = None,
+    outcome_ids: Optional[torch.Tensor] = None,
+    next_token_ids: Optional[torch.Tensor] = None,
+    wide_token_ids: Optional[torch.Tensor] = None,
+    wide_window_size: Optional[float] = None,
+    wide_tiers: Optional[list] = None,
+) -> torch.Tensor:
+    """
+    Build temporal multi-hot targets over a future time window using GPU-efficient
+    searchsorted + prefix-sum approach.
+
+    For each query step t, marks token ids that appear at any future step s such that:
+        0 < (all_abs_ts[s] - query_abs_ts[t]) <= window_size
+
+    Outcome override: when ``outcome_ids`` and ``next_token_ids`` are both provided,
+    any query position whose immediate next token is an outcome/terminal token has its
+    entire multi-hot row replaced with a 1-hot on just that token. This eliminates
+    gradient dilution at exactly the positions where precise supervision matters most.
+
+    IMPORTANT: This function assumes all_abs_ts is NON-DECREASING (sorted) per batch.
+    The dataset MUST maintain this ordering. See dataset.py for sorting guarantees.
+
+    Args:
+        target_ids: [B, T_all] token ids whose occurrences will be marked as positives.
+        all_abs_ts: [B, T_all] absolute timestamps, MUST be non-decreasing per batch.
+        padding_idx: Token id used for PAD. PAD is excluded from targets.
+        vocab_size: Vocabulary size V for output shape.
+        window_size: Future window size (same normalized units as ``all_abs_ts``).
+        query_abs_ts: [B, T_q] optional query timestamps. If omitted, uses ``all_abs_ts``.
+        outcome_ids: 1-D LongTensor of outcome + terminal token ids. When provided
+            together with ``next_token_ids``, enables the 1-hot override.
+        next_token_ids: [B, T_q] immediate next token at each query position.
+            Use ``padding_idx`` where no next token exists (e.g. last position in phase-1).
+
+    Returns:
+        FloatTensor [B, T_q, V] with 0/1 multi-hot labels.
+    """
+    if query_abs_ts is None:
+        query_abs_ts = all_abs_ts
+
+    B, T_all = target_ids.shape
+    T_q = query_abs_ts.size(1)
+
+    # GPU-friendly searchsorted + prefix-sum approach (O(B * T * log T) instead of O(B * T^2)).
+    # Assumes timestamps are sorted; violation will produce incorrect results silently.
+    all_abs_ts = all_abs_ts.contiguous()
+    query_abs_ts = query_abs_ts.contiguous()
+    left_idx = torch.searchsorted(all_abs_ts, query_abs_ts, right=True)
+    right_idx = torch.searchsorted(all_abs_ts, query_abs_ts + window_size, right=True)
+
+    oh = F.one_hot(target_ids.clamp(min=0), num_classes=vocab_size).to(torch.float32)  # [B, T_all, V]
+    csum = oh.cumsum(dim=1)
+
+    # Prefix a zero row so window sum is prefix[right] - prefix[left].
+    prefix = torch.cat(
+        [torch.zeros(B, 1, vocab_size, device=target_ids.device, dtype=csum.dtype), csum],
+        dim=1,
+    )  # [B, T_all+1, V]
+
+    left = left_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
+    right = right_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
+
+    future_counts = prefix.gather(1, right) - prefix.gather(1, left)
+    multi_hot = (future_counts > 0).to(torch.float32)
+
+    if 0 <= padding_idx < vocab_size:
+        multi_hot[..., padding_idx] = 0.0
+
+    # Optionally apply wider future windows to specific subsets of tokens. Two entry
+    # points are supported:
+    #   - single-tier: pass wide_token_ids + wide_window_size
+    #   - multi-tier:  pass wide_tiers = [(ids, window), ...]
+    # Each tier reuses the same prefix sums — one extra searchsorted + gather per
+    # tier. The wider window provides denser positive signal for rare/critical
+    # tokens (e.g. terminals), so the LM head learns to assign higher logits at
+    # pre-event positions instead of only the immediate-next position.
+    _wide_specs = []
+    if wide_token_ids is not None and wide_window_size is not None and wide_token_ids.numel() > 0 and wide_window_size > window_size:
+        _wide_specs.append((wide_token_ids, wide_window_size))
+    if wide_tiers is not None:
+        for _tier_ids, _tier_w in wide_tiers:
+            if _tier_ids is not None and _tier_w is not None and _tier_ids.numel() > 0 and _tier_w > window_size:
+                _wide_specs.append((_tier_ids, _tier_w))
+    for _wide_ids, _w_size in _wide_specs:
+        right_wide_idx = torch.searchsorted(all_abs_ts, query_abs_ts + _w_size, right=True)
+        right_wide = right_wide_idx.clamp(0, T_all).unsqueeze(-1).expand(B, T_q, vocab_size)
+        future_counts_wide = prefix.gather(1, right_wide) - prefix.gather(1, left)
+        wide_multi_hot = (future_counts_wide > 0).to(torch.float32)
+        if 0 <= padding_idx < vocab_size:
+            wide_multi_hot[..., padding_idx] = 0.0
+        wide_ids = _wide_ids.to(target_ids.device)
+        multi_hot[:, :, wide_ids] = wide_multi_hot[:, :, wide_ids]
+
+    # Outcome 1-hot override: replace the broad window multi-hot with a strict 1-hot at
+    # positions where the immediate next token is an outcome or terminal. Outcome tokens
+    # are never illegal so the legality mask does not conflict with this override.
+    if outcome_ids is not None and next_token_ids is not None and outcome_ids.numel() > 0:
+        assert next_token_ids.shape == (B, T_q), (
+            f"next_token_ids shape {next_token_ids.shape} must match (B={B}, T_q={T_q})"
+        )
+        oids = outcome_ids.to(target_ids.device)
+        # is_outcome_next[b, q] = True iff next_token_ids[b, q] is in outcome_ids
+        is_outcome_next = (next_token_ids.unsqueeze(-1) == oids.view(1, 1, -1)).any(-1)  # [B, T_q]
+        if is_outcome_next.any():
+            bi, qi = is_outcome_next.nonzero(as_tuple=True)
+            tok = next_token_ids[bi, qi]   # [N] the specific outcome token ids
+            multi_hot[bi, qi] = 0.0        # wipe window
+            multi_hot[bi, qi, tok] = 1.0   # replace with 1-hot
+
+    return multi_hot

@@ -408,14 +408,10 @@ class EMREmbedding(nn.Module):
             embed_dim=config["embed_dim"],
             dropout=config["dropout"]
         )
-        # Tolerate stale keys from removed components so older checkpoints still load:
-        #   token_type_embeds.weight / _token_type_flags — token-type flag embeddings (removed)
-        #   mlm_head.weight                              — Phase-1 MLM head (removed)
-        stale_keys = {"token_type_embeds.weight", "_token_type_flags", "mlm_head.weight"}
         state = ckpt["model_state"]
         unexpected = set(state.keys()) - set(model.state_dict().keys())
-        if unexpected - stale_keys:
-            raise RuntimeError(f"[EMREmbedding.load] Unexpected keys: {sorted(unexpected - stale_keys)}")
+        if unexpected:
+            raise RuntimeError(f"[EMREmbedding.load] Unexpected keys: {sorted(unexpected)}")
         model.load_state_dict(state, strict=False)
 
         # Helpful metadata for callers that want to fully restore prior training settings.

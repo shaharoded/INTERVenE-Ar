@@ -733,22 +733,7 @@ class GPT(nn.Module):
         ckpt_keys  = set(state_dict.keys())
         missing    = model_keys - ckpt_keys
         unexpected = ckpt_keys - model_keys
-        # Tolerate stale keys from removed components so older checkpoints load:
-        #   outcome_to_lm.*    — outcome→LM coupling (removed; structurally incompatible with AR eval)
-        #   hazard_time_bias / hazard_x_bias.* / hazard_head.*   — discrete-time hazard head (removed)
-        #   _complication_ids                                    — second wide-window BCE tier (removed)
-        stale_keys = {"outcome_to_lm.weight", "outcome_to_lm.bias", "_outcome_lm_ids",
-                      "hazard_time_bias", "_complication_ids"}
-        stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_x_bias.")}
-        stale_keys = stale_keys | {k for k in unexpected if k.startswith("hazard_head.")}
-        # Tolerate missing parameters added later. Defaults are no-op (zero init or
-        # log-init equivalent to the legacy hard-coded value), so loading older
-        # checkpoints into the current model is safe.
-        new_keys = {k for k in missing if
-                    k.endswith(".time_bias_w") or k.endswith(".time_bias_b")
-                    or k in {"outcome_log_tau", "_terminal_ids"}}
-        missing = missing - new_keys
-        unexpected_non_stale = unexpected - stale_keys
+        unexpected_non_stale = unexpected
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
         if unexpected_non_stale:
@@ -864,10 +849,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         label_smoothing=0.0,     # optional
     ).to(device)
 
-    # No pos_weight: oversampling already rebalances rare outcomes in Phase-2.
-    # Combining pos_weight with oversampling would double-count, causing gradient explosion.
-    OutcomeCriterion = nn.BCEWithLogitsLoss(reduction='none')
-
     start_epoch = 0
     best_val = float("inf")
     bad_epochs = 0
@@ -911,8 +892,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_outcome = total_dt = total_ranking = 0.0
-        total_ce_raw = total_outcome_raw = total_dt_raw = total_ranking_raw = 0.0
+        total_loss = total_bce = total_ce = total_dt = total_ranking = 0.0
+        total_ce_raw = total_dt_raw = total_ranking_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -1000,40 +981,21 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 true_abs = batch["abs_ts"][:, 1:] # [B, T-1] (Shifted true times)
 
                 # === Loss: BCE with logits — temporal targets ===
-                # For each position t, mark all tokens within the next phase2_bce_window_hours
-                # as positives. Terminal tokens (DEATH/RELEASE) get a much wider window so the
-                # LM head sees dense pre-terminal positive signal, not just the immediate-next
-                # position. abs_ts is hours / _ABS_TS_SCALE.
+                # Per-token-class soft kernel: for each position t and class k, the
+                # target weight is exp(-|Δt| / tau_k) over all future positions where
+                # token == k, clamped to [0,1]. tau_k is learnable (model.log_tau_lm)
+                # and horizon hard-zeros beyond phase2_terminal_bce_window_hours.
                 _ABS_TS_SCALE = 336.0
-                _BCE_WIN  = training_settings.get("phase2_bce_window_hours", 12.0)            / _ABS_TS_SCALE
                 _TERM_WIN = training_settings.get("phase2_terminal_bce_window_hours", 168.0) / _ABS_TS_SCALE
-                if training_settings.get("phase2_use_soft_kernel", False):
-                    # Direction C: learnable per-token-class soft decay replaces
-                    # the hard two-tier window. tau is `model.log_tau_lm.exp()`,
-                    # horizon is the terminal window (widest of the old tiers).
-                    multi_hot = get_temporal_soft_targets(
-                        target_ids=full_targets,
-                        all_abs_ts=batch["abs_ts"],
-                        query_abs_ts=batch["abs_ts"][:, :-1],
-                        padding_idx=model.embedder.padding_idx,
-                        vocab_size=pred_logits.size(-1),
-                        tau=model.log_tau_lm.exp(),
-                        horizon=_TERM_WIN,
-                    )
-                else:
-                    multi_hot = get_temporal_multi_hot_targets(
-                        target_ids=full_targets,
-                        all_abs_ts=batch["abs_ts"],
-                        query_abs_ts=batch["abs_ts"][:, :-1],
-                        padding_idx=model.embedder.padding_idx,
-                        vocab_size=pred_logits.size(-1),
-                        window_size=_BCE_WIN,
-                        outcome_ids=model._outcome_ids,
-                        next_token_ids=full_targets[:, 1:],
-                        wide_tiers=[
-                            (model._terminal_ids, _TERM_WIN),
-                        ],
-                    )
+                multi_hot = get_temporal_soft_targets(
+                    target_ids=full_targets,
+                    all_abs_ts=batch["abs_ts"],
+                    query_abs_ts=batch["abs_ts"][:, :-1],
+                    padding_idx=model.embedder.padding_idx,
+                    vocab_size=pred_logits.size(-1),
+                    tau=model.log_tau_lm.exp(),
+                    horizon=_TERM_WIN,
+                )
                 multi_hot = multi_hot.masked_fill(illegal_mask, 0.0)
 
                 # mask out illegal classes AND PAD steps from the denominator
@@ -1088,11 +1050,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     horizon=_HORIZON,
                 )  # [B, T-1, K]
 
-                # Only learn from valid (non-pad) time steps.
-                loss_outcome_raw = OutcomeCriterion(outcome_pred, outcome_targets) # [B, T-1, K]
-                loss_outcome_raw = (loss_outcome_raw * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
-                loss_outcome = lambdas["outcome"] * loss_outcome_raw
-
                 # === Loss: Pairwise ranking (direct AUROC proxy on the outcome head) ===
                 # Positive positions: outcome_targets > 0 (outcome occurs within horizon).
                 # Negative positions: outcome_targets == 0 (no outcome within horizon).
@@ -1107,14 +1064,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + loss_outcome + abs_t_loss + loss_ranking
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "outcome": loss_outcome, "dt": abs_t_loss, "ranking": loss_ranking, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1144,11 +1101,9 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_loss    += loss.item()
                 total_bce     += loss_bce.item()
                 total_ce      += loss_ce.item()
-                total_outcome += loss_outcome.item()
                 total_dt      += abs_t_loss.item()
                 total_ranking += loss_ranking.item()
                 total_ce_raw      += loss_ce_raw.item()
-                total_outcome_raw += loss_outcome_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
 
@@ -1168,26 +1123,24 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_loss    / n_batches,
             total_bce     / n_batches,
             total_ce      / n_batches,
-            total_outcome / n_batches,
             total_dt      / n_batches,
             total_ranking / n_batches,
             total_ce_raw      / n_batches,
-            total_outcome_raw / n_batches,
             total_dt_raw      / n_batches,
             total_ranking_raw / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_outcome, tr_dt, tr_ranking, tr_ce_raw, tr_outcome_raw, tr_dt_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_outcome, vl_dt, vl_ranking, _, _, _, _                                          = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ce_raw, tr_dt_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Out={tr_outcome:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Out={vl_outcome:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} outcome={tr_outcome_raw:.7f} ranking={tr_ranking_raw:.7f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1195,7 +1148,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             tr_main=tr_bce,
             ce=tr_ce_raw,
             dt=tr_dt_raw,
-            outcome=tr_outcome_raw,
             ranking=tr_ranking_raw,
         )
         for msg in schedule_events:

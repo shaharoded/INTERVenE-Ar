@@ -23,12 +23,11 @@ TRAINING_SETTINGS = {
     "phase2_n_epochs": 50,
     "phase3_n_epochs": 50,
     "sample": None,  # set to int (e.g. 50) for a quick smoke-test
-    "phase2_use_soft_kernel": True,  # exp69 — Direction C: learnable per-class decay replaces 12h/168h two-tier
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
     "lr_warmup_epochs": 5,
-    "early-stop-patience": 10,  # Longer patience lets the outcome head converge through transient val plateaus
+    "early-stop-patience": 5,
     "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,
@@ -41,10 +40,10 @@ TRAINING_SETTINGS = {
     "batch_size": 16, # Number of patients processed concurrently (effective batch=64 via grad accumulation)
     "grad_accumulation_steps": 4, # Accumulate gradients over N steps before optimizer.step()
     "phase1_bce_window_hours": 3.0,
-    "phase2_bce_window_hours": 12.0,
-    # Terminal tokens (DEATH/RELEASE) use a wider future window in the LM-head
-    # multi-hot BCE so many pre-terminal positions are positive — denser supervision
-    # for the model to assign higher terminal logits hours-to-days before the event.
+    # Soft-kernel horizon for the Phase-2 LM-head BCE. The kernel decay constant
+    # tau is learnable per token class (model.log_tau_lm); this value is both the
+    # init for terminal tokens and the hard outer horizon beyond which the kernel
+    # contribution is zero.
     "phase2_terminal_bce_window_hours": 168.0,
 
     # Phase-1 auxiliary scheduler.
@@ -74,15 +73,13 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 0.00,    # exp71: zero — soft-kernel LM head now carries the outcome-timing signal that this term was providing
-            "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss; conservative cap (Rule 6 floor)
+            "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
         },
-        "order": [["ce", "dt"], ["outcome", "ranking"]],
+        "order": [["ce", "dt"], ["ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
-            "outcome": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
-            "ranking": 3,  # Same ramp as outcome — both activate together in stage 1
+            "ranking": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
@@ -90,10 +87,9 @@ TRAINING_SETTINGS = {
 
     # Outcome head — time-decayed soft labels.
     # For each position t the target for outcome k is:
-    # sum_s { exp(-dt(t,s) / tau) * 1[token_s == outcome_k] }.clamp(0, 1)
-    # where dt is the time gap (in hours, then normalised by 336) to future step s.
-    # tau controls the decay rate: at dt=tau the weight is ~0.37; at 3*tau it is ~0.05.
-    # outcome_horizon_hours hard-zeros any contribution beyond that horizon.
-    "outcome_decay_tau_hours":  12.0,   # half-life-ish decay constant (hours)
-    "outcome_horizon_hours":    48.0,   # keep in sync with eval horizon
+    # sum_s { exp(-dt(t,s) / tau_k) * 1[token_s == outcome_k] }.clamp(0, 1)
+    # tau_k is a per-outcome learnable parameter (model.outcome_log_tau), initialised
+    # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
+    # horizon (kept in sync with the eval window family).
+    "outcome_horizon_hours": 48.0,
 }
