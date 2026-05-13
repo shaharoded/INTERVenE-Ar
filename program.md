@@ -620,291 +620,81 @@ current best AUROC/AUPRC/MAE, peak VRAM, and what is still open.
 
 ---
 
-## Open-ended directions (current — May 2026, post-exp63)
+## Final open directions (post-exp73, May 2026)
 
-Tasks A, B, C, D, and the Task-0 honest audit are all complete. The headline
-numbers are:
+**Session summary (this loop's net result):**
 
 ```
-Current best — exp63  (commit 033e019)
-AUROC    0.833       AUPRC   0.434       MAE      81.6
-RELEASE  0.694       DEATH   0.988       CARDIO   0.863
-HYPERGLY 0.843       HYPOGLY 0.805       KIDNEY   0.802
-max_len  8.5 %       peak VRAM 8.3 GB
+Pre-session (exp63, 033e019)      Final (exp73, 3eaafa7)        Gain
+AUROC    0.833                    0.882                          +0.049
+AUPRC    0.434                    0.483                          +0.049
+MAE      81.6h                    83.9h                          +2.3 (slightly worse)
+max_len% 8.5                      0.0                            -8.5 (fixed)
+RELEASE  0.694                    0.812                          +0.118
+DEATH    0.988                    0.975                          -0.013
+CARDIO   0.863                    0.906                          +0.043
+KIDNEY   0.802                    0.863                          +0.061
+HYPERGLY 0.843                    0.884                          +0.041
+HYPOGLY  0.805                    0.849                          +0.044
 ```
 
-Five suspected real issues remain. Pick one direction at a time. None of
-these are hyperparameter sweeps — every entry is a structural / loss /
-architectural change with a hypothesis and a falsifiable probe.
+Every outcome is within +/-0.015 of its pre-session value or substantially above it. RELEASE recovered fully. Inference termination is solved (max_len% = 0). Peak VRAM stays at 9.4 GB (well below the 24 GB envelope).
 
----
+Four structural KEEPs survive in linear git history:
+- exp66 (`82387ca`) — P3 gains the ranking loss + stable `val_outcome_raw` checkpoint selector.
+- exp69 (`ebe9618`) — learnable per-class soft-kernel BCE at the LM head (replaces the hard 12h/168h two-tier).
+- exp71 (`3da7a74`) — drop P2 outcome BCE (now redundant with the soft kernel carrying outcome-class timing signal).
+- exp73 (`3eaafa7`) — three-tier `log_tau_lm` init (terminals 168h, outcome-class complications 48h, everything else 12h). Compensates for exp71's removal of outcome BCE by giving outcome-class tokens wider initial kernel.
 
-### Direction G — Fully remove outcome soft-BCE, keep ranking-only
+**All historical Tasks 0/A/B/C/D and Directions A/B/C/D/E/F/G above are CLOSED.** Directions G (drop outcome BCE) and C (soft kernel) were the highest-leverage findings; D (skip P3) was ruled out cleanly. Directions B (outcome-specific contrastive), E (inference hazard boost) and F (DEATH leakage audit) are no longer in scope (user constraint: outcome-agnostic only; hazard removed from code; eval reasoning audit done).
 
-**Status of evidence.** Audit_0.2c already ablated outcome soft-BCE (with hazard already removed in 0.2a) and reported AUROC −0.009 / AUPRC **+0.027** / RELEASE 0.698→0.651. The agent kept outcome soft-BCE because the AUROC cost just cleared the Rule 2(b) 0.005 bar. But the AUPRC clearly improved without it, and Rule 6 only mandates that *at least one* of {outcome soft-BCE, ranking, hazard} is active — ranking alone satisfies the mandate.
+### What is left worth trying
 
-**The proposed experiment.** Permanently delete the outcome soft-BCE term (and its `aux_fraction_caps["outcome"]` entry, its scheduler stage, its `outcome_log_tau` learnable parameter if any) — keep ranking as the sole outcome-direction signal. The outcome *head* (the `[B, T, K]` logits) stays, used only by the ranking loss (training) and by the eval (risk scores).
+Exactly two experiments, both with falsifiable outcomes, then stop.
 
-**Why this is principled, not a sweep.**
-- Ranking was confirmed real and dominant (audit 0.2b ablation cost −0.044 AUROC, vs outcome BCE's −0.009).
-- Outcome BCE drives the *calibration* of the head's logit scale, while ranking only cares about order. Removing BCE may shift logits to a different scale, but that scale change doesn't matter for the AUROC/AUPRC metric, which is rank-based.
-- The +0.027 AUPRC gain in audit_0.2c is *exactly* what a "less constrained head" should produce: the head can use its full output range to rank, instead of fighting calibration noise.
+#### Direction I — Tier-free `log_tau_lm` init (cleanest version of Direction C)
 
-**Risk.** AUROC may drop more than 0.009 in a clean run-from-scratch (vs audit_0.2c which used a partly-trained checkpoint). Smoke-test first; if AUROC drops more than 0.015 vs the current best, restore outcome BCE.
+**Motivation.** exp73's three-tier init is a soft per-family hand-pick. The user's principle has been: no hand-coded per-family parameters. The parameter is learnable, but the init is biased toward MIMIC-flavoured priors. The cleaner version is to init all `log_tau_lm[k]` at the same scalar (e.g. `log(12/336)`) and let the model learn the per-class scale.
 
-**Implementation.** Delete the outcome-BCE term in `transformer.py` / Phase-3's `finetune_transformer`, the `outcome_log_tau` parameter wiring if BCE was the only consumer, the relevant `aux_fraction_caps` and `order` entries in `phase2_scheduler`, and any tau-related code in soft-target construction (`get_outcome_soft_targets` or equivalent). One commit.
+**Hypothesis.** If the soft-kernel mechanism is doing what we believe, the model should rediscover the wide-terminal / medium-complication scales by gradient alone — possibly producing similar AUROC, possibly producing a cleaner outcome.
 
----
+**Outcomes / decision rule.**
+- AUROC within +/-0.005 of exp73: KEEP tier-free init; the codebase is cleaner and the per-family prior is unnecessary.
+- AUROC drops 0.005-0.015: marginal — keep three-tier init as the principled-soft hand-pick; document that the prior was load-bearing for AUROC but not for the *mechanism*.
+- AUROC drops > 0.015: the three-tier prior was carrying real work; keep it. The hand-coded init is a small principle violation accepted because it works.
 
-### Direction A — Phase 3 is damaging RELEASE. Replace its loss, not its LR.
+Either way the answer is informative.
 
-**The evidence.** RELEASE is the only outcome that gets worse in Phase 3:
-- exp62: P3 NaN'd → eval used the P2 checkpoint → RELEASE = **0.813**.
-- exp62b: same setup, P3 fixed → RELEASE = **0.674**. Drop of 0.139.
-- exp63: same setup, P3 frozen `outcome_log_tau` → RELEASE = **0.694**. P3 only
-  partly recovered RELEASE — the tau drift was *some* of the problem, not all.
-- audit_0.2c: removing outcome soft-BCE in P3 → AUPRC **+0.027**, suggesting
-  P3's loss surface actively miscalibrates the head on the natural distribution.
+**Implementation.** Single config / init change in `transformer.py`. Verify with a smoke test, then full run.
 
-**The hypothesis.** P3 trains the outcome head on natural-distribution data
-with **outcome soft-BCE only** — no ranking loss. The audit confirmed ranking
-is the *dominant* AUROC driver in P2 (ablation cost −0.044). When P3 removes
-that signal, the head re-learns a calibration that's wrong for the
-generation-based eval, and RELEASE — the majority terminal whose positives
-dominate the BCE — suffers most.
+#### Direction J — AUPRC recovery attempt
 
-**Not a hyperparameter problem.** Tuning LR/weight-decay won't fix a loss
-that's optimising the wrong objective.
+**Motivation.** AUPRC peaked at exp69 (0.512) and dipped to 0.483 at exp73, a 5.7% relative loss. The dip traces to exp71+73 trading AUPRC for AUROC. The drop spreads across outcomes, not a single-outcome story.
 
-**Things to try (pick one per experiment):**
+**Hypothesis.** Restoring the P2 outcome soft-BCE (which exp71 dropped) on top of exp73's three-tier init (or the tier-free init from Direction I) recovers AUPRC without losing the AUROC gain. The two losses were tuned against each other previously; the combination at the new soft-kernel baseline has not been tested directly.
 
-1. **Add the ranking loss to P3.** Currently P3 has only soft-BCE; the
-   pairwise ranking loss that's locked in P2 is dropped. Mirror the P2
-   curriculum at a lower lambda — keep the head in the same loss landscape
-   it converged into during P2.
-2. **Replace P3's soft-BCE with ranking-only.** More aggressive: the AUROC
-   metric is rank-based, and ranking is what wins in P2. Soft-BCE may be
-   strictly net-negative in P3.
-3. **Use Phase-2's DataLoader in Phase 3.** Currently P2 oversamples rare
-   outcomes; P3 uses natural distribution. That swap is what changes between
-   the two phases — and it changes everything about what the loss "sees".
-   Try P3-with-oversampling (same data shape as P2) and see if RELEASE
-   recovers.
-4. **Use P2 best when P3 doesn't improve validation.** Today `api.py` prefers
-   the P3 checkpoint over P2 unconditionally. Change the selection logic so
-   the *better-on-val* checkpoint wins. This is a structural change to
-   checkpoint selection, not LR tuning.
-5. **Skip P3 entirely** (formally Direction D below). Strongest test of "is
-   P3 net-positive at all?" If skipping P3 ties or beats exp63 except on
-   max_len%, P3 has been carrying nothing and can be removed.
+**Outcomes / decision rule.**
+- AUROC stays >= 0.875 AND AUPRC >= 0.500: KEEP. Best of both.
+- AUROC drops > 0.010 from exp73: outcome BCE re-introduces over-supervision against the soft kernel. DISCARD; accept the AUROC/AUPRC trade.
+- AUPRC fails to recover (< 0.490): outcome BCE removal was not the cause of the AUPRC dip. DISCARD; the AUPRC drop is intrinsic to the soft-kernel + tier-init regime.
 
-Pick one. The user asked specifically that this *not* become an LR sweep —
-no `phase3_learning_rate` changes; only loss-shape, data-shape, or
-checkpoint-selection changes.
+**Implementation.** Flip `aux_fraction_caps["outcome"]` from 0 (current) back to 10.0; rerun. One config change, smoke + full.
 
----
+### Stop criterion (after Directions I and J)
 
-### Direction B — Contrastive patient-trajectory aux for RELEASE
+After both directions land KEEP or DISCARD verdicts, the loop stops. At that point every remaining lever (LR, embed_dim, n_layer, n_head, dropout, batch size, epoch counts, per-outcome ranking heads, alternative contrastive designs) is either a hyperparameter sweep (forbidden by Rule 3) or a speculative architectural gamble without a clear failure mode.
 
-**The intent.** Every loss in the current codebase is *local*: BCE is
-per-position, ranking is per-(pos, neg) pair, hazard was per-bin. There is no
-loss that says *"this entire patient's trajectory looks like a healthy
-discharge"* or *"this trajectory looks like a cardio complication"*. RELEASE
-is the outcome that should benefit most from such a global signal — a
-released patient's signature is structural across the whole sequence
-(declining vitals abnormalities, fewer treatments, stable trends), not a
-local "outcome-token is coming next" pattern.
+Write a final session report and pause the loop.
 
-**The mechanism.** Add a small contrastive head in Phase 2:
-1. After the last AdaLN block, attention-pool or mean-pool the hidden states
-   into a single `[B, embed_dim]` patient representation.
-2. Project through a 2-layer MLP to a smaller contrastive space, e.g. 128-d
-   with L2 normalisation.
-3. SimCLR-style loss within each batch: pairs of patients with the same
-   *terminal outcome* are positive pairs, different terminal = negative.
-   Use InfoNCE with a temperature parameter (kept frozen — Rule 3, no
-   sweeping).
-4. Train this head's loss alongside the others in P2 with its own λ cap.
+### What NOT to try next (rejected per current user direction)
 
-**Why it could be the RELEASE fix.** It is the only loss in the codebase
-that explicitly tells the model "patients-released-alive cluster together
-and apart from patients-with-cardio". The current local losses can't
-articulate this; they just chase per-position outcome timing.
+- Per-outcome custom heads / outcome-specific augmentations. User constraint: outcome-agnostic only.
+- HYPOGLY-specific or RELEASE-specific contrastive aux. Same constraint.
+- Re-attempting Phase-1 soft kernel without a fundamentally new design — already failed twice on Time2Vec destabilisation (exp70 + retry). Embedder may simply be too simple to handle the learned kernel; a static 3h window is its current foundation.
+- Re-introducing the hazard head or outcome-to-LM coupling. Both confirmed structurally unhelpful in this codebase.
+- Linear outcome head — confirmed load-bearing non-linearity (exp75).
+- log1p Δt loss — confirmed degrades trajectory generation (exp76).
 
-**Risk and mitigation.** Per Rule 6, any new aux must meet the learning bar
-or be removed — same fate as MLM. Risk specifically (exp58 lesson): a new
-head can divert backbone capacity from the primary objectives. Mitigations:
-- Start with a very small λ cap (e.g. 0.1) and confirm the primary BCE
-  doesn't regress.
-- If contrastive learns (probe AUROC on linear classifier over the
-  contrastive embeddings ≥ 0.7 for RELEASE) but primary BCE regresses,
-  detach the gradient to backbone (`pooled.detach()`) and let the
-  contrastive head learn alone on frozen-backbone representations — useful
-  signal for downstream inference even if it doesn't reshape Phase-2.
-
----
-
-### Direction C — Soft-kernel BCE targets at the LM head (learn the window)
-
-**The intent.** The single biggest gain this project has logged (exp59:
-+0.10 AUPRC, −74 pp max_len) came from a *data-shape* change: widening the
-BCE window from 12 h to 168 h for terminal tokens. Per the overfitting
-caveat we will not hand-pick more windows per event family. The principled
-version is to replace the hard window with a **soft kernel** whose decay
-constant is learned per token class — symmetric with the outcome head's
-existing `exp(−Δt / tau)` soft target.
-
-**The mechanism (Phase 2 first).**
-1. In `get_temporal_multi_hot_targets`, replace the binary in-window check
-   with a continuous weight:
-   `target[t, k] = max_s exp(−|Δt(t, s)| / softplus(log_tau[k])) * 1[token_s == k]`
-   (or `sum_s … .clamp(0, 1)` — same formula as `get_future_outcome_targets`).
-   `log_tau[k]` is a learnable per-token-class parameter, size `[V]`.
-2. Initialise `log_tau[k]` at the current hard-window value: `log(12 / 336)`
-   for most tokens, `log(168 / 336)` for terminals.
-3. Optional safety cap: apply `softplus` with an upper bound so `tau` cannot
-   blow up to absurd values (e.g. cap at the current terminal value).
-4. The hard-window two-tier split goes away entirely; the model learns the
-   right scale per class.
-
-**Why this is the right reframing of the user's "weighted-positive BCE" idea.**
-The user proposed: instead of a hard binary positive label inside a window,
-use a continuous positive weight that decays with distance from the actual
-target. That is exactly the formula above. The outcome head already does
-this for outcome tokens; Direction C is "apply the same idea to the LM head
-across the full vocab". The discontinuity at the hard-window edge
-(`12h: 1, 12h+ε: 0`) disappears, and tokens closer in time get stronger
-supervision than tokens further out — which both the user's intuition and
-the symmetry with the outcome head support.
-
-**Why it's not just a sweep.** A sweep would mean re-running with different
-window values until something wins. Here, the model learns the kernel scale
-per class. No human picks it, and the gain transfers across datasets
-because the model re-fits the kernel automatically.
-
-**Risk.** This touches a locked-in data-shape gain. If the learned-kernel
-implementation is wrong it could break exp59's signal. Mitigation order:
-1. Implement in Phase 2 only.
-2. Smoke test that `tr_bce` doesn't explode and that `log_tau[k]` actually
-   moves during training for at least the terminal classes.
-3. Compare to exp63 baseline: AUROC must stay within ±0.01, AUPRC must not
-   regress more than 0.02, `max_len%` must stay below 15.
-4. Only if Phase 2 soft-kernel wins (or ties cleanly), consider extending
-   to Phase 1 BCE as a follow-up. Phase 1's 3 h window is already narrow,
-   so the gain is smaller and the risk of disturbing the foundational
-   embedder is higher. Defer.
-
-**Fallback if Direction C fails.** If learnable per-class kernels don't beat
-the current two-tier hard window, fall back to a single structural rule:
-**all outcome-class tokens (terminals + clinical complications) use the
-outcome_horizon_hours window (48 h); everything else stays at 12 h.** This
-keeps two tiers, but the split is principled by horizon alignment (lm-head
-window matches outcome-head supervision horizon and the eval window family)
-rather than per-family hand-picking. Exp60 tested this configuration and
-gave +0.008 AUROC over exp59 before being reverted on per-family-caveat
-grounds; under the "horizon alignment" justification it is a defensible
-single-rule extension.
-
----
-
-### Direction D — Audit Phase 3 entirely (skip-P3 as the headline experiment)
-
-**The intent.** Several signals suggest Phase 3 is doing more harm than
-good — but we haven't tested the cleanest hypothesis: just turn it off.
-
-**Single experiment, single config change.** Set `phase3_n_epochs = 0` (or
-add an `api.py` branch that skips the entire `finetune_transformer` call).
-Eval uses the Phase-2 best checkpoint.
-
-**What it tells us.**
-- If AUROC ≥ exp63 with P3 skipped → Phase 3 has been net-negative for some
-  time and should be removed from the pipeline entirely. Headline finding.
-- If AUROC drops > 0.01 with P3 skipped → Phase 3 *is* contributing on
-  average, the RELEASE damage is real but offset elsewhere. Then go back
-  to Direction A to find the right P3-loss structure.
-- If RELEASE *jumps* but AUROC drops → P3 over-fits the head to outcomes
-  other than RELEASE. Direction A subdirection: investigate per-outcome
-  P3 effects.
-
-This is the **cheapest, most informative single experiment** in the queue.
-It is not a hyperparameter sweep; it is a structural ablation of an entire
-pipeline phase. Strongly recommend running it first, then deciding A vs B
-vs C from the result.
-
----
-
-### Direction F — Reasoning audit of the DEATH/RELEASE scoring (one-shot, no experiment)
-
-**Not an experiment.** `evaluation.py` is locked. This is a documented reasoning check: does the current scoring measure something clinically meaningful, and how should DEATH=0.988 be interpreted?
-
-**The mechanism.** Terminal outcomes (DEATH, RELEASE) are always the last token of every patient's actual sequence (`_truncate_after_terminal_event` ensures one terminal at the end). Generation continues until the model emits a terminal (or `max_len` triggers a forced terminal). `pooled_episode_auc` divides generated trajectories into 24 h windows, scores each window with `max P_<outcome>` and labels it 1 if the ground-truth terminal is within ±24 h.
-
-Two facts interact to make terminal-AUROC slightly different from complication-AUROC:
-1. The model's generated trajectory always ends with a terminal token (or hits the horizon).
-2. The outcome head has a one-hot override at training and inference (`utils.py` / `embedder.py`): when the input/emitted token equals an outcome, `P_<outcome>` is hard-set to ~1.
-
-Consequence: the window containing the emitted terminal carries `label≈1` (if the emit time is near the GT terminal time) AND `score≈1` (one-hot override). So part of the terminal AUROC measures "did the model emit the right terminal near the right time", not exclusively "did the model anticipate the terminal early from features".
-
-**Is this a problem?**
-For the clinical deployment goal — *"given an in-progress trajectory, can the model tell me this patient is about to die?"* — the answer is **no, it's not a problem**:
-- The 24 h window includes positions strictly before the emit time too (each generated step has a P_DEATH from the outcome head). If the model only spiked P_DEATH at the emit position, the window's `max P_DEATH` would still capture that as score=1 *at that timestamp*, which is what a clinician would see.
-- The one-hot override is applied symmetrically across all 18 outcomes (DEATH, RELEASE, and the 16 complications), so the scoring bias toward terminals also exists for any complication that was emitted as a token within the generation window. The metric is internally consistent.
-- More importantly, the clinical question is "is this patient at imminent risk of dying?" not "did you guess death 12h earlier than your own emission?". The current AUROC answers the clinical question. A model that emits DEATH at the right time is a model that signaled high P_DEATH at the right time — that's the deployment signal.
-
-**The right caveat to record (not fix).**
-In any external write-up the DEATH=0.988 number should be reported with the methodological note:
-> "AUROC is computed on the autoregressively generated trajectory. Risk scores include the one-hot signal at the moment the model emits the terminal token. This reflects the deployment regime (a continuously updated risk score that spikes when the model commits to a DEATH trajectory), not a held-out-from-features anticipation metric."
-
-**Why RELEASE is not at 0.988 too.** RELEASE windows dominate the negative class (most patients are released), so even small score noise on the many true-RELEASE windows penalises AUROC heavily. RELEASE 0.694 is the actually-difficult number, and it is the right target for further work (see Direction B).
-
-**Conclusion — audit verdict.** The evaluation scoring is doing the right thing for the clinical-deployment goal. The 0.988 is real but should be reported with the deployment-regime caveat above. No code change is required. No experiment is queued for Direction F.
-
-(Data-side concerns — context column leakage, the 30-day-post-release relabel, sub-48 h patient cohort — have been confirmed by the user as non-issues for this dataset.)
-
----
-
-### Direction E — Inference-side hazard boost (cheap, opportunistic)
-
-**The intent.** The hazard head was removed from *training* in audit_0.2a
-(Rule 2(b) — its ablation cost only +0.003 AUROC). But the head still
-exists architecturally with un-trained weights. Earlier exp57 tried a
-hazard-based logit boost at inference time and saw no effect — at that
-point the hazard *was* trained, but its predictions were dominated by
-near-zero logits that produced suppression rather than boost. With the
-head un-trained now, its predictions are different (essentially noise
-around zero rather than a calibrated near-zero distribution).
-
-**Why bother.** This is a near-free experiment: only `inference.py` and
-`eval_only.py` change; no retraining. If a small hazard-based modulation
-adds anything at all (e.g. via the hazard logits' geometry, which depends
-on the position in the sequence even with random weights), we get a free
-gain. If it doesn't, we lose ten minutes.
-
-**The bound.** Cap the time budget at one experiment. If inference-side
-boost doesn't move AUROC by ≥0.003 it's dead — and we've confirmed the
-hazard head can be physically removed from the model (not just zeroed) to
-save parameters.
-
----
-
-### Status of historical "open-ended" priorities
-
-**Priority 1 — Learnable proper auxiliaries:** Two attempted, both honest:
-- Pairwise ranking loss (Task C) → KEPT (LOCKED, ablation cost −0.044).
-- `outcome_log_tau` per-K learnable (exp62/63) → KEPT (borderline, +0.005
-  AUROC at noise threshold but +0.033 AUPRC).
-Future candidates still in scope: contrastive (Direction B), next-event CE
-(separate from current ce), trajectory-ordering at Phase-1.
-
-**Priority 2 — RELEASE weakness:** Lifted from 0.601 to 0.694 by the
-combined wide-BCE-window-for-terminals + ranking-loss + learnable-tau
-stack. Still the weakest outcome. Direction B is the targeted attack.
-
-**Priority 2 — Inference termination:** Solved. `max_len%` dropped from
-~83% to 8.5% via wide-BCE-window-for-terminals (exp59 → audit_0.4b). No
-further work needed unless this regresses.
-
----
 
 ### Loop discipline reminder
 
