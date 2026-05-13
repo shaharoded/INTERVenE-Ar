@@ -74,8 +74,8 @@ TRAINING_SETTINGS = {
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
-            "outcome": 10.00,   # Soft-BCE outcome head; higher caps over-dominate the backbone
-            "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss; conservative cap
+            "outcome": 0.00,    # exp71: zero — soft-kernel LM head now carries the outcome-timing signal that this term was providing
+            "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss; conservative cap (Rule 6 floor)
         },
         "order": [["ce", "dt"], ["outcome", "ranking"]],
         "ramp_epochs": {
