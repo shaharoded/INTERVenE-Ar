@@ -9,6 +9,7 @@ TRAIN_TEMPORAL_DATA_FILE = os.path.join(PROJECT_ROOT, 'data', 'train', 'temporal
 TRAIN_CTX_DATA_FILE      = os.path.join(PROJECT_ROOT, 'data', 'train', 'context_data.csv')
 TEST_TEMPORAL_DATA_FILE  = os.path.join(PROJECT_ROOT, 'data', 'test', 'temporal_data.csv')
 TEST_CTX_DATA_FILE       = os.path.join(PROJECT_ROOT, 'data', 'test', 'context_data.csv')
+QA_DATA_FILE             = os.path.join(PROJECT_ROOT, 'data', 'source', 'qa_data.csv')
 
 # Define the prediction targets, <bot>, <eot> tokens to terminate the inference
 OUTCOMES = [
@@ -42,13 +43,21 @@ MEAL_TOKENS = ["MEAL_CONTEXT_Breakfast", "MEAL_CONTEXT_Lunch", "MEAL_CONTEXT_Din
 # Outcomes below this threshold are dropped — they have too few positive examples to learn from.
 OUTCOME_RARE_THRESHOLD_PCT = 1.0
 
-# inclusion/exclusion criteria to filter all datasets
-INCLUSION_EXCLUSION_CRITERIA = {
-    "temporal": [
-        "WHERE Value NOT LIKE '%Steady%'",
-        "WHERE ConceptName NOT LIKE '%_PATTERN%'",
-    ],
-    "context":[
+USE_QA_DATA = False  # Whether to include QA data in training (based on the medical GL)
+# History window (hours from admission) used when aggregating QA ComplianceScore into
+# context features. At eval time DataProcessor overrides this with max_input_days * 24
+# so QA features match the k-day seed actually given to the model.
+QA_HISTORY_HOURS_DEFAULT = 48
 
-    ]
+# inclusion/exclusion criteria to filter all datasets.
+# %_PATTERN% events carry treatment-quality signal — keep them only when QA features
+# are enabled, drop them otherwise so the LM does not have to model pattern markers
+# the model does not consume.
+_temporal_filters = ["WHERE Value NOT LIKE '%Steady%'"]
+if not USE_QA_DATA:
+    _temporal_filters.append("WHERE ConceptName NOT LIKE '%_PATTERN%'")
+
+INCLUSION_EXCLUSION_CRITERIA = {
+    "temporal": _temporal_filters,
+    "context": [],
 }

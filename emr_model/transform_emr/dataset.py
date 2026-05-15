@@ -87,6 +87,8 @@ class DataProcessor:
         # Process on context_df
         if 'index' in self.context_df.columns:
             self.context_df = self.context_df.drop(columns=['index'])
+        # QA features must be merged BEFORE indexing/scaling so the scaler picks them up.
+        self._add_qa_features()
         self.context_df = self.context_df.set_index("PatientId").drop(columns=["PatientId"], errors="ignore").astype("float32")
         self._fit_scaler()
         return self.df, self.context_df
@@ -165,6 +167,98 @@ class DataProcessor:
             print(f"[DataProcessor] Applied {source_name} filter: {cond} | rows {before_n} -> {after_n}")
 
         return out_df
+
+    def _add_qa_features(self):
+        """
+        Purpose: Augment context_df with per-patient, per-PatternName mean ComplianceScore
+                 over the first `qa_history_hours` after admission.
+        Method:  Load qa_data.csv (path from config); compute elapsed hours from each
+                 patient's earliest StartDateTime in self.df; filter QA rows to
+                 [0, qa_history_hours]; group by (PatientId, PatternName) and mean
+                 the score; pivot to wide; reindex to the canonical PatternName set
+                 read from the FULL qa file (stable schema across train/val); reindex
+                 to all PatientIds in context_df with zero-fill; merge as new columns.
+
+                 No-op when USE_QA_DATA is False so the gate is a single config flag.
+
+        Args:    None (uses self.df, self.context_df, self.max_input_days).
+
+        Returns: None. Mutates self.context_df in place.
+        """
+        if not USE_QA_DATA:
+            return
+
+        if not os.path.exists(QA_DATA_FILE):
+            raise FileNotFoundError(
+                f"USE_QA_DATA=True but QA file missing: {QA_DATA_FILE}"
+            )
+
+        qa = pd.read_csv(QA_DATA_FILE, low_memory=False)
+        required = ["PatientId", "PatternName", "StartDateTime", "ComplianceScore"]
+        for col in required:
+            if col not in qa.columns:
+                raise ValueError(f"qa_data.csv missing required column: {col}")
+
+        qa["StartDateTime"] = pd.to_datetime(
+            qa["StartDateTime"], format="ISO8601", utc=True, errors="raise"
+        ).dt.tz_convert(None)
+
+        # Canonical pattern column set comes from the FULL qa file so train and val
+        # splits always produce the same column layout. Sorted for determinism.
+        canonical_patterns = sorted(qa["PatternName"].unique())
+        qa_cols = [f"QA_{p}" for p in canonical_patterns]
+
+        # Per-patient admission time = earliest StartDateTime cached in _normalize_time
+        # (self.df no longer has StartDateTime after _expand_tokens replaced it with TimePoint).
+        # Patients that were dropped (e.g. by _cut_after_k_days) still appear here, which
+        # is fine — the reindex/zero-fill at the end aligns to context_df's patient set.
+        if not hasattr(self, "_patient_admission_time"):
+            raise RuntimeError(
+                "_add_qa_features called before _normalize_time — admission timestamps unavailable."
+            )
+        admission = self._patient_admission_time.rename("AdmissionTime").reset_index()
+
+        qa_history_hours = (
+            float(self.max_input_days) * 24.0 if self.max_input_days else float(QA_HISTORY_HOURS_DEFAULT)
+        )
+
+        qa = qa.merge(admission, on="PatientId", how="inner")
+        qa["elapsed_h"] = (qa["StartDateTime"] - qa["AdmissionTime"]).dt.total_seconds() / 3600.0
+        qa = qa[(qa["elapsed_h"] >= 0.0) & (qa["elapsed_h"] <= qa_history_hours)]
+
+        if len(qa) == 0:
+            # No QA rows fell in the window for any patient — still emit zero-filled
+            # columns so the schema is stable across runs.
+            wide = pd.DataFrame(
+                0.0,
+                index=self.context_df["PatientId"].unique(),
+                columns=qa_cols,
+            )
+        else:
+            agg = qa.groupby(["PatientId", "PatternName"])["ComplianceScore"].mean().reset_index()
+            wide = agg.pivot(index="PatientId", columns="PatternName", values="ComplianceScore")
+            wide = wide.reindex(columns=canonical_patterns, fill_value=0.0)
+            wide.columns = qa_cols
+
+        all_pids = self.context_df["PatientId"].unique()
+        wide = wide.reindex(all_pids, fill_value=0.0)
+        wide.index.name = "PatientId"
+        wide = wide.reset_index()
+
+        # Drop any pre-existing QA columns so re-running DataProcessor stays idempotent.
+        stale = [c for c in qa_cols if c in self.context_df.columns]
+        if stale:
+            self.context_df = self.context_df.drop(columns=stale)
+
+        self.context_df = self.context_df.merge(wide, on="PatientId", how="left")
+        for c in qa_cols:
+            self.context_df[c] = self.context_df[c].fillna(0.0)
+
+        print(
+            f"[DataProcessor] QA features added: {len(qa_cols)} columns, "
+            f"window=[0, {qa_history_hours:.1f}h], {len(qa)} qa rows in window."
+        )
+
 
     def _fit_scaler(self):
         """
@@ -304,6 +398,9 @@ class DataProcessor:
     def _normalize_time(self):
         """
         Normalizes time to be relative to the start of each visit. Also adds VisitID and VisitStart columns.
+        Caches the per-patient earliest StartDateTime on the instance so downstream
+        steps (e.g. _add_qa_features) can recover absolute admission timestamps
+        after _expand_tokens drops the raw datetime columns.
         """
         df = self.df.copy()
         df["IsAdmission"] = df["ConceptName"] == ADMISSION_TOKEN
@@ -312,6 +409,7 @@ class DataProcessor:
         df["VisitStart"] = df.groupby("VisitID")["StartDateTime"].transform('min')
         df["RelStartTime"] = (df["StartDateTime"] - df["VisitStart"]).dt.total_seconds() / 3600.0 # In hours
         df["RelEndTime"] = (df["EndDateTime"] - df["VisitStart"]).dt.total_seconds() / 3600.0 # In hours
+        self._patient_admission_time = df.groupby("PatientId")["StartDateTime"].min()
         self.df = df
 
 
