@@ -48,7 +48,7 @@ if EMR_MODEL_DIR not in sys.path:
     sys.path.insert(0, EMR_MODEL_DIR)
 
 from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr, get_dataloader
-from transform_emr.config.dataset_config import TAK_REPO_PATH
+from transform_emr.config.dataset_config import TAK_REPO_PATH, USE_QA_DATA
 from transform_emr.config.model_config import MODEL_CONFIG, TRAINING_SETTINGS
 from transform_emr.embedder import EMREmbedding, train_embedder
 from transform_emr.transformer import GPT, pretrain_transformer, finetune_transformer
@@ -68,8 +68,13 @@ EMBEDDER_CHECKPOINT    = os.path.join(CHECKPOINT_DIR, "phase1", "ckpt_best.pt")
 TRANSFORMER_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "phase2", "ckpt_best.pt")
 PHASE3_CHECKPOINT      = os.path.join(CHECKPOINT_DIR, "phase3", "ckpt_best.pt")
 TOKENIZER_PATH         = os.path.join(CHECKPOINT_DIR, "tokenizer.pt")
+# Cache of fully-processed train/val EMRDatasets + raw test split + tokenizer.
+# Built once after the first full data load; reused across every architecture
+# experiment in the sweep. Invalidated by `rm -rf checkpoints/`.
+PROCESSED_CACHE        = os.path.join(CHECKPOINT_DIR, "processed_datasets.pt")
 
-VAL_SPLIT   = 0.2
+TEST_SPLIT  = 0.15  # held-out, never seen until final evaluation
+VAL_SPLIT   = 0.15  # used for early-stop monitoring during P2/P3
 RANDOM_SEED = 42
 
 # ===========================================================================
@@ -92,11 +97,40 @@ def load_data(sample=None, batch_size=64):
         embedder_train_dl (DataLoader): Natural-distribution loader for Phase-1 embedder.
         transformer_train_dl (DataLoader): Oversampled loader for Phase-2 GPT pretraining.
         phase3_train_dl (DataLoader): Natural-distribution loader for Phase-3 fine-tuning.
-        val_dl (DataLoader): Natural-distribution validation loader.
+        val_dl (DataLoader): Natural-distribution validation loader (early-stop monitor).
         tokenizer (EMRTokenizer): Fitted vocabulary.
-        val_raw (tuple): (val_temporal_df_raw, val_ctx_df_raw) — unprocessed val data,
-            passed to evaluate_on_test_set() so it can re-process with truncation.
+        test_raw (tuple): (test_temporal_df_raw, test_ctx_df_raw) — unprocessed test data,
+            held out until final evaluation. Passed to evaluate_on_test_set().
     """
+    # ── Fast path: reload the cached processed datasets if present ──────────
+    # The processed dataset is fully determined by (sample, seeds, splits, USE_QA_DATA).
+    # Wipe `checkpoints/` to invalidate. Sampled smoke tests skip the cache.
+    cache_path = Path(PROCESSED_CACHE)
+    cache_key  = (sample, RANDOM_SEED, TEST_SPLIT, VAL_SPLIT, USE_QA_DATA)
+    if sample is None and cache_path.exists():
+        try:
+            cached = torch.load(str(cache_path), map_location="cpu", weights_only=False)
+            if cached.get("key") == cache_key:
+                print(f"[Data]: Loading cached processed datasets from {cache_path.name}...")
+                train_ds   = cached["train_ds"]
+                val_ds     = cached["val_ds"]
+                tokenizer  = cached["tokenizer"]
+                test_raw   = cached["test_raw"]
+                n_train, n_val, n_test = cached["sizes"]
+                print(f"[Data]: cached — {n_train} train / {n_val} val / {n_test} test patients")
+
+                embedder_train_dl    = get_dataloader(train_ds, batch_size=batch_size,
+                                                      collate_fn=collate_emr, oversample=False, bucket_batching=True)
+                phase3_train_dl      = get_dataloader(train_ds, batch_size=batch_size,
+                                                      collate_fn=collate_emr, oversample=False, bucket_batching=True)
+                transformer_train_dl = get_dataloader(train_ds, batch_size=batch_size,
+                                                      collate_fn=collate_emr, oversample=True,  bucket_batching=True)
+                val_dl               = get_dataloader(val_ds,   batch_size=batch_size,
+                                                      collate_fn=collate_emr, oversample=False, bucket_batching=True)
+                return embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl, tokenizer, test_raw
+        except Exception as e:
+            print(f"[Data]: cache load failed ({e}); rebuilding from source CSVs.")
+
     print("[Data]: Loading source temporal events and context data...")
     temporal_raw = pd.read_csv(TEMPORAL_DATA_FILE, low_memory=False)
     ctx_raw      = pd.read_csv(CONTEXT_DATA_FILE)
@@ -108,14 +142,24 @@ def load_data(sample=None, batch_size=64):
         temporal_raw = temporal_raw[temporal_raw["PatientId"].isin(chosen)]
         ctx_raw      = ctx_raw[ctx_raw["PatientId"].isin(chosen)]
 
-    # Split patient IDs before processing so scaler is fitted on train only
-    all_pids  = temporal_raw["PatientId"].unique()
-    train_ids, val_ids = train_test_split(all_pids, test_size=VAL_SPLIT, random_state=RANDOM_SEED)
+    # Three-way split by PatientId: train / val (early stop) / test (held-out for final eval).
+    # Two-stage split with the same seed keeps the test set stable across re-runs.
+    all_pids = temporal_raw["PatientId"].unique()
+    trainval_ids, test_ids = train_test_split(
+        all_pids, test_size=TEST_SPLIT, random_state=RANDOM_SEED
+    )
+    # val_size relative to the remaining train+val pool
+    val_relative = VAL_SPLIT / (1.0 - TEST_SPLIT)
+    train_ids, val_ids = train_test_split(
+        trainval_ids, test_size=val_relative, random_state=RANDOM_SEED
+    )
 
     train_temporal_raw = temporal_raw[temporal_raw["PatientId"].isin(train_ids)].copy()
     train_ctx_raw      = ctx_raw[ctx_raw["PatientId"].isin(train_ids)].copy()
     val_temporal_raw   = temporal_raw[temporal_raw["PatientId"].isin(val_ids)].copy()
     val_ctx_raw        = ctx_raw[ctx_raw["PatientId"].isin(val_ids)].copy()
+    test_temporal_raw  = temporal_raw[temporal_raw["PatientId"].isin(test_ids)].copy()
+    test_ctx_raw       = ctx_raw[ctx_raw["PatientId"].isin(test_ids)].copy()
 
     # Fit scaler on train patients and save to CHECKPOINT_DIR/scaler.pkl
     print("[Data]: Processing train split (fitting scaler)...")
@@ -147,8 +191,25 @@ def load_data(sample=None, batch_size=64):
     train_ds = EMRDataset(train_temporal_df, train_ctx_df, tokenizer=tokenizer)
     val_ds   = EMRDataset(val_temporal_df,   val_ctx_df,   tokenizer=tokenizer)
 
-    print(f"[Data]: {len(train_ids)} train / {len(val_ids)} val patients  "
-          f"({len(train_ds.tokens_df):,} train records, {len(val_ds.tokens_df):,} val records)")
+    print(f"[Data]: {len(train_ids)} train / {len(val_ids)} val / {len(test_ids)} test patients  "
+          f"({len(train_ds.tokens_df):,} train records, {len(val_ds.tokens_df):,} val records; "
+          f"test held out, processed at eval time)")
+
+    # Persist processed datasets so the next architecture experiment skips ~20 min
+    # of CSV reading + DataProcessor transforms. Sampled smoke tests stay un-cached.
+    if sample is None:
+        try:
+            torch.save({
+                "key": cache_key,
+                "train_ds": train_ds,
+                "val_ds": val_ds,
+                "tokenizer": tokenizer,
+                "test_raw": (test_temporal_raw, test_ctx_raw),
+                "sizes": (len(train_ids), len(val_ids), len(test_ids)),
+            }, str(cache_path))
+            print(f"[Data]: cached processed datasets to {cache_path.name}")
+        except Exception as e:
+            print(f"[Data]: cache save failed ({e}); continuing without cache.")
 
     # Phase-1 and Phase-3 use natural-distribution; Phase-2 uses oversampled
     embedder_train_dl    = get_dataloader(train_ds, batch_size=batch_size,
@@ -160,7 +221,7 @@ def load_data(sample=None, batch_size=64):
     val_dl               = get_dataloader(val_ds,   batch_size=batch_size,
                                           collate_fn=collate_emr, oversample=False, bucket_batching=True)
 
-    return embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl, tokenizer, (val_temporal_raw, val_ctx_raw)
+    return embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl, tokenizer, (test_temporal_raw, test_ctx_raw)
 
 
 # ===========================================================================
@@ -181,8 +242,8 @@ for _phase in ["phase2", "phase3"]:
     _phase_path.mkdir(parents=True, exist_ok=True)
 (Path(CHECKPOINT_DIR) / "phase1").mkdir(parents=True, exist_ok=True)
 
-# Load data — keeps raw val data for post-training evaluation
-embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl, tokenizer, val_raw = load_data(
+# Load data — keeps raw TEST data for final held-out evaluation
+embedder_train_dl, transformer_train_dl, phase3_train_dl, val_dl, tokenizer, test_raw = load_data(
     sample=TRAINING_SETTINGS.get("sample"),
     batch_size=TRAINING_SETTINGS["batch_size"],
 )
@@ -293,13 +354,16 @@ elif _p2_path.exists():
 else:
     best_model = model_p3
 
-val_temporal_raw, val_ctx_raw = val_raw
+# Final evaluation runs on the held-out TEST split — never seen during training
+# or early-stop selection. evaluate_on_test_set still names its kwargs val_* for
+# backwards compat; we are passing the test split into them.
+test_temporal_raw, test_ctx_raw = test_raw
 scaler = joblib_load(os.path.join(CHECKPOINT_DIR, "scaler.pkl"))
 eval_results = evaluate_on_test_set(
     model=best_model,
     tokenizer=tokenizer,
-    val_temporal_raw=val_temporal_raw,
-    val_ctx_raw=val_ctx_raw,
+    val_temporal_raw=test_temporal_raw,
+    val_ctx_raw=test_ctx_raw,
     scaler=scaler,
     checkpoint_dir=CHECKPOINT_DIR,
 )

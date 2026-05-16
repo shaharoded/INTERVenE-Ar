@@ -1232,6 +1232,14 @@ def get_dataloader(
     # that fire when DataLoader iterators are garbage-collected between epochs.
     persistent = num_workers > 0
 
+    # On Linux + CUDA the default 'fork' start method copies CUDA handles from the
+    # already-initialised parent into the workers, which deadlocks once any worker
+    # touches torch state. Forcing 'spawn' starts each worker as a fresh Python
+    # process — slower to launch, but `persistent_workers=True` amortises that to
+    # one-time-per-DataLoader. Pickle cost is fine: EMRDataset is pure-Python.
+    mp_ctx = "spawn" if (num_workers > 0 and torch.cuda.is_available()) else None
+    dl_extra = {"multiprocessing_context": mp_ctx} if mp_ctx else {}
+
     # ---------- no oversampling ----------
     if not oversample:
         if bucket_batching:
@@ -1241,14 +1249,16 @@ def get_dataloader(
                               collate_fn=collate_fn,
                               num_workers=num_workers,
                               persistent_workers=persistent,
-                              pin_memory=torch.cuda.is_available())
+                              pin_memory=torch.cuda.is_available(),
+                              **dl_extra)
         return DataLoader(dataset,
                           batch_size=batch_size,
                           shuffle=True,
                           collate_fn=collate_fn,
                           num_workers=num_workers,
                           persistent_workers=persistent,
-                          pin_memory=torch.cuda.is_available())
+                          pin_memory=torch.cuda.is_available(),
+                          **dl_extra)
 
     # ---------- build sample weights ----------
     # Each patient weight = sum of (n_patients / outcome_count) for each outcome
@@ -1281,7 +1291,8 @@ def get_dataloader(
                           collate_fn=collate_fn,
                           num_workers=num_workers,
                           persistent_workers=persistent,
-                          pin_memory=torch.cuda.is_available())
+                          pin_memory=torch.cuda.is_available(),
+                          **dl_extra)
 
     sampler = WeightedRandomSampler(sample_w,
                                     num_samples=len(sample_w),
@@ -1293,4 +1304,5 @@ def get_dataloader(
                       collate_fn=collate_fn,
                       num_workers=num_workers,
                       persistent_workers=persistent,
-                      pin_memory=torch.cuda.is_available())
+                      pin_memory=torch.cuda.is_available(),
+                      **dl_extra)
