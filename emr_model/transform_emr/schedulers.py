@@ -208,7 +208,14 @@ class LambdaScheduleController:
             if len(order) == 0:
                 self._warmup_complete_epoch = self.start_epoch
             else:
-                self._warmup_complete_epoch = max(self._ramp_end(n) for n in order[0])
+                # +1 accounts for the calibration delay. update() runs at end-of-epoch,
+                # so at epoch == start_epoch, get_lambdas() still returns 0 (lambda_max
+                # not yet set). The aux only becomes active from start_epoch+1 onwards.
+                # Without this offset the LAST bce-only epoch's val_loss locks in as
+                # 'best' before the aux ever contributes to training — early-stop then
+                # counts down and kills the run before the aux can compete.
+                # (Multi-stage Phase-2 gets this for free via unlock_epoch = epoch + 1.)
+                self._warmup_complete_epoch = max(self._ramp_end(n) for n in order[0]) + 1
 
     # ------------------------------------------------------------------
     # Internal helpers
