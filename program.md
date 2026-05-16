@@ -26,9 +26,14 @@ Three-phase training of an event-stream transformer:
   (`backbone 1e-6, head 1e-4`); outcome BCE on time-decayed soft labels + P3
   ranking loss. `val_outcome_raw` is the checkpoint selector.
 
-Evaluation = autoregressive generation from a 2-day seed → 24h windows → AUROC /
-AUPRC / onset-MAE per complication, then mean across complications with ≥3
-positive windows. See `evaluation.py`.
+Data is split 70/15/15 train/val/test **by `PatientId`** (seed=42, two-stage
+`train_test_split`). Train fits the scaler and tokenizer; val is used for
+early-stop monitoring during P2/P3; the test split is held out and never seen
+until the final evaluation. Evaluation = autoregressive generation from a 2-day
+seed → 24h windows → AUROC / AUPRC / onset-MAE per complication, then mean
+across complications with ≥3 positive windows. See `evaluation.py`. **Published
+metrics in `results.tsv` / `status.md` are computed on the held-out test split**
+— they are the reportable numbers, not a val-set proxy.
 
 Current best = exp73 (`3eaafa7`): `embed_dim=256, n_layer=4, n_head=4,
 time2vec_dim=32, dropout=0.1`. Peak VRAM 9.4 GB on MIMIC-III at the previous data
