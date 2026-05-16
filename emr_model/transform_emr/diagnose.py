@@ -641,7 +641,6 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     probe_dt_head(model, val_dl, n_batches=2)
     probe_outcome_label_alignment(model, val_dl, tokenizer, n_batches=2)
     probe_outcome_logit_distribution(model, val_dl, n_batches=2)
-    probe_outcome_lm_coupling(model, val_dl, n_batches=2)
 
     print("\n[Diag] Done.")
 
@@ -1155,74 +1154,6 @@ def probe_legality_starvation(model, val_dl, tokenizer, n_batches: int = 1) -> d
             "frac_blocked":       float(frac) if frac == frac else float("nan"),
         }
     return out
-
-
-def probe_outcome_lm_coupling(model, val_dl, n_batches: int = 1) -> dict:
-    """
-    Purpose: Verify that outcome_to_lm has activated and that it produces
-        meaningful additive corrections to LM logits at outcome vocab positions.
-    Method: Forward a val slice. For each outcome k: compute Pearson r between
-        the outcome head logit (raw) and the lm_bias it produces via outcome_to_lm.
-        lm_bias = outcome_to_lm(outcome_logits.detach()), computed directly from the
-        collected outcome_logits without a second forward pass.
-        Also report mean absolute bias and the weight norm of outcome_to_lm.
-
-    Args:
-        model: GPT in eval mode (must have outcome_to_lm and _outcome_lm_ids).
-        val_dl (DataLoader): Validation dataloader.
-        n_batches (int): Batches to consume.
-
-    Returns:
-        dict: weight_norm, per-outcome pearson_r and mean_bias.
-    """
-    if not hasattr(model, "outcome_to_lm") or not hasattr(model, "_outcome_lm_ids"):
-        print("\n[probe_outcome_lm_coupling] outcome_to_lm not present in model — skipping.")
-        return {}
-
-    device = next(model.parameters()).device
-    pad_idx = model.embedder.padding_idx
-    model.eval()
-
-    w_norm = model.outcome_to_lm.weight.detach().cpu().norm().item()
-
-    cache = _collect_val_batches(model, val_dl, n_batches=n_batches)
-    oh    = cache["outcome_logits"]   # [N, T, K]
-    tgt   = cache["targets"]
-    nonpad = (tgt != pad_idx)
-
-    # Compute lm_bias from the collected outcome logits (no second forward needed)
-    with torch.no_grad():
-        lm_bias = model.outcome_to_lm(oh.to(device)).cpu()  # [N, T, K]
-
-    oids = model._outcome_lm_ids.cpu()
-
-    print("\n" + "=" * 90)
-    print("PROBE - OUTCOME→LM COUPLING")
-    print("=" * 90)
-    print(f"  outcome_to_lm weight norm : {w_norm:.6f}")
-    if w_norm < 1e-6:
-        print("  ⚠ Weight norm near zero — coupling has not activated (expected if Phase-3 not run yet).")
-
-    rows = []
-    for k, name in enumerate(model.outcome_names):
-        head_logit = oh[..., k][nonpad].numpy()
-        lm_bias_k  = lm_bias[..., k][nonpad].numpy()
-        if len(head_logit) < 10:
-            continue
-        hm, bm = head_logit.mean(), lm_bias_k.mean()
-        cov = float(((head_logit - hm) * (lm_bias_k - bm)).mean())
-        r = cov / (head_logit.std() * lm_bias_k.std() + 1e-12)
-        rows.append({
-            "outcome":     name,
-            "head→bias_r": round(float(r), 4),
-            "mean_bias":   round(float(lm_bias_k.mean()), 6),
-            "bias_std":    round(float(lm_bias_k.std()), 6),
-        })
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        print(df.to_string(index=False))
-    return {"weight_norm": w_norm, "details": rows}
 
 
 def probe_outcome_logit_distribution(model, val_dl, n_batches: int = 1) -> pd.DataFrame:

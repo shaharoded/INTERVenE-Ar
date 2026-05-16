@@ -733,13 +733,10 @@ class GPT(nn.Module):
         ckpt_keys  = set(state_dict.keys())
         missing    = model_keys - ckpt_keys
         unexpected = ckpt_keys - model_keys
-        unexpected_non_stale = unexpected
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
-        if unexpected_non_stale:
-            raise RuntimeError(f"[GPT.load] Unexpected keys in checkpoint: {sorted(unexpected_non_stale)}")
-        if unexpected & stale_keys:
-            print(f"[GPT.load] Ignoring stale Task-A keys: {sorted(unexpected & stale_keys)}")
+        if unexpected:
+            raise RuntimeError(f"[GPT.load] Unexpected keys in checkpoint: {sorted(unexpected)}")
         model.load_state_dict(state_dict, strict=False)
 
         # Align device: the caller's embedder may already be on GPU while the checkpoint
@@ -1246,8 +1243,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         """
         for param in m.parameters():
             param.requires_grad_(True)
-        if hasattr(m, "outcome_log_tau"):
-            m.outcome_log_tau.requires_grad_(False)
+        m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
         head_names = {"outcome_head"}

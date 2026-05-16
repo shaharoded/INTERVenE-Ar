@@ -125,10 +125,10 @@ class EMREmbedding(nn.Module):
     def __init__(self, tokenizer, ctx_dim, time2vec_dim=8, embed_dim=128, dropout=0.1):
         super().__init__()
 
-        # --- for compatibility -------------------------------------------------
-        self.tokenizer = tokenizer # keep public attr for compatibility
+        # Public attributes consumed by GPT, training loops, inference and diagnose.
+        self.tokenizer = tokenizer
         self.padding_idx = tokenizer.pad_token_id
-        self.output_dim = embed_dim  # keep public attr for compatibility
+        self.output_dim = embed_dim
 
         # --- Token-level embeddings ---
         self.raw_concept_embed = nn.Embedding(len(tokenizer.rawconcept2id), embed_dim) # Embed for "GLUCOSE_MEASURE"
@@ -188,8 +188,6 @@ class EMREmbedding(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.scale = math.sqrt(embed_dim)
         self.layernorm = nn.LayerNorm(embed_dim)
-
-        self.output_dim = embed_dim
 
         # --- Decoder tied to token embeddings ----------------------------
         self.decoder = nn.Linear(embed_dim, len(tokenizer.token2id), bias=False)

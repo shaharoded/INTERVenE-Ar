@@ -1169,12 +1169,10 @@ def audit_generated_stream(
           .to_string(index=True, col_space={'Token': token_w}))
 
 
-# ---------------------------------------------------------------------------
-# UNUSED — kept for reference only.
-# The Phase-2 LM-head BCE now uses get_temporal_soft_targets (learnable
-# per-class soft kernel). This hard-window multi-hot builder is no longer
-# called by any active code path. Retained for reference / future ablation.
-# ---------------------------------------------------------------------------
+# Phase-1 BCE target builder. Phase 2 has migrated to a learnable per-class soft
+# kernel (`get_temporal_soft_targets`); Phase 1 still consumes this hard-window
+# multi-hot version because the embedder works better with a static 3 h window
+# (soft kernel destabilised Time2Vec — confirmed in exp53/exp70).
 @torch.no_grad()
 def get_temporal_multi_hot_targets(
     target_ids: torch.Tensor,

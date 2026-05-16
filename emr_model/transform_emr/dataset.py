@@ -50,9 +50,6 @@ class DataProcessor:
         if not isinstance(self.repo, dict):
             raise ValueError("'taks' must be a dictionary.")
         
-        # Handle compatability issue in complete flow
-        if "StartTime" in df.columns and "EndTime" in df.columns:
-            df.rename(columns={"StartTime": "StartDateTime", "EndTime": "EndDateTime"}, inplace=True)
         df['StartDateTime'] = pd.to_datetime(df['StartDateTime'], format='ISO8601', utc=True, errors='raise')
         df['StartDateTime'] = df['StartDateTime'].dt.tz_convert(None)
         df['EndDateTime'] = pd.to_datetime(df['EndDateTime'], format='ISO8601', utc=True, errors='raise')
