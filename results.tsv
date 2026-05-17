@@ -1,0 +1,2 @@
+commit	outcome_auroc	outcome_auprc	onset_mae_hrs	peak_vram_gb	status	description
+7925c06	0.914243	0.620625	64.95	4.54	KEEP	arch M-256; baseline on real MIMIC-IV 40k patients; P1 19ep dt-fixed, P2 44ep ranking=0.097, P3 49ep vl_select=0.679
