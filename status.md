@@ -44,7 +44,7 @@ Verdict: KEEP — Phase A baseline. +0.032 AUROC / +0.138 AUPRC / -19h MAE
 
 ---
 
-### M-256-deep  (commit TBD)  — Phase B #2
+### M-256-deep  (commit `3c94166`)  — Phase B #2
 - params: 9,307,944           peak VRAM: 0.40 GB (eval-only; training not captured)
 - final config:
     embed_dim=256, n_layer=6, n_head=4, time2vec_dim=32, dropout=0.1,
