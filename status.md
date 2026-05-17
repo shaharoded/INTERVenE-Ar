@@ -10,7 +10,7 @@ KIDNEY 0.900  RELEASE 0.835
 
 ## Status
 
-Phase B in progress — running S-128 next.
+Phase B in progress — S-128 DISCARD. Running M-256-deep next.
 
 ---
 
@@ -41,3 +41,29 @@ Training notes:
   Within-size adjustments tried: none needed.
 Verdict: KEEP — Phase A baseline. +0.032 AUROC / +0.138 AUPRC / -19h MAE
   vs prior exp73 (MIMIC-III, 0.882/0.483/83.9h). VRAM halved (9.4→4.5 GB).
+
+---
+
+### S-128  (commit `d22dadb`)  — Phase B #1
+- params: 1,668,900           peak VRAM: 0.22 GB (eval-only; training not captured)
+- final config:
+    embed_dim=128, n_layer=4, n_head=4, time2vec_dim=32, dropout=0.1,
+    phase1_lr=3e-4, phase2_lr=3e-4, phase3_lr=1e-4 (backbone×0.01),
+    patience=5, aux_caps={ce:0.5, dt:0.5, ranking:0.2}
+- metrics: AUROC=0.900, AUPRC=0.611, MAE=64.72h, max_len%=n/a
+- per-outcome (≥3 pos windows):
+    DEATH=0.918, CARDIO=0.972, HYPERGLY=0.940, HYPOGLY=0.918,
+    KIDNEY=0.909, RELEASE=0.741
+
+Training notes:
+  Phase 1 — retrained from scratch (embed_dim changed 256→128 vs cached M-256).
+    ~19 epochs estimated from checkpoint timestamp.
+  Phase 2 — ~50 epochs estimated (~2.9 hrs from P1-done to P2-ckpt timestamps).
+    Aux curriculum same settings as M-256.
+  Phase 3 — best epoch 35 (vl_select=0.712417); process crashed during epoch 40
+    validation before printing summary. Evaluated via eval_only.py from saved
+    phase3/ckpt_best.pt. Steady descent from ep26 (0.725) to ep35 (0.712).
+  Within-size adjustments tried: none.
+Verdict: DISCARD — AUROC 0.900 vs M-256 0.914 (Δ=-0.014, outside ±0.005 window).
+  RELEASE dropped 0.835→0.741. Other outcomes individually better (CARDIO, HYPERGLY,
+  HYPOGLY, KIDNEY), but RELEASE collapse drags the mean. Data wants M-256 width.
