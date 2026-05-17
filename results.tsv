@@ -1,3 +1,4 @@
 commit	outcome_auroc	outcome_auprc	onset_mae_hrs	peak_vram_gb	status	description
 7925c06	0.914243	0.620625	64.95	4.54	KEEP	arch M-256; baseline on real MIMIC-IV 40k patients; P1 19ep dt-fixed, P2 44ep ranking=0.097, P3 49ep vl_select=0.679
 d22dadb	0.899748	0.610763	64.72	0.22	DISCARD	arch S-128; 1.67M params; P3 best ep35 vl_select=0.712 (proc died ep40 val, eval-only); RELEASE 0.741 vs 0.835 baseline; AUROC -0.014 below M-256
+TBD	0.898504	0.606415	64.49	0.40	DISCARD	arch M-256-deep; 9.31M params; embed=256 n_layer=6; P3 best ep28 vl_select=0.680 (proc died ep33 val, eval-only); RELEASE 0.751 vs 0.835 baseline; AUROC -0.016 below M-256

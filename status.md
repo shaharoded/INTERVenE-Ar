@@ -10,7 +10,7 @@ KIDNEY 0.900  RELEASE 0.835
 
 ## Status
 
-Phase B in progress — S-128 DISCARD. Running M-256-deep next.
+Phase B in progress — S-128 DISCARD, M-256-deep DISCARD. Running L-384 next.
 
 ---
 
@@ -41,6 +41,34 @@ Training notes:
   Within-size adjustments tried: none needed.
 Verdict: KEEP — Phase A baseline. +0.032 AUROC / +0.138 AUPRC / -19h MAE
   vs prior exp73 (MIMIC-III, 0.882/0.483/83.9h). VRAM halved (9.4→4.5 GB).
+
+---
+
+### M-256-deep  (commit TBD)  — Phase B #2
+- params: 9,307,944           peak VRAM: 0.40 GB (eval-only; training not captured)
+- final config:
+    embed_dim=256, n_layer=6, n_head=4, time2vec_dim=32, dropout=0.1,
+    phase1_lr=3e-4, phase2_lr=3e-4, phase3_lr=1e-4 (backbone×0.01),
+    patience=5, aux_caps={ce:0.5, dt:0.5, ranking:0.2}
+- metrics: AUROC=0.899, AUPRC=0.606, MAE=64.49h
+- per-outcome (≥3 pos windows):
+    DEATH=0.935, CARDIO=0.968, HYPERGLY=0.930, HYPOGLY=0.911,
+    KIDNEY=0.896, RELEASE=0.751
+
+Training notes:
+  Phase 1 — retrained from scratch (S-128 P1 cache had embed_dim=128).
+    ~19 epochs estimated.
+  Phase 2 — 49 epochs (phase2_n_epochs=50 loaded from checkpoint override;
+    100-epoch config took effect from P3 onward). Best val saved as late as ep48.
+  Phase 3 — best epoch 28 (vl_select=0.680229); process crashed during epoch 33
+    validation (90% through). Evaluated via eval_only.py from phase3/ckpt_best.pt.
+    Steady descent ep1(0.790)→ep28(0.680), then plateaued; patience-5 would have
+    fired at ep33 anyway. λ_ranking calibrated=0.502.
+  Within-size adjustments tried: none.
+Verdict: DISCARD — AUROC 0.899 vs M-256 0.914 (Δ=-0.015, outside ±0.005 window).
+  RELEASE collapsed 0.835→0.751 (same pattern as S-128). CARDIO improved 0.951→0.968
+  but other outcomes flat or worse. Adding depth (4→6 layers) does not help — M-256
+  width at 4 layers appears to be the sweet spot for this embedding dimension.
 
 ---
 
