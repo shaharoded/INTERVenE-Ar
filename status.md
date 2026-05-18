@@ -10,11 +10,46 @@ KIDNEY 0.900  RELEASE 0.835
 
 ## Status
 
-Phase B complete — M-256 KEEP (best). S-128/M-256-deep/L-384 DISCARD, XL-512 OOM EXCLUSION. Phase C started: M-256-QA training (USE_QA_DATA=True).
+Phase B complete — M-256 KEEP (best). S-128/M-256-deep/L-384 DISCARD, XL-512 OOM EXCLUSION. Phase C complete — M-256-QA DISCARD (AUROC=0.903, Δ=-0.011 below ±0.005 window). Phase D k-day seed scan next.
 
 ---
 
 ## Architectures completed
+
+### M-256-QA  (commit `2da6fc5`)  — Phase C QA-data retrain
+
+- params: 6,416,932           peak VRAM: 2.75 GB (2817.8 MB)
+- final config (same as M-256 + USE_QA_DATA=True):
+    embed_dim=256, n_layer=4, n_head=4, time2vec_dim=32, dropout=0.1,
+    phase1_lr=3e-4, phase2_lr=3e-4, phase3_lr=1e-4 (backbone×0.01),
+    patience=5, aux_caps={ce:0.5, dt:0.5, ranking:0.2}
+- metrics: AUROC=0.903, AUPRC=0.636, MAE=66.00h
+- per-outcome (≥3 pos windows):
+    DEATH=0.935, CARDIO=0.976, HYPERGLY=0.940, HYPOGLY=0.903,
+    KIDNEY=0.906, RELEASE=0.759
+
+Training notes:
+  Phase 1 — reused M-256 Phase 1 checkpoint (embed_dim unchanged; dataset cache
+    invalidated by USE_QA_DATA=True, Phase 1 retrained). ~19 epochs estimated.
+  Phase 2 — 47 epochs (0-46); early stopped. BCE descended 0.2498→0.0658.
+    ce λ_max=0.1022, dt λ_max=0.0985 (active ep4+), ranking λ_max=0.0208
+    (calibrated ep33, full lambda ep37). Best BCE ~0.0665.
+  Phase 3 — 48 epochs; best at epoch 43 (vl_select=0.600547). Descended
+    ep1(0.715)→ep43(0.601), then 5 consecutive non-improving epochs fired
+    early stop at ep48. Recovered via run_phase3.py after api.py crash
+    during original Phase 3 epoch 3 (cumulative RAM growth at ~3h49m runtime).
+    vl_select significantly below M-256 baseline (0.601 vs 0.679 at best).
+  Verdict factors: AUROC 0.903 vs baseline 0.914 (Δ=-0.011, outside ±0.005
+    window). AUPRC improved (+0.015: 0.636 vs 0.621). MAE regressed slightly
+    (+1.05h). RELEASE collapsed 0.835→0.759 (−0.076). CARDIO excellent 0.976
+    (+0.025). DEATH dropped 0.953→0.935 (−0.018). QA-data retrain hurts RELEASE
+    and DEATH while improving CARDIO/HYPERGLY; net AUROC loss is decisive.
+Verdict: DISCARD — AUROC 0.903 vs M-256 0.914 (Δ=-0.011, outside ±0.005).
+  QA features did not improve the primary metric. RELEASE collapse is the
+  dominant failure mode (same pattern as smaller architectures). Phase D next:
+  k-day seed scan (k=2,3,4,5,6) on M-256 baseline.
+
+---
 
 ### M-256  (commit `7925c06`)  — Phase A baseline
 - params: 6,414,628           peak VRAM: 4.54 GB
