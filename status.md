@@ -105,12 +105,30 @@ Training notes:
     DataProcessor temporal filter pass (training data still in memory). Evaluated via
     eval_only.py from phase3/ckpt_best.pt.
   Within-size adjustments tried: none.
-  Diagnose: run — see diag_L384.log. Summary to be filled after diagnose completes.
+  Diagnose: run (diag_L384.log). Key findings:
+    - LM head beats outcome head at every outcome on validation (per-position):
+        CARDIO LM=0.918 vs Head=0.636; HYPERGLY LM=0.919 vs Head=0.668;
+        KIDNEY LM=0.802 vs Head=0.673 — outcome head underfits in 20 epochs.
+    - RELEASE validation head AUROC=0.901 vs test AUROC=0.795: worst generaliz-
+        ation gap, suggesting RELEASE representation is not stable in L-384 space.
+    - Outcome token gradient signal is low (HYPERGLY rank 260/350, CARDIO 168/350);
+        top-signal tokens are insulin-delivery states and severe-HTN events.
+    - Lambda calibration healthy (ce=0.116, dt=0.098, ranking=0.020; all below caps).
+    - Temporal coverage good: 93.8%/97.9% of positions have ≥1 pos in 12h/48h windows.
+    - Δt R²=0.1275 (moderate); embedder linear probe AUROC=0.620 (unchanged).
+    - Context vectors provide small consistent signal (+0.94 BCE when zeroed).
+    Conclusion: Phase 3 ran only 20 epochs (vs 49 for M-256). At 20.78M params the
+    outcome head needs more epochs to converge past the general LM head. The low
+    gradient signal for outcome tokens and backbone LR×0.01 (≈1e-6) means the head
+    is training largely alone, needing more iterations. Earlier early-stop (vl_select
+    still changing at ep20) cut training short. RELEASE generalisation gap is the
+    primary failure mode at this scale.
 Verdict: DISCARD — AUROC 0.899 vs M-256 0.914 (Δ=-0.015, outside ±0.005 window).
   DEATH collapsed 0.953→0.919 (−0.034). RELEASE partially recovered vs S-128/M-256-deep
   (0.795 vs 0.741/0.751) but still well below baseline 0.835. CARDIO excellent 0.962
   (+0.011). Pattern: wider/deeper (384-dim, 6L) helps CARDIO but hurts DEATH and
-  RELEASE. Consistent with insufficient regularisation or overfitting at 20.8M params.
+  RELEASE. Phase 3 outcome head did not converge: LM head outperforms dedicated head
+  at all outcomes — more P3 epochs or higher backbone LR factor needed at this scale.
 
 ---
 
