@@ -1,0 +1,102 @@
+[Phase D] k=6 days seed scan
+Device: cuda
+[Data]: Loading processed datasets cache...
+[Data]: 8562 test patients loaded from cache
+[Phase 1]: Loading embedder checkpoint...
+[Phase 3]: Loading Phase-3 best checkpoint...
+[GPT] Outcomes not in tokenizer vocab (ignored): ['ATHEROSCLEROSIS_EVENT', 'DIABETIC_COMA_EVENT', 'NERVOUS_SYSTEM_DISORDER_EVENT', 'OTHER_COMPLICATION_EVENT', 'SKIN_ULCER_EVENT']
+[GPT]: Total params: 6.42 M
+[Phase 3]: Loaded from /workspace/autoresearch/emr_model/checkpoints/phase3/ckpt_best.pt
+[Eval] Processing full val sequences (ground truth)...
+[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 2514266 -> 2050505
+[DataProcessor] QA features added: 9 columns, window=[0, 48.0h], 65638 qa rows in window.
+[Warning][EMRDataset] Unknown Concept values found (count=10) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN
+  - ROUTINE_BASAL_DOSAGE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_STEROIDS_PATTERN
+  - REDUCE_BASAL_ON_HYPOGLYCEMIA_PATTERN
+  - NERVOUS_SYSTEM_DISORDER_EVENT
+  - INSULIN_ON_HYPERGLYCEMIA_PATTERN
+  - ATHEROSCLEROSIS_EVENT
+  - REDUCE_BOLUS_ON_HYPOGLYCEMIA_PATTERN
+  - SKIN_ULCER_EVENT
+[Warning][EMRDataset] Unknown ValueToken values found (count=44) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN_Partial
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_Partial
+  - ROUTINE_BASAL_DOSAGE_PATTERN
+  - ROUTINE_BASAL_DOSAGE_PATTERN_False
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_False
+  - HEMATOCRIT_MEASURE_STATE_Critical Anemia
+  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia
+  - INSULIN_BITZUA_STATE_IntraVenous Medium
+  - ROUTINE_BASAL_DOSAGE_PATTERN_Partial
+[Warning][EMRDataset] Unknown PositionToken values found (count=79) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN_Partial
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_Partial
+  - ROUTINE_BASAL_DOSAGE_PATTERN
+  - ROUTINE_BASAL_DOSAGE_PATTERN_False
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_False
+  - HEMATOCRIT_MEASURE_STATE_Critical Anemia_START
+  - HEMATOCRIT_MEASURE_STATE_Critical Anemia_END
+  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia_START
+  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia_END
+[Eval] Processing truncated val sequences (6-day input)...
+[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 2514266 -> 2050505
+[DataProcessor] QA features added: 9 columns, window=[0, 144.0h], 112828 qa rows in window.
+[Warning][EMRDataset] Unknown Concept values found (count=10) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN
+  - ROUTINE_BASAL_DOSAGE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_STEROIDS_PATTERN
+  - REDUCE_BASAL_ON_HYPOGLYCEMIA_PATTERN
+  - INSULIN_ON_HYPERGLYCEMIA_PATTERN
+  - NERVOUS_SYSTEM_DISORDER_EVENT
+  - ATHEROSCLEROSIS_EVENT
+  - SKIN_ULCER_EVENT
+  - REDUCE_BOLUS_ON_HYPOGLYCEMIA_PATTERN
+[Warning][EMRDataset] Unknown ValueToken values found (count=44) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN_Partial
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_Partial
+  - ROUTINE_BASAL_DOSAGE_PATTERN_False
+  - HEMATOCRIT_MEASURE_STATE_Critical Anemia
+  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia
+  - INSULIN_BITZUA_STATE_IntraVenous Medium
+  - ROUTINE_BASAL_DOSAGE_PATTERN_Partial
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_STEROIDS_PATTERN_Partial
+[Warning][EMRDataset] Unknown PositionToken values found (count=64) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN_Partial
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_Partial
+  - ROUTINE_BASAL_DOSAGE_PATTERN_False
+  - HEMATOCRIT_MEASURE_STATE_Critical Anemia_START
+  - HEMATOCRIT_MEASURE_STATE_Critical Anemia_END
+  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia_START
+  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia_END
+  - INSULIN_BITZUA_STATE_IntraVenous Medium_START
+  - INSULIN_BITZUA_STATE_IntraVenous Medium_END
+[Eval] Generating risk curves...
+Generating:   0%|          | 0/288 [00:00<?, ?it/s]Generating:   0%|          | 1/288 [00:00<02:31,  1.89it/s]Generating:   1%|          | 3/288 [00:00<01:00,  4.68it/s]Generating:   2%|▏         | 5/288 [00:00<00:46,  6.09it/s]Generating:   2%|▏         | 6/288 [00:01<00:42,  6.65it/s]Generating:   2%|▏         | 7/288 [00:01<00:39,  7.06it/s]Generating:   3%|▎         | 9/288 [00:01<00:35,  7.97it/s]Generating:   3%|▎         | 10/288 [00:01<00:35,  7.92it/s]Generating:   4%|▍         | 12/288 [00:01<00:32,  8.40it/s]Generating:   5%|▍         | 13/288 [00:01<00:33,  8.19it/s]Generating:   5%|▍         | 14/288 [00:02<00:36,  7.52it/s]Generating:   5%|▌         | 15/288 [00:02<00:43,  6.33it/s]Generating:   6%|▌         | 16/288 [00:02<00:39,  6.85it/s]Generating:   6%|▋         | 18/288 [00:02<00:46,  5.85it/s]Generating:   7%|▋         | 20/288 [00:02<00:36,  7.32it/s]Generating:   7%|▋         | 21/288 [00:03<00:37,  7.18it/s]Generating:   8%|▊         | 22/288 [00:03<00:37,  7.06it/s]Generating:   8%|▊         | 23/288 [00:03<00:37,  7.09it/s]Generating:   8%|▊         | 24/288 [00:03<00:35,  7.44it/s]Generating:   9%|▊         | 25/288 [00:03<00:33,  7.96it/s]Generating:   9%|▉         | 26/288 [00:03<00:33,  7.93it/s]Generating:   9%|▉         | 27/288 [00:03<00:32,  7.95it/s]Generating:  10%|▉         | 28/288 [00:04<00:32,  7.90it/s]Generating:  10%|█         | 29/288 [00:04<00:34,  7.51it/s]Generating:  10%|█         | 30/288 [00:04<00:34,  7.38it/s]Generating:  11%|█         | 31/288 [00:04<00:36,  7.05it/s]Generating:  11%|█         | 32/288 [00:04<00:59,  4.30it/s]Generating:  11%|█▏        | 33/288 [00:05<00:50,  5.05it/s]Generating:  12%|█▏        | 34/288 [00:05<00:46,  5.49it/s]Generating:  12%|█▏        | 35/288 [00:05<00:43,  5.82it/s]Generating:  12%|█▎        | 36/288 [00:05<00:41,  6.11it/s]Generating:  13%|█▎        | 37/288 [00:05<00:39,  6.43it/s]Generating:  14%|█▎        | 39/288 [00:05<00:31,  7.92it/s]Generating:  14%|█▍        | 40/288 [00:05<00:33,  7.39it/s]Generating:  14%|█▍        | 41/288 [00:06<00:33,  7.42it/s]Generating:  15%|█▍        | 43/288 [00:06<00:28,  8.55it/s]Generating:  15%|█▌        | 44/288 [00:06<00:28,  8.48it/s]Generating:  16%|█▌        | 45/288 [00:06<00:29,  8.13it/s]Generating:  16%|█▌        | 46/288 [00:06<00:29,  8.19it/s]Generating:  16%|█▋        | 47/288 [00:06<00:29,  8.20it/s]Generating:  17%|█▋        | 49/288 [00:06<00:27,  8.80it/s]Generating:  18%|█▊        | 51/288 [00:07<00:26,  8.95it/s]Generating:  18%|█▊        | 52/288 [00:07<00:27,  8.46it/s]Generating:  18%|█▊        | 53/288 [00:07<00:27,  8.50it/s]Generating:  19%|█▉        | 54/288 [00:07<00:27,  8.41it/s]Generating:  19%|█▉        | 56/288 [00:07<00:28,  8.15it/s]Generating:  20%|█▉        | 57/288 [00:07<00:27,  8.25it/s]Generating:  20%|██        | 58/288 [00:08<00:28,  8.17it/s]Generating:  20%|██        | 59/288 [00:08<00:40,  5.67it/s]Generating:  21%|██        | 60/288 [00:08<00:35,  6.33it/s]Generating:  22%|██▏       | 62/288 [00:08<00:28,  7.96it/s]Generating:  22%|██▏       | 64/288 [00:08<00:25,  8.65it/s]Generating:  23%|██▎       | 66/288 [00:09<00:27,  8.21it/s]Generating:  23%|██▎       | 67/288 [00:09<00:27,  8.04it/s]Generating:  24%|██▎       | 68/288 [00:09<00:26,  8.22it/s]Generating:  24%|██▍       | 69/288 [00:09<00:25,  8.44it/s]Generating:  24%|██▍       | 70/288 [00:09<00:25,  8.45it/s]Generating:  25%|██▌       | 72/288 [00:09<00:23,  9.35it/s]Generating:  25%|██▌       | 73/288 [00:09<00:25,  8.50it/s]Generating:  26%|██▌       | 74/288 [00:10<00:25,  8.46it/s]Generating:  26%|██▌       | 75/288 [00:10<00:38,  5.54it/s]Generating:  27%|██▋       | 77/288 [00:10<00:31,  6.76it/s]Generating:  27%|██▋       | 79/288 [00:10<00:28,  7.41it/s]Generating:  28%|██▊       | 80/288 [00:10<00:27,  7.50it/s]Generating:  28%|██▊       | 81/288 [00:11<00:27,  7.64it/s]Generating:  28%|██▊       | 82/288 [00:11<00:27,  7.50it/s]Generating:  29%|██▉       | 84/288 [00:11<00:23,  8.81it/s]Generating:  30%|██▉       | 85/288 [00:11<00:23,  8.51it/s]Generating:  30%|██▉       | 86/288 [00:11<00:25,  8.07it/s]Generating:  30%|███       | 87/288 [00:11<00:23,  8.43it/s]Generating:  31%|███       | 89/288 [00:11<00:21,  9.20it/s]Generating:  32%|███▏      | 91/288 [00:12<00:20,  9.72it/s]Generating:  32%|███▏      | 92/288 [00:12<00:20,  9.71it/s]Generating:  32%|███▏      | 93/288 [00:12<00:20,  9.69it/s]Generating:  33%|███▎      | 95/288 [00:12<00:17, 10.90it/s]Generating:  34%|███▎      | 97/288 [00:12<00:17, 10.70it/s]Generating:  34%|███▍      | 99/288 [00:12<00:19,  9.45it/s]Generating:  35%|███▍      | 100/288 [00:13<00:20,  9.25it/s]Generating:  35%|███▌      | 102/288 [00:13<00:19,  9.69it/s]Generating:  36%|███▌      | 103/288 [00:13<00:22,  8.30it/s]Generating:  36%|███▌      | 104/288 [00:13<00:23,  7.93it/s]Generating:  36%|███▋      | 105/288 [00:13<00:26,  6.86it/s]Generating:  37%|███▋      | 106/288 [00:13<00:26,  6.98it/s]Generating:  37%|███▋      | 107/288 [00:14<00:24,  7.46it/s]Generating:  38%|███▊      | 109/288 [00:14<00:22,  8.13it/s]Generating:  38%|███▊      | 110/288 [00:14<00:22,  7.97it/s]Generating:  39%|███▊      | 111/288 [00:14<00:21,  8.25it/s]Generating:  39%|███▉      | 113/288 [00:14<00:23,  7.51it/s]Generating:  40%|███▉      | 115/288 [00:15<00:21,  7.89it/s]Generating:  40%|████      | 116/288 [00:15<00:23,  7.42it/s]Generating:  41%|████      | 117/288 [00:15<00:22,  7.60it/s]Generating:  41%|████      | 118/288 [00:15<00:22,  7.46it/s]Generating:  41%|████▏     | 119/288 [00:15<00:22,  7.53it/s]Generating:  42%|████▏     | 121/288 [00:15<00:19,  8.55it/s]Generating:  43%|████▎     | 123/288 [00:15<00:17,  9.61it/s]Generating:  43%|████▎     | 124/288 [00:16<00:17,  9.23it/s]Generating:  43%|████▎     | 125/288 [00:16<00:17,  9.12it/s]Generating:  44%|████▍     | 126/288 [00:16<00:19,  8.37it/s]Generating:  44%|████▍     | 127/288 [00:16<00:19,  8.33it/s]Generating:  44%|████▍     | 128/288 [00:16<00:18,  8.69it/s]Generating:  45%|████▍     | 129/288 [00:16<00:18,  8.52it/s]Generating:  45%|████▌     | 131/288 [00:16<00:17,  9.11it/s]Generating:  46%|████▌     | 133/288 [00:17<00:14, 10.79it/s]Generating:  47%|████▋     | 135/288 [00:17<00:16,  9.35it/s]Generating:  48%|████▊     | 137/288 [00:17<00:15,  9.58it/s]Generating:  48%|████▊     | 139/288 [00:17<00:14, 10.15it/s]Generating:  49%|████▉     | 141/288 [00:17<00:13, 10.77it/s]Generating:  50%|████▉     | 143/288 [00:18<00:13, 11.12it/s]Generating:  50%|█████     | 145/288 [00:18<00:14,  9.95it/s]Generating:  51%|█████     | 147/288 [00:18<00:16,  8.78it/s]Generating:  51%|█████▏    | 148/288 [00:18<00:16,  8.52it/s]Generating:  52%|█████▏    | 149/288 [00:18<00:16,  8.61it/s]Generating:  52%|█████▏    | 151/288 [00:19<00:15,  8.81it/s]Generating:  53%|█████▎    | 152/288 [00:19<00:15,  9.01it/s]Generating:  53%|█████▎    | 153/288 [00:19<00:15,  8.51it/s]Generating:  53%|█████▎    | 154/288 [00:19<00:16,  8.26it/s]Generating:  54%|█████▍    | 156/288 [00:19<00:15,  8.64it/s]Generating:  55%|█████▍    | 157/288 [00:19<00:15,  8.62it/s]Generating:  55%|█████▍    | 158/288 [00:19<00:14,  8.73it/s]Generating:  55%|█████▌    | 159/288 [00:19<00:14,  8.79it/s]Generating:  56%|█████▌    | 160/288 [00:20<00:15,  8.12it/s]Generating:  56%|█████▌    | 161/288 [00:20<00:14,  8.51it/s]Generating:  56%|█████▋    | 162/288 [00:20<00:16,  7.56it/s]Generating:  57%|█████▋    | 164/288 [00:20<00:15,  8.26it/s]Generating:  57%|█████▋    | 165/288 [00:20<00:14,  8.56it/s]Generating:  58%|█████▊    | 166/288 [00:20<00:13,  8.72it/s]Generating:  58%|█████▊    | 168/288 [00:20<00:13,  9.07it/s]Generating:  59%|█████▊    | 169/288 [00:21<00:14,  8.44it/s]Generating:  59%|█████▉    | 170/288 [00:21<00:13,  8.65it/s]Generating:  59%|█████▉    | 171/288 [00:21<00:13,  8.52it/s]Generating:  60%|█████▉    | 172/288 [00:21<00:14,  7.93it/s]Generating:  60%|██████    | 173/288 [00:21<00:15,  7.53it/s]Generating:  60%|██████    | 174/288 [00:21<00:15,  7.17it/s]Generating:  61%|██████    | 175/288 [00:21<00:17,  6.60it/s]Generating:  61%|██████    | 176/288 [00:22<00:18,  6.16it/s]Generating:  61%|██████▏   | 177/288 [00:22<00:16,  6.55it/s]Generating:  62%|██████▏   | 178/288 [00:22<00:16,  6.48it/s]Generating:  62%|██████▏   | 179/288 [00:22<00:16,  6.58it/s]Generating:  62%|██████▎   | 180/288 [00:22<00:18,  5.83it/s]Generating:  63%|██████▎   | 181/288 [00:22<00:17,  5.97it/s]Generating:  63%|██████▎   | 182/288 [00:23<00:17,  5.89it/s]Generating:  64%|██████▎   | 183/288 [00:23<00:16,  6.19it/s]Generating:  64%|██████▍   | 184/288 [00:23<00:15,  6.73it/s]Generating:  64%|██████▍   | 185/288 [00:23<00:15,  6.80it/s]Generating:  65%|██████▍   | 186/288 [00:23<00:14,  7.12it/s]Generating:  65%|██████▍   | 187/288 [00:23<00:13,  7.63it/s]Generating:  65%|██████▌   | 188/288 [00:23<00:13,  7.62it/s]Generating:  66%|██████▌   | 189/288 [00:24<00:13,  7.42it/s]Generating:  66%|██████▌   | 190/288 [00:24<00:14,  6.93it/s]Generating:  66%|██████▋   | 191/288 [00:24<00:13,  7.13it/s]Generating:  67%|██████▋   | 192/288 [00:24<00:12,  7.72it/s]Generating:  67%|██████▋   | 193/288 [00:24<00:12,  7.64it/s]Generating:  67%|██████▋   | 194/288 [00:24<00:11,  7.92it/s]Generating:  68%|██████▊   | 195/288 [00:24<00:12,  7.24it/s]Generating:  68%|██████▊   | 196/288 [00:25<00:12,  7.42it/s]Generating:  68%|██████▊   | 197/288 [00:25<00:17,  5.33it/s]Generating:  69%|██████▉   | 198/288 [00:25<00:16,  5.48it/s]Generating:  69%|██████▉   | 199/288 [00:25<00:14,  6.20it/s]Generating:  69%|██████▉   | 200/288 [00:25<00:14,  6.28it/s]Generating:  70%|██████▉   | 201/288 [00:25<00:13,  6.67it/s]Generating:  70%|███████   | 202/288 [00:26<00:11,  7.23it/s]Generating:  70%|███████   | 203/288 [00:26<00:12,  7.03it/s]Generating:  71%|███████   | 204/288 [00:26<00:11,  7.43it/s]Generating:  71%|███████   | 205/288 [00:26<00:10,  7.89it/s]Generating:  72%|███████▏  | 206/288 [00:26<00:10,  8.19it/s]Generating:  72%|███████▏  | 207/288 [00:26<00:10,  7.52it/s]Generating:  72%|███████▏  | 208/288 [00:26<00:11,  7.08it/s]Generating:  73%|███████▎  | 209/288 [00:26<00:10,  7.21it/s]Generating:  73%|███████▎  | 210/288 [00:27<00:10,  7.26it/s]Generating:  73%|███████▎  | 211/288 [00:27<00:11,  6.55it/s]Generating:  74%|███████▎  | 212/288 [00:27<00:11,  6.83it/s]Generating:  74%|███████▍  | 214/288 [00:27<00:09,  7.50it/s]Generating:  75%|███████▍  | 215/288 [00:27<00:09,  7.55it/s]Generating:  75%|███████▌  | 216/288 [00:27<00:08,  8.02it/s]Generating:  75%|███████▌  | 217/288 [00:28<00:08,  8.04it/s]Generating:  76%|███████▌  | 218/288 [00:28<00:09,  7.14it/s]Generating:  76%|███████▌  | 219/288 [00:28<00:09,  6.96it/s]Generating:  76%|███████▋  | 220/288 [00:28<00:09,  7.06it/s]Generating:  77%|███████▋  | 222/288 [00:28<00:08,  8.22it/s]Generating:  78%|███████▊  | 224/288 [00:28<00:06,  9.17it/s]Generating:  78%|███████▊  | 225/288 [00:28<00:06,  9.11it/s]Generating:  79%|███████▉  | 227/288 [00:29<00:06,  9.10it/s]Generating:  80%|███████▉  | 229/288 [00:29<00:06,  9.37it/s]Generating:  80%|███████▉  | 230/288 [00:29<00:07,  8.26it/s]Generating:  80%|████████  | 231/288 [00:29<00:07,  7.92it/s]Generating:  81%|████████  | 232/288 [00:29<00:07,  7.09it/s]Generating:  81%|████████▏ | 234/288 [00:30<00:07,  7.65it/s]Generating:  82%|████████▏ | 235/288 [00:30<00:07,  7.08it/s]Generating:  82%|████████▏ | 236/288 [00:30<00:06,  7.43it/s]Generating:  83%|████████▎ | 238/288 [00:30<00:05,  8.49it/s]Generating:  83%|████████▎ | 239/288 [00:30<00:05,  8.53it/s]Generating:  84%|████████▎ | 241/288 [00:30<00:04,  9.47it/s]Generating:  84%|████████▍ | 242/288 [00:31<00:05,  9.03it/s]Generating:  85%|████████▍ | 244/288 [00:31<00:04,  8.80it/s]Generating:  85%|████████▌ | 245/288 [00:31<00:05,  8.13it/s]Generating:  85%|████████▌ | 246/288 [00:31<00:05,  8.37it/s]Generating:  86%|████████▌ | 247/288 [00:31<00:05,  7.62it/s]Generating:  86%|████████▌ | 248/288 [00:31<00:04,  8.13it/s]Generating:  86%|████████▋ | 249/288 [00:31<00:04,  7.96it/s]Generating:  87%|████████▋ | 250/288 [00:32<00:04,  8.41it/s]Generating:  87%|████████▋ | 251/288 [00:32<00:04,  7.90it/s]Generating:  88%|████████▊ | 252/288 [00:32<00:04,  8.23it/s]Generating:  88%|████████▊ | 253/288 [00:32<00:04,  7.88it/s]Generating:  88%|████████▊ | 254/288 [00:32<00:04,  7.89it/s]Generating:  89%|████████▊ | 255/288 [00:32<00:03,  8.34it/s]Generating:  89%|████████▉ | 256/288 [00:32<00:03,  8.27it/s]Generating:  89%|████████▉ | 257/288 [00:32<00:03,  8.60it/s]Generating:  90%|████████▉ | 258/288 [00:33<00:04,  7.36it/s]Generating:  90%|████████▉ | 259/288 [00:33<00:04,  6.86it/s]Generating:  91%|█████████ | 261/288 [00:33<00:03,  7.79it/s]Generating:  91%|█████████ | 262/288 [00:33<00:03,  7.34it/s]Generating:  91%|█████████▏| 263/288 [00:33<00:03,  7.07it/s]Generating:  92%|█████████▏| 264/288 [00:33<00:03,  7.26it/s]Generating:  92%|█████████▏| 266/288 [00:34<00:02,  8.20it/s]Generating:  93%|█████████▎| 268/288 [00:34<00:02,  8.84it/s]Generating:  93%|█████████▎| 269/288 [00:34<00:02,  8.81it/s]Generating:  94%|█████████▍| 271/288 [00:34<00:02,  8.43it/s]Generating:  95%|█████████▍| 273/288 [00:34<00:01,  9.64it/s]Generating:  95%|█████████▌| 275/288 [00:34<00:01, 10.38it/s]Generating:  96%|█████████▌| 277/288 [00:35<00:01, 10.47it/s]Generating:  97%|█████████▋| 279/288 [00:35<00:00,  9.87it/s]Generating:  98%|█████████▊| 281/288 [00:35<00:00,  9.37it/s]Generating:  98%|█████████▊| 282/288 [00:35<00:00,  8.84it/s]Generating:  99%|█████████▊| 284/288 [00:35<00:00,  9.56it/s]Generating:  99%|█████████▉| 285/288 [00:36<00:00,  9.56it/s]Generating:  99%|█████████▉| 286/288 [00:36<00:00,  9.03it/s]Generating: 100%|██████████| 288/288 [00:36<00:00, 10.15it/s]                                                             [Eval] Generated 2013512 rows for 4602 patients.
+[Eval] Computing episode-level AUC and time accuracy...
+[Eval] Per-outcome AUROC:
+  CARDIO-VASCULAR_DISORDER_EVENT                AUROC=0.961  AUPRC=0.543
+  DEATH_EVENT                                   AUROC=0.942  AUPRC=0.448
+  DISGLYCEMIA_EVENT_Hyperglycemia               AUROC=0.934  AUPRC=0.833
+  DISGLYCEMIA_EVENT_Hypoglycemia                AUROC=0.921  AUPRC=0.458
+  KIDNEY_COMPLICATION_EVENT                     AUROC=0.918  AUPRC=0.767
+  RELEASE_EVENT                                 AUROC=0.732  AUPRC=0.559
+---
+k_days:           6
+outcome_auroc:    0.901493
+outcome_auprc:    0.601425
+onset_mae_hrs:    137.13
+total_seconds:    469.2
+peak_vram_mb:     1184.9
+embed_dim:        256
+n_layer:          4
+n_head:           4
+num_params:       6,416,932
