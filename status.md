@@ -10,7 +10,7 @@ KIDNEY 0.900  RELEASE 0.835
 
 ## Status
 
-Phase B in progress — S-128 DISCARD, M-256-deep DISCARD. Running L-384 next.
+Phase B in progress — S-128 DISCARD, M-256-deep DISCARD, L-384 DISCARD. Next: XL-512 or L-384 variation per program.md.
 
 ---
 
@@ -39,6 +39,9 @@ Training notes:
   Phase 3 — 49 epochs, best at epoch 44 (vl_select=0.679). Step-wise
     descent with occasional blips; patience-5 fired cleanly at epoch 49.
   Within-size adjustments tried: none needed.
+  Diagnose: not run — checkpoints overwritten when S-128 started (embed_dim 256→128
+    forces Phase-1 retrain). Training logs show no pathologies: dt converged, val BCE
+    fell smoothly, ranking signal strong (raw_ranking=0.097). No within-size fix was needed.
 Verdict: KEEP — Phase A baseline. +0.032 AUROC / +0.138 AUPRC / -19h MAE
   vs prior exp73 (MIMIC-III, 0.882/0.483/83.9h). VRAM halved (9.4→4.5 GB).
 
@@ -65,10 +68,49 @@ Training notes:
     Steady descent ep1(0.790)→ep28(0.680), then plateaued; patience-5 would have
     fired at ep33 anyway. λ_ranking calibrated=0.502.
   Within-size adjustments tried: none.
+  Diagnose: not run — checkpoints overwritten when L-384 started (embed_dim 256→384
+    forces Phase-1 retrain). No evidence of training pathology from logs: Phase 2
+    ran 49/50 epochs with stable BCE descent; Phase 3 descended to ep28 then plateaued.
+    RELEASE collapse pattern (0.835→0.751) mirrors S-128 and suggests the embedding
+    dimension (256) is insufficient to disambiguate RELEASE from other outcomes when
+    depth is added without widening. Depth addition may fragment representational capacity.
 Verdict: DISCARD — AUROC 0.899 vs M-256 0.914 (Δ=-0.015, outside ±0.005 window).
   RELEASE collapsed 0.835→0.751 (same pattern as S-128). CARDIO improved 0.951→0.968
   but other outcomes flat or worse. Adding depth (4→6 layers) does not help — M-256
   width at 4 layers appears to be the sweet spot for this embedding dimension.
+
+---
+
+### L-384  (commit `b72a0a1`)  — Phase B #3
+- params: 20,777,320           peak VRAM: 0.59 GB (eval-only; training OOM crash before eval)
+- final config:
+    embed_dim=384, n_layer=6, n_head=6, time2vec_dim=48, dropout=0.1,
+    phase1_lr=3e-4, phase2_lr=3e-4, phase3_lr=1e-4 (backbone×0.01),
+    patience=5, aux_caps={ce:0.5, dt:0.5, ranking:0.2}
+- metrics: AUROC=0.899, AUPRC=0.597, MAE=64.62h
+- per-outcome (≥3 pos windows):
+    DEATH=0.919, CARDIO=0.962, HYPERGLY=0.924, HYPOGLY=0.899,
+    KIDNEY=0.897, RELEASE=0.795
+
+Training notes:
+  Phase 1 — retrained from scratch (embed_dim changed 256→384 forces P1 retrain).
+    ~19 epochs estimated from checkpoint timestamps.
+  Phase 2 — ~40 epochs, best val ~0.096300 (from smoke_test_L384.log, epoch 39).
+    Aux curriculum: ce+dt unlocked ep4, ranking unlocked on plateau.
+    api.py crashed (SIGKILL) between Phase 2 and Phase 3; Phase 2 checkpoint intact.
+    Recovery: run_phase3.py loaded Phase 2 checkpoint directly.
+  Phase 3 — 20 epochs, best at epoch 15 (vl_select=0.662728). Steep descent
+    ep1(0.735)→ep7(0.682), plateau ep8-14, new best ep15(0.663), flat ep16-20 → early
+    stop at ep20. run_phase3.py evaluation OOM-crashed (SIGKILL) during test-set
+    DataProcessor temporal filter pass (training data still in memory). Evaluated via
+    eval_only.py from phase3/ckpt_best.pt.
+  Within-size adjustments tried: none.
+  Diagnose: run — see diag_L384.log. Summary to be filled after diagnose completes.
+Verdict: DISCARD — AUROC 0.899 vs M-256 0.914 (Δ=-0.015, outside ±0.005 window).
+  DEATH collapsed 0.953→0.919 (−0.034). RELEASE partially recovered vs S-128/M-256-deep
+  (0.795 vs 0.741/0.751) but still well below baseline 0.835. CARDIO excellent 0.962
+  (+0.011). Pattern: wider/deeper (384-dim, 6L) helps CARDIO but hurts DEATH and
+  RELEASE. Consistent with insufficient regularisation or overfitting at 20.8M params.
 
 ---
 
@@ -92,6 +134,11 @@ Training notes:
     validation before printing summary. Evaluated via eval_only.py from saved
     phase3/ckpt_best.pt. Steady descent from ep26 (0.725) to ep35 (0.712).
   Within-size adjustments tried: none.
+  Diagnose: not run — checkpoints overwritten when M-256-deep started (embed_dim
+    128→256 forces Phase-1 retrain). Training logs show no pathologies; Phase 2 ran
+    ~50 epochs with stable curriculum. RELEASE collapse (0.835→0.741) is the dominant
+    failure mode — smaller embed_dim likely lacks capacity to encode the admission-to-
+    discharge trajectory needed for RELEASE prediction.
 Verdict: DISCARD — AUROC 0.900 vs M-256 0.914 (Δ=-0.014, outside ±0.005 window).
   RELEASE dropped 0.835→0.741. Other outcomes individually better (CARDIO, HYPERGLY,
   HYPOGLY, KIDNEY), but RELEASE collapse drags the mean. Data wants M-256 width.
