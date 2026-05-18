@@ -1,0 +1,233 @@
+<frozen runpy>:128: RuntimeWarning: 'transform_emr.diagnose' found in sys.modules after import of package 'transform_emr', but prior to execution of 'transform_emr.diagnose'; this may result in unpredictable behaviour
+[Diag] Loading validation data...
+[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 579216 -> 472345
+[DataProcessor] QA features added: 9 columns, window=[0, 48.0h], 15402 qa rows in window.
+[Warning][EMRDataset] Unknown Concept values found (count=10) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_BASAL_DOSAGE_PATTERN
+  - INSULIN_ON_HYPERGLYCEMIA_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_STEROIDS_PATTERN
+  - REDUCE_BASAL_ON_HYPOGLYCEMIA_PATTERN
+  - NERVOUS_SYSTEM_DISORDER_EVENT
+  - SKIN_ULCER_EVENT
+  - ATHEROSCLEROSIS_EVENT
+  - REDUCE_BOLUS_ON_HYPOGLYCEMIA_PATTERN
+[Warning][EMRDataset] Unknown ValueToken values found (count=40) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_Partial
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN_Partial
+  - ROUTINE_BASAL_DOSAGE_PATTERN_False
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_False
+  - INSULIN_ON_HYPERGLYCEMIA_PATTERN
+  - POTASSIUM_MEASURE_STATE_Moderate Hypokalemia
+  - ROUTINE_BASAL_DOSAGE_PATTERN_Partial
+  - NEUTROPHILS_MEASURE_TREND_Decreasing
+[Warning][EMRDataset] Unknown PositionToken values found (count=59) — mapping to [MASK]:
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_Partial
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN
+  - ROUTINE_GLUCOSE_MEASURE_ON_ADMISSION_PATTERN_Partial
+  - ROUTINE_BASAL_DOSAGE_PATTERN_False
+  - ROUTINE_GLUCOSE_MEASURE_PATTERN_False
+  - INSULIN_ON_HYPERGLYCEMIA_PATTERN
+  - POTASSIUM_MEASURE_STATE_Moderate Hypokalemia_START
+  - POTASSIUM_MEASURE_STATE_Moderate Hypokalemia_END
+  - ROUTINE_BASAL_DOSAGE_PATTERN_Partial
+[Diag] Loading checkpoints...
+[GPT] Outcomes not in tokenizer vocab (ignored): ['ATHEROSCLEROSIS_EVENT', 'DIABETIC_COMA_EVENT', 'NERVOUS_SYSTEM_DISORDER_EVENT', 'OTHER_COMPLICATION_EVENT', 'SKIN_ULCER_EVENT']
+[GPT]: Total params: 6.42 M
+[Diag] Using Phase-3 checkpoint (outcome head fine-tuned — matches evaluation.py).
+/usr/local/lib/python3.11/dist-packages/torch/utils/checkpoint.py:295: FutureWarning: `torch.cpu.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cpu', args...)` instead.
+  with torch.enable_grad(), device_autocast_ctx, torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
+
+==========================================================================================
+REPORT 1 - PER-OUTCOME AUROC BREAKDOWN (48h eval window, teacher-forced LM logits)
+==========================================================================================
+  NOTE: Uses teacher-forced LM logits — scores are systematically higher than
+  evaluation.py's generation-based AUROC. Use for within-run ranking and trend
+  analysis, not as a direct comparison to the summary outcome_auroc.
+Outcome                                 AUROC  PosRate%    nPos      Sep
+---------------------------------------------------------------------------
+DISGLYCEMIA_EVENT_Hyperglycemia        0.9187   30.878%   54819   2.2972 >>>
+DISGLYCEMIA_EVENT_Hypoglycemia         0.8923    3.502%    6218   2.1652 >>>
+KIDNEY_COMPLICATION_EVENT              0.7444   14.046%   24936   0.7989
+ACUTE_RESPIRATORY_DISORDER_EVENT       NO POS    0.000%
+INFECTION_EVENT                        NO POS    0.000%
+CARDIO-VASCULAR_DISORDER_EVENT         0.8938    2.749%    4881   1.5374 >>>
+NEUROVASCULAR_COMPLICATION_EVENT       NO POS    0.000%
+RETINOPATHY_EVENT                      NO POS    0.000%
+HYPEROSMOLALITY_EVENT                  NO POS    0.000%
+KETOACIDOSIS_EVENT                     NO POS    0.000%
+ACIDOSIS_EVENT                         NO POS    0.000%
+---------------------------------------------------------------------------
+MEAN OUTCOME AUROC                     0.8623
+
+LM head vs Outcome head
+Outcome                                    LM    Head  Winner
+------------------------------------------------------------
+DISGLYCEMIA_EVENT_Hyperglycemia        0.9187  0.6959  lm >>>
+DISGLYCEMIA_EVENT_Hypoglycemia         0.8923  0.8183  lm >>>
+KIDNEY_COMPLICATION_EVENT              0.7444  0.6809  lm >>>
+CARDIO-VASCULAR_DISORDER_EVENT         0.8938  0.4994  lm >>>
+
+==========================================================================================
+REPORT 2 - LOGIT CALIBRATION (all outcomes combined)
+==========================================================================================
+Total positions : 1,952,874
+Positive rate   : 4.652%
+Overall AUROC   : 0.9684
+Logit[pos] mean : -0.7061  std: 1.1411
+Logit[neg] mean : -5.8188  std: 2.3252
+Separation      : 5.1127
+Sigmoid[pos]    : 0.3305
+Sigmoid[neg]    : 0.0030
+
+==========================================================================================
+REPORT 3 - TEMPORAL COVERAGE  (BCE=12h  EVAL=48h)
+==========================================================================================
+BCE  window (12h):  95.1% with >=1 positive (mean 45.48)
+Eval window (48h):  97.9% with >=1 positive (mean 147.06)
+
+==========================================================================================
+REPORT 4 - AUX LOSS LAMBDA CALIBRATION (actual trained values from checkpoint)
+==========================================================================================
+  aux             lambda_max    anchor_bce    anchor_aux   bce/aux     cap
+  ------------------------------------------------------------------------
+  ce                0.102220      0.160812      0.786598    0.2044     0.5
+  dt                0.098527      0.160812      0.816079    0.1971     0.5
+  ranking           0.020799      0.022155      0.213044    0.1040     0.2
+
+  Warmup completed at epoch: 37
+  Current curriculum stage: 1
+
+==========================================================================================
+REPORT 5 - TOKEN GRADIENT UTILITY (outcome + top/bottom tokens)
+==========================================================================================
+Token                                       occ    grad/occ    rank
+-----------------------------------------------------------------
+DISGLYCEMIA_EVENT_Hyperglycemia             341  6.7661e-08     229 << LOW SIGNAL
+DISGLYCEMIA_EVENT_Hypoglycemia               21  5.4260e-07      84
+KIDNEY_COMPLICATION_EVENT                   110  9.5173e-07      46
+ACUTE_RESPIRATORY_DISORDER_EVENT             15  4.7548e-08     249 << LOW SIGNAL
+INFECTION_EVENT                               7  7.0906e-08     226 << LOW SIGNAL
+CARDIO-VASCULAR_DISORDER_EVENT               66  1.8779e-07     164
+NEUROVASCULAR_COMPLICATION_EVENT              1  7.5763e-09     321 << LOW SIGNAL
+RETINOPATHY_EVENT                             2  1.6532e-08     307 << LOW SIGNAL
+HYPEROSMOLALITY_EVENT                         5  2.4636e-08     283 << LOW SIGNAL
+KETOACIDOSIS_EVENT                            3  2.1343e-07     151
+ACIDOSIS_EVENT                               14  4.4739e-08     253 << LOW SIGNAL
+
+Top 10 tokens by grad/occ:
+  BASAL_BITZUA_STATE_SubCutaneous Medium_START  6.9182e-06
+  INSULIN_BITZUA_STATE_IntraVenous High_START   4.4046e-06
+  BOLUS_BITZUA_STATE_SubCutaneous Low_START     3.4054e-06
+  HEMOGLOBIN_MEASURE_TREND_nan_START            3.3686e-06
+  PH_MEASURE_TREND_nan_START                    3.3032e-06
+  GLUCOSE_MEASURE_STATE_Low Glucose_START       2.9410e-06
+  BOLUS_BITZUA_STATE_SubCutaneous Medium_START  2.8261e-06
+  BASAL_BITZUA_STATE_SubCutaneous Medium_END    2.6546e-06
+  TROPONIN_MEASURE_TREND_nan_START              2.6405e-06
+  BOLUS_BITZUA_STATE_SubCutaneous High_START    2.5871e-06
+Bottom 10 tokens by grad/occ:
+  HEART_RATE_MEASURE_STATE_Bradycardia_END      1.9951e-10
+  BLOOD_PRESSURE_DIASTOLIC_MEASURE_STATE_Severe HTN_END 1.9636e-10
+  ANTIDIABETIC_BITZUA_EVENT                     1.2667e-10
+  BODY_TEMPERATURE_MEASURE_STATE_Mild Fever_END 9.5889e-11
+  HYPERTONIC-SALINE_BITZUA_EVENT                8.1093e-11
+  NEUTROPHILS_MEASURE_STATE_Severe Neutrophilia_START 5.2137e-12
+  ASPARATE-AMINOTRANSFERASE_MEASURE_STATE_Massive Elevation_START 4.1799e-12
+  NEUTROPHILS_MEASURE_STATE_Severe Neutrophilia_END 0.0000e+00
+  ASPARATE-AMINOTRANSFERASE_MEASURE_STATE_Massive Elevation_END 0.0000e+00
+  [PAD]                                         0.0000e+00
+
+==========================================================================================
+REPORT 6 - CONTEXT VECTOR INFLUENCE
+==========================================================================================
+BCE (normal ctx)  : 225.966181
+BCE (zeroed ctx)  : 228.863973   delta=+2.897792
+BCE (shuffled ctx): 225.454173   delta=-0.512009
+
+==========================================================================================
+REPORT 7 - EMBEDDER LINEAR PROBE (frozen Phase-1)
+==========================================================================================
+3-fold CV ROC-AUC from embedder alone: 0.6245
+
+==========================================================================================
+REPORT 8 - VOCAB HEALTH (frequent-noisy / rare-unlearned)
+==========================================================================================
+
+[Frequent but noisy]
+
+[Rare and under-learned]
+[PAD]                                         occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=0
+[MASK]                                        occ=1318   conf=0.000 top1=0.000 nextH=0.86 freq=0
+BOLUS_BITZUA_STATE_SubCutaneous High_END      occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=1
+BOLUS_BITZUA_STATE_SubCutaneous High_START    occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=1
+CREATINE-KINASE_MEASURE_TREND_Increasing_END  occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=1
+CREATINE-KINASE_MEASURE_TREND_Increasing_START occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=1
+HEMOGLOBIN_MEASURE_TREND_nan_END              occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=1
+HEMOGLOBIN_MEASURE_TREND_nan_START            occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=1
+PLT_MEASURE_TREND_nan_END                     occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=1
+PLT_MEASURE_TREND_nan_START                   occ=0      conf=0.000 top1=0.000 nextH=0.00 freq=1
+TROPONIN_MEASURE_TREND_Increasing_START       occ=2      conf=0.000 top1=0.000 nextH=0.96 freq=1
+KETOACIDOSIS_EVENT                            occ=2      conf=0.000 top1=0.000 nextH=0.99 freq=1
+INFECTION_WBC_MEASURE_TREND_nan_START         occ=1      conf=0.000 top1=0.000 nextH=0.92 freq=1
+HYPERTONIC-SALINE_BITZUA_EVENT                occ=10     conf=0.000 top1=0.000 nextH=0.94 freq=1
+NEUROVASCULAR_COMPLICATION_EVENT              occ=2      conf=0.000 top1=0.000 nextH=0.99 freq=1
+RETINOPATHY_EVENT                             occ=2      conf=0.000 top1=0.000 nextH=1.00 freq=1
+HEMATOCRIT_MEASURE_TREND_nan_START            occ=1      conf=0.000 top1=0.000 nextH=0.96 freq=1
+INSULIN_BITZUA_STATE_IntraVenous High_START   occ=5      conf=0.000 top1=0.000 nextH=0.97 freq=1
+HYPEROSMOLALITY_EVENT                         occ=5      conf=0.000 top1=0.000 nextH=0.96 freq=1
+HEMOGLOBIN_MEASURE_STATE_Polycythemia_START   occ=2      conf=0.000 top1=0.000 nextH=1.00 freq=1
+
+==========================================================================================
+PROBE - Δt HEAD
+==========================================================================================
+  positions   : 27,602
+  pred Δt (h) : mean=1.039  std=1.248
+  true Δt (h) : mean=0.399  std=2.763
+  Pearson r   : 0.2843
+  R²          : -0.0008
+  per-patient pred Δt std (h): mean=1.244  p10=0.782
+
+==========================================================================================
+PROBE - OUTCOME HEAD LABEL ALIGNMENT (eval window=48.0h)
+==========================================================================================
+                         outcome  n_pos  n_neg  mean_logit_pos  mean_logit_neg    gap  auroc  flip
+       KIDNEY_COMPLICATION_EVENT   2246  24667         -3.0559         -4.5237 1.4678 0.6887 False
+                   RELEASE_EVENT   3213  23700         -4.0079         -6.9998 2.9919 0.8472 False
+ DISGLYCEMIA_EVENT_Hyperglycemia   6693  20220         -0.4304         -5.4927 5.0624 0.9201 False
+  DISGLYCEMIA_EVENT_Hypoglycemia    664  26249         -0.4145         -6.3512 5.9367 0.9243 False
+                     DEATH_EVENT    542  26371         -1.5213         -7.4605 5.9392 0.8522 False
+  CARDIO-VASCULAR_DISORDER_EVENT    392  26521         -2.2009         -8.6644 6.4635 0.9724 False
+                  ACIDOSIS_EVENT      0  26913             NaN             NaN    NaN    NaN False
+ACUTE_RESPIRATORY_DISORDER_EVENT      0  26913             NaN             NaN    NaN    NaN False
+           HYPEROSMOLALITY_EVENT      0  26913             NaN             NaN    NaN    NaN False
+                 INFECTION_EVENT      0  26913             NaN             NaN    NaN    NaN False
+              KETOACIDOSIS_EVENT      0  26913             NaN             NaN    NaN    NaN False
+NEUROVASCULAR_COMPLICATION_EVENT      0  26913             NaN             NaN    NaN    NaN False
+               RETINOPATHY_EVENT      0  26913             NaN             NaN    NaN    NaN False
+
+==========================================================================================
+PROBE - OUTCOME HEAD LOGIT DISTRIBUTION
+==========================================================================================
+                         outcome    mean   std     p50     p99  abs_max
+                  ACIDOSIS_EVENT -28.441 4.784 -28.790 -18.199   43.335
+ACUTE_RESPIRATORY_DISORDER_EVENT -28.328 4.748 -28.645 -18.180   43.543
+                 INFECTION_EVENT -28.347 4.739 -28.685 -18.140   42.967
+NEUROVASCULAR_COMPLICATION_EVENT -28.349 4.735 -28.711 -18.161   43.172
+           HYPEROSMOLALITY_EVENT -28.310 4.712 -28.693 -18.133   42.776
+              KETOACIDOSIS_EVENT -28.217 4.693 -28.611 -18.170   42.840
+               RETINOPATHY_EVENT -28.342 4.675 -28.734 -18.232   42.475
+                     DEATH_EVENT  -6.946 4.237  -6.666   1.034   24.489
+  DISGLYCEMIA_EVENT_Hypoglycemia  -5.510 4.202  -5.117   1.481   38.298
+ DISGLYCEMIA_EVENT_Hyperglycemia  -3.341 3.943  -3.129   3.948   27.311
+  CARDIO-VASCULAR_DISORDER_EVENT  -8.193 3.735  -8.203  -0.108   29.462
+                   RELEASE_EVENT  -6.632 3.248  -6.040  -2.260   25.873
+       KIDNEY_COMPLICATION_EVENT  -3.925 3.056  -3.865   1.491   27.309
+
+[probe_outcome_lm_coupling] outcome_to_lm not present in model — skipping.
+
+[Diag] Done.
