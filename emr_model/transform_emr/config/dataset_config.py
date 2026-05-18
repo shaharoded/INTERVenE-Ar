@@ -43,7 +43,7 @@ MEAL_TOKENS = ["MEAL_CONTEXT_Breakfast", "MEAL_CONTEXT_Lunch", "MEAL_CONTEXT_Din
 # Outcomes below this threshold are dropped — they have too few positive examples to learn from.
 OUTCOME_RARE_THRESHOLD_PCT = 1.0
 
-USE_QA_DATA = True  # Phase C: QA-data retrain on M-256 (best architecture from Phase B)
+USE_QA_DATA = False  # Phase E: L-384-v2 HP sweep (non-QA)
 # History window (hours from admission) used when aggregating QA ComplianceScore into
 # context features. At eval time DataProcessor overrides this with max_input_days * 24
 # so QA features match the k-day seed actually given to the model.

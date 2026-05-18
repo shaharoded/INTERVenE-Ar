@@ -10,11 +10,11 @@ PHASE2_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'ckpt_best.pt')
 PHASE3_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase3', 'ckpt_best.pt')
 
 MODEL_CONFIG = {
-      "time2vec_dim": 32,
-      "embed_dim": 256,
-      "n_head": 4,
-      "n_layer": 4,
-      "dropout": 0.1,
+      "time2vec_dim": 48,
+      "embed_dim": 384,
+      "n_head": 6,
+      "n_layer": 6,
+      "dropout": 0.15,
       "bias": True,
     }
 
@@ -33,7 +33,7 @@ TRAINING_SETTINGS = {
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 3e-4,
     "phase3_learning_rate":       1e-4,
-    "phase3_backbone_lr_factor":  0.01,  # backbone LR = phase3_lr * factor (1e-6); 0.0 = fully frozen
+    "phase3_backbone_lr_factor":  0.10,  # raised from 0.01: outcome head underfit diagnosed in L-384 Phase B
     "phase3_weight_decay":        1e-3,  # weight decay for outcome_head in P3 (matches backbone)
     "weight_decay": 1e-3,
 
