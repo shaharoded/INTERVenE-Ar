@@ -10,7 +10,7 @@ KIDNEY 0.900  RELEASE 0.835
 
 ## Status
 
-Phase B in progress — S-128 DISCARD, M-256-deep DISCARD, L-384 DISCARD. Next: XL-512 or L-384 variation per program.md.
+Phase B complete — M-256 KEEP (best). S-128/M-256-deep/L-384 DISCARD, XL-512 OOM EXCLUSION. Phase C started: M-256-QA training (USE_QA_DATA=True).
 
 ---
 
@@ -129,6 +129,33 @@ Verdict: DISCARD — AUROC 0.899 vs M-256 0.914 (Δ=-0.015, outside ±0.005 wind
   (+0.011). Pattern: wider/deeper (384-dim, 6L) helps CARDIO but hurts DEATH and
   RELEASE. Phase 3 outcome head did not converge: LM head outperforms dedicated head
   at all outcomes — more P3 epochs or higher backbone LR factor needed at this scale.
+
+---
+
+### XL-512  (commit `ab7aae1`)  — Phase B #4  — OOM EXCLUSION
+- params: ~36,790,000 (est.)    peak VRAM: n/a (never reached eval)
+- final config attempted:
+    embed_dim=512, n_layer=6, n_head=8, time2vec_dim=64, dropout=0.1,
+    batch_size=16→8 (halved per program.md OOM rule)
+- metrics: n/a — Phase 2 never completed
+
+Training notes:
+  Phase 1 — 19 epochs, completed successfully.
+  Phase 2 — SIGKILL during training ~30-45 min after Phase 2 start, all attempts:
+    Run 1 (batch_size=16): crashed during epoch 6 training at ~06:55 UTC.
+    Run 2 (batch_size=16): crashed during epoch 6 training at ~07:05 UTC.
+    Run 3 (batch_size=8, grad_accum=8): crashed during epoch 4 training at ~07:53 UTC.
+    All crashes at same wall-clock time (~30-45 min), different epoch counts:
+      batch_size=16 → 6 epochs × 5 min = 30 min; batch_size=8 → 4 epochs × 8 min = 32 min.
+    Pattern is TIME-BASED (cumulative RAM growth), not per-step VRAM OOM. Batch halving
+    does not reduce peak RAM since workers accumulate memory independently of batch size.
+    No ckpt_best.pt ever saved; ckpt_last.pt only.
+  Within-size adjustments tried: batch_size=16→8 (program.md within-size rule applied).
+  Diagnose: not run — Phase 2 never completed; no usable checkpoint.
+Verdict: OOM EXCLUSION — Phase 2 training crashes after ~30-45 min regardless of batch
+  size. Cumulative RAM growth pattern (not VRAM OOM) prevents training XL-512 on this
+  hardware. Per program.md: hard exclusion after batch halve still failed.
+  Phase B best remains M-256.
 
 ---
 

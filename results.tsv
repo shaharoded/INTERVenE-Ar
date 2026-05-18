@@ -3,3 +3,4 @@ commit	outcome_auroc	outcome_auprc	onset_mae_hrs	peak_vram_gb	status	description
 d22dadb	0.899748	0.610763	64.72	0.22	DISCARD	arch S-128; 1.67M params; P3 best ep35 vl_select=0.712 (proc died ep40 val, eval-only); RELEASE 0.741 vs 0.835 baseline; AUROC -0.014 below M-256
 3c94166	0.898504	0.606415	64.49	0.40	DISCARD	arch M-256-deep; 9.31M params; embed=256 n_layer=6; P3 best ep28 vl_select=0.680 (proc died ep33 val, eval-only); RELEASE 0.751 vs 0.835 baseline; AUROC -0.016 below M-256
 b72a0a1	0.899163	0.597074	64.62	0.59	DISCARD	arch L-384; 20.78M params; embed=384 n_layer=6 n_head=6; P3 best ep15 vl_select=0.663 (OOM during eval, eval-only); DEATH 0.919 vs 0.953 baseline; RELEASE 0.795 vs 0.835 baseline; AUROC -0.015 below M-256
+ab7aae1	n/a	n/a	n/a	n/a	OOM_EXCLUSION	arch XL-512; ~36.8M params; embed=512 n_layer=6 n_head=8; Phase 2 SIGKILL after ~30-45 min regardless of batch_size (16 and 8 both failed); cumulative RAM growth; hard exclusion per program.md

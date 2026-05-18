@@ -13,7 +13,7 @@ MODEL_CONFIG = {
       "time2vec_dim": 32,
       "embed_dim": 256,
       "n_head": 4,
-      "n_layer": 6,
+      "n_layer": 4,
       "dropout": 0.1,
       "bias": True,
     }
