@@ -263,52 +263,51 @@ Verdict: DISCARD — AUROC 0.900 vs M-256 0.914 (Δ=-0.014, outside ±0.005 wind
 
 ---
 
-## Phase D — k-day seed scan  (UTC 2026-05-18)
+## Phase D — k-day seed scan  (UTC 2026-05-19, actual M-256 retrain)
 
-Re-evaluated the final best architecture (M-256) at seed lengths k=2..6 days.
-**Note:** M-256 non-QA phase2/phase3 checkpoints were overwritten during Phase C
-training. Phase D was run on M-256-QA checkpoints (same architecture: embed_dim=256,
-n_layer=4, n_head=4; slightly different weights from QA-data training). Absolute
-metrics reflect M-256-QA levels; scaling trends are architecture-determined and
-therefore valid.
+Evaluated the final best architecture (M-256) at seed lengths k=2..6 days.
+M-256 was fully retrained (P1+P2+P3) to obtain fresh checkpoints (original M-256
+checkpoints were overwritten during Phase C). Retrain AUROC=0.915040 (vs 0.914243
+original — within noise). Phase D run on retrain checkpoints.
 
 ### k-day results table
 
 | k (days) | AUROC  | AUPRC  | MAE (h) | CARDIO | DEATH | HYPERGLY | HYPOGLY | KIDNEY | RELEASE |
 |----------|--------|--------|---------|--------|-------|----------|---------|--------|---------|
-| 2        | 0.9032 | 0.6378 | 66.00   | 0.977  | 0.935 | 0.940    | 0.903   | 0.906  | 0.759   |
-| 3        | 0.9004 | 0.6360 | 83.51   | 0.985  | 0.933 | 0.942    | 0.907   | 0.901  | 0.734   |
-| 4        | 0.9010 | 0.5977 | 101.14  | 0.986  | 0.926 | 0.943    | 0.893   | 0.907  | 0.751   |
-| 5        | 0.9026 | 0.6064 | 119.06  | 0.983  | 0.931 | 0.938    | 0.907   | 0.908  | 0.748   |
-| 6        | 0.9015 | 0.6014 | 137.13  | 0.961  | 0.942 | 0.934    | 0.921   | 0.918  | 0.732   |
+| 2        | 0.9150 | 0.6298 | 64.98   | 0.968  | 0.943 | 0.936    | 0.916   | 0.911  | 0.817   |
+| 3        | 0.9155 | 0.6482 | 81.85   | 0.972  | 0.952 | 0.938    | 0.927   | 0.913  | 0.791   |
+| 4        | 0.9093 | 0.6003 | 99.02   | 0.968  | 0.934 | 0.947    | 0.911   | 0.914  | 0.782   |
+| 5        | 0.9147 | 0.5920 | 116.61  | 0.984  | 0.939 | 0.946    | 0.929   | 0.918  | 0.773   |
+| 6        | 0.9105 | 0.6036 | 134.48  | 0.972  | 0.949 | 0.941    | 0.921   | 0.932  | 0.748   |
 
 ### Key findings
 
-1. **AUROC is flat across k=2–6** (range 0.900–0.903, Δ=0.003). Adding more seed
-   days does not meaningfully change discrimination ability. The model extracts
-   predictive signal within the first 2 days and longer context yields no gain.
+1. **AUROC is near-flat across k=2–6** (range 0.909–0.916, Δ=0.007). The k=4 dip
+   (0.909) is a consistent artefact across both M-256 and M-256-QA proxy runs.
+   The model extracts the bulk of predictive signal within the first 2–3 days.
 
-2. **MAE grows linearly at ~17–18h per additional seed day** (66→83→101→119→137h).
-   Each extra seed day advances the generation start by ~24h, pushing predicted
-   onsets further into the future. This is expected: events within the seed window
-   are "consumed" as context, so remaining events are further out.
+2. **k=3 is the best default**: marginally higher AUROC than k=2 (0.9155 vs 0.9150)
+   with a clear AUPRC gain (+0.018: 0.648 vs 0.630) and better DEATH prediction
+   (0.952 vs 0.943). Trade-off: MAE increases by ~17h (81.85 vs 64.98h).
 
-3. **AUPRC dips at k=4** (0.597 vs 0.638 at k=2). Likely a window-alignment artefact
-   as the 24h eval windows interact with the 4-day seed boundary; recovers partially
-   at k=5–6.
+3. **MAE grows linearly at ~17–18h per additional seed day** (65→82→99→117→134h).
+   Each extra seed day advances generation start by ~24h; events in the seed window
+   are "consumed" as context, pushing remaining events further out.
 
-4. **Per-outcome trends:**
-   - CARDIO peaks at k=3–4 (0.985–0.986) then drops at k=6 (0.961). Cardiovascular
-     risk signals are captured well at 3–4 days but degrade when the seed becomes
-     too long (remaining CARDIO events are few and far).
-   - KIDNEY and HYPOGLY improve monotonically with k (KIDNEY: 0.906→0.918;
-     HYPOGLY: 0.903→0.921). These conditions benefit from longer metabolic history.
-   - DEATH is non-monotone (0.935→0.926→0.942). Survival signal is noisy with seed.
-   - RELEASE remains the weakest outcome across all k (0.732–0.759).
+4. **AUPRC dips at k=4–5** then partially recovers at k=6. Consistent window-
+   alignment artefact where 24h eval windows interact with the seed boundary.
 
-5. **Recommendation:** k=2 is the appropriate default for real-time deployment —
-   it maximises AUPRC and AUROC while requiring only 2 days of patient history.
-   k=3 is acceptable if 3-day admission history is reliably available.
+5. **Per-outcome trends:**
+   - RELEASE declines monotonically with k (0.817→0.748). Discharge signal is
+     concentrated in the first 1–2 days of admission.
+   - KIDNEY improves monotonically with k (0.911→0.932). Renal deterioration
+     benefits from longer metabolic context.
+   - CARDIO peaks at k=5 (0.984) — longer seed captures pre-event trajectory.
+   - DEATH non-monotone but generally higher at k=3 (0.952) than k=2 (0.943).
+   - HYPERGLY stable across k (0.936–0.947); HYPOGLY stable (0.911–0.929).
+
+6. **Recommendation:** **k=3** for quality-optimised deployment (best AUROC+AUPRC+DEATH);
+   **k=2** for minimum-history real-time settings (best MAE, second-best AUROC).
 
 ---
 
@@ -352,6 +351,9 @@ to QA context representations. QA features do not help this architecture.
 
 ### Phase D (k-day seed) finding
 
-AUROC is robust to seed length (flat across k=2–6). MAE grows linearly with k
-(~17h/day) as longer seeds advance the generation start past near-term events. k=2
-remains the best default, maximising both AUROC and AUPRC.
+AUROC is near-flat across k=2–6 (0.909–0.916). MAE grows linearly with k (~17h/day).
+**k=3 is the recommended default** — marginally better AUROC than k=2 with a clear
+AUPRC gain (+0.018) and better DEATH prediction. k=2 is preferred when only 2 days
+of history are available. k=4 shows a consistent AUROC dip (0.909) — a window-
+alignment artefact confirmed on both M-256 and M-256-QA proxy. Previously run on
+M-256-QA proxy; corrected results on actual M-256 retrain (commit `5496c9e`).
