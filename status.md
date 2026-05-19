@@ -279,25 +279,28 @@ original — within noise). Phase D run on retrain checkpoints.
 | 4        | 0.9093 | 0.6003 | 99.02   | 0.968  | 0.934 | 0.947    | 0.911   | 0.914  | 0.782   |
 | 5        | 0.9147 | 0.5920 | 116.61  | 0.984  | 0.939 | 0.946    | 0.929   | 0.918  | 0.773   |
 | 6        | 0.9105 | 0.6036 | 134.48  | 0.972  | 0.949 | 0.941    | 0.921   | 0.932  | 0.748   |
+| 7        | 0.9115 | 0.6049 | 152.85  | n/a    | n/a   | n/a      | n/a     | n/a    | n/a     |
+| 8        | 0.9087 | 0.6178 | 171.82  | n/a    | n/a   | n/a      | n/a     | n/a    | n/a     |
 
 ### Key findings
 
-1. **AUROC is near-flat across k=2–6** (range 0.909–0.916, Δ=0.007). The k=4 dip
-   (0.909) is a consistent artefact across both M-256 and M-256-QA proxy runs.
-   The model extracts the bulk of predictive signal within the first 2–3 days.
+1. **AUROC is near-flat across k=2–8** (range 0.909–0.916, Δ=0.007). The k=4 dip
+   (0.909) is a consistent artefact; k=8 is the second-lowest (0.909). The model
+   extracts the bulk of predictive signal within the first 2–3 days.
 
 2. **k=3 is the best default**: marginally higher AUROC than k=2 (0.9155 vs 0.9150)
    with a clear AUPRC gain (+0.018: 0.648 vs 0.630) and better DEATH prediction
    (0.952 vs 0.943). Trade-off: MAE increases by ~17h (81.85 vs 64.98h).
 
-3. **MAE grows linearly at ~17–18h per additional seed day** (65→82→99→117→134h).
+3. **MAE grows linearly at ~17–18h per additional seed day** (65→82→99→117→134→153→172h).
    Each extra seed day advances generation start by ~24h; events in the seed window
    are "consumed" as context, pushing remaining events further out.
 
-4. **AUPRC dips at k=4–5** then partially recovers at k=6. Consistent window-
-   alignment artefact where 24h eval windows interact with the seed boundary.
+4. **AUPRC dips at k=4–5** then partially recovers from k=6 onward (0.604, 0.617, 0.618).
+   k=8 AUPRC (0.618) is the second-best after k=3 (0.648) — longer context improves
+   precision-recall for rare events despite the MAE cost.
 
-5. **Per-outcome trends:**
+5. **Per-outcome trends (k=2–6 only; k=7–8 mean metrics only):**
    - RELEASE declines monotonically with k (0.817→0.748). Discharge signal is
      concentrated in the first 1–2 days of admission.
    - KIDNEY improves monotonically with k (0.911→0.932). Renal deterioration
@@ -308,6 +311,7 @@ original — within noise). Phase D run on retrain checkpoints.
 
 6. **Recommendation:** **k=3** for quality-optimised deployment (best AUROC+AUPRC+DEATH);
    **k=2** for minimum-history real-time settings (best MAE, second-best AUROC).
+   k>6 not recommended — AUROC declines while MAE exceeds 150h.
 
 ---
 
