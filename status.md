@@ -357,3 +357,16 @@ AUPRC gain (+0.018) and better DEATH prediction. k=2 is preferred when only 2 da
 of history are available. k=4 shows a consistent AUROC dip (0.909) — a window-
 alignment artefact confirmed on both M-256 and M-256-QA proxy. Previously run on
 M-256-QA proxy; corrected results on actual M-256 retrain (commit `5496c9e`).
+
+### Phase E (proper QA retrain) finding  —  DISCARD
+
+M-256 retrained with USE_QA_DATA=True and a fresh tokenizer (commit `fa63768`):
+AUROC=0.876, AUPRC=0.567, MAE=63.70h, VRAM=0.33 GB. P3 best ep31 vl_select=0.702
+(proc died ep36 val; eval-only recovery).
+
+**Verdict: DISCARD.** AUROC −0.038 below M-256 baseline (0.914243), well outside
+the ±0.005 tolerance. Worse than the original stale-tokenizer QA run (0.876 vs
+0.903), confirming that properly tokenized %_PATTERN% events add noise rather than
+signal. Phase C and Phase E together establish that QA features do not benefit this
+architecture in any form. The best model remains M-256 non-QA (commit `5496c9e`,
+AUROC=0.915040).
