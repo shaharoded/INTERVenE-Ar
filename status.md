@@ -274,6 +274,7 @@ original — within noise). Phase D run on retrain checkpoints.
 
 | k (days) | AUROC  | AUPRC  | MAE (h) | CARDIO | DEATH | HYPERGLY | HYPOGLY | KIDNEY | RELEASE |
 |----------|--------|--------|---------|--------|-------|----------|---------|--------|---------|
+| 1        | 0.6653 | 0.2543 | 51.23   | n/a    | n/a   | n/a      | n/a     | n/a    | n/a     |
 | 2        | 0.9150 | 0.6298 | 64.98   | 0.968  | 0.943 | 0.936    | 0.916   | 0.911  | 0.817   |
 | 3        | 0.9155 | 0.6482 | 81.85   | 0.972  | 0.952 | 0.938    | 0.927   | 0.913  | 0.791   |
 | 4        | 0.9093 | 0.6003 | 99.02   | 0.968  | 0.934 | 0.947    | 0.911   | 0.914  | 0.782   |
@@ -284,23 +285,27 @@ original — within noise). Phase D run on retrain checkpoints.
 
 ### Key findings
 
-1. **AUROC is near-flat across k=2–8** (range 0.909–0.916, Δ=0.007). The k=4 dip
+1. **k=1 is unusable** — AUROC collapses to 0.665 (AUPRC 0.254) with only 1 day of
+   history. There is a hard cliff between k=1 and k=2 (+0.250 AUROC). The model
+   requires a minimum of 2 days of admission context to make meaningful predictions.
+
+2. **AUROC is near-flat across k=2–8** (range 0.909–0.916, Δ=0.007). The k=4 dip
    (0.909) is a consistent artefact; k=8 is the second-lowest (0.909). The model
    extracts the bulk of predictive signal within the first 2–3 days.
 
-2. **k=3 is the best default**: marginally higher AUROC than k=2 (0.9155 vs 0.9150)
+3. **k=3 is the best default**: marginally higher AUROC than k=2 (0.9155 vs 0.9150)
    with a clear AUPRC gain (+0.018: 0.648 vs 0.630) and better DEATH prediction
    (0.952 vs 0.943). Trade-off: MAE increases by ~17h (81.85 vs 64.98h).
 
-3. **MAE grows linearly at ~17–18h per additional seed day** (65→82→99→117→134→153→172h).
+4. **MAE grows linearly at ~17–18h per additional seed day** (65→82→99→117→134→153→172h).
    Each extra seed day advances generation start by ~24h; events in the seed window
    are "consumed" as context, pushing remaining events further out.
 
-4. **AUPRC dips at k=4–5** then partially recovers from k=6 onward (0.604, 0.617, 0.618).
+5. **AUPRC dips at k=4–5** then partially recovers from k=6 onward (0.604, 0.617, 0.618).
    k=8 AUPRC (0.618) is the second-best after k=3 (0.648) — longer context improves
    precision-recall for rare events despite the MAE cost.
 
-5. **Per-outcome trends (k=2–6 only; k=7–8 mean metrics only):**
+6. **Per-outcome trends (k=2–6 only; k=1,7–8 mean metrics only):**
    - RELEASE declines monotonically with k (0.817→0.748). Discharge signal is
      concentrated in the first 1–2 days of admission.
    - KIDNEY improves monotonically with k (0.911→0.932). Renal deterioration
@@ -309,8 +314,9 @@ original — within noise). Phase D run on retrain checkpoints.
    - DEATH non-monotone but generally higher at k=3 (0.952) than k=2 (0.943).
    - HYPERGLY stable across k (0.936–0.947); HYPOGLY stable (0.911–0.929).
 
-6. **Recommendation:** **k=3** for quality-optimised deployment (best AUROC+AUPRC+DEATH);
+7. **Recommendation:** **k=3** for quality-optimised deployment (best AUROC+AUPRC+DEATH);
    **k=2** for minimum-history real-time settings (best MAE, second-best AUROC).
+   **k=1 is hard minimum** — model is not viable below 2 days of history.
    k>6 not recommended — AUROC declines while MAE exceeds 150h.
 
 ---
