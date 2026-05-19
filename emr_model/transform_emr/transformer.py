@@ -1394,6 +1394,8 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     for epoch in range(start_epoch, start_epoch + n_epochs):
         tr = run_epoch(train_dl, train_flag=True)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         vl = run_epoch(val_dl,   train_flag=False)
 
         # One-shot λ_ranking calibration at the end of epoch 1 (mirrors P2).

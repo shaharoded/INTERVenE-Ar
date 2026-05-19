@@ -10,11 +10,49 @@ KIDNEY 0.900  RELEASE 0.835
 
 ## Status
 
-**COMPLETE** — All phases done. Final best: M-256 (non-QA). Phases A/B/C/D all complete.
+**COMPLETE** — Architecture sweep done. Final best: M-256 (non-QA). Phases A/B/C/D complete. Phase B HP sweep (L-384-v2) DISCARD.
 
 ---
 
 ## Architectures completed
+
+### L-384-v2  (commit `452cea9`)  — Phase B HP sweep: backbone_lr_factor 0.01→0.10, dropout 0.10→0.15
+
+- params: 20,782,344           peak VRAM: 0.58 GB (eval-only; training crashed before full eval)
+- final config:
+    embed_dim=384, n_layer=6, n_head=6, time2vec_dim=48, dropout=0.15,
+    phase1_lr=3e-4, phase2_lr=3e-4, phase3_lr=1e-4 (backbone×0.10),
+    patience=5, aux_caps={ce:0.5, dt:0.5, ranking:0.2}
+- metrics: AUROC=0.911, AUPRC=0.633, MAE=65.61h
+- per-outcome: not captured (eval-only path used)
+
+Training notes:
+  Motivation: L-384 Phase 3 diagnosis showed outcome head underfitting at every
+    outcome (LM head beat dedicated head at CARDIO, HYPERGLY, KIDNEY, etc.). Root cause:
+    backbone_lr_factor=0.01 → LR=1e-6 was too small for 20.78M params to adapt in
+    the Phase 3 budget. Fix: raise factor to 0.10 (backbone LR=1e-5); also raise
+    dropout 0.10→0.15 for regularisation at this scale.
+  Phase 1 — reused L-384 Phase 1 checkpoint (embed_dim unchanged; no retrain needed).
+  Phase 2 — 52 epochs; ranking unlocked ep33 (plateau), best ep43 (vl_total=0.0964,
+    BCE=0.0650, ranking=0.097). api.py crashed between Phase 2 and Phase 3 (same
+    cumulative-RAM pattern as original L-384). Recovered via run_phase3.py.
+  Phase 3 — repeated SIGKILL at validation ~80-84% (batch ~433-455 of 541) after
+    ~10-11 epochs across 3 separate launches (run-b, run-c, run-d). Root cause:
+    cumulative CUDA memory growth over training epochs meets long-sequence validation
+    batches. Fix applied: torch.cuda.empty_cache() before validation + resume from
+    ckpt_last.pt. With fix, run-d survived ep12 and ep13 (validation fully completed).
+    Best checkpoint: run-c ep6 (vl_select=0.656235). run-d resumed at ep12 but
+    ep12=0.684, ep13=0.700 — diverging upward (bad_epochs accumulating, early stop
+    ~ep17). Evaluated via eval_only.py from phase3/ckpt_best.pt (run-c ep6).
+  Within-size adjustments tried: backbone_lr_factor=0.01→0.10, dropout=0.10→0.15.
+Verdict: DISCARD — AUROC 0.911 vs M-256 0.914 (Δ=−0.004). Within the ±0.005 AUROC
+  tolerance window, but MAE 65.61h is 0.66h WORSE than baseline (secondary criterion
+  requires ≥2h MAE improvement). AUPRC notably better (+0.013: 0.633 vs 0.621).
+  Higher backbone LR did not fully close the convergence gap; Phase 3 best arrived at
+  only ep6 of an expected 20-30+ epoch trajectory — the model needs more training epochs
+  to converge at 20.78M params than the current crash-recovery budget provides.
+
+---
 
 ### M-256-QA  (commit `2da6fc5`)  — Phase C QA-data retrain
 

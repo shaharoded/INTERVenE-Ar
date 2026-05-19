@@ -75,23 +75,30 @@ print("[Phase 1]: Loading embedder checkpoint...")
 embedder, *_ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=tokenizer)
 embedder.to(device)
 
-# Load Phase-2 GPT checkpoint as starting point for Phase-3
-print("[Phase 2]: Loading Phase-2 best checkpoint...")
+# Load Phase-3 last checkpoint for resume, else fall back to Phase-2 best
+_p3_last = Path(PHASE3_CHECKPOINT).parent / "ckpt_last.pt"
 _p2_best = Path(PHASE2_CHECKPOINT)
 _p2_last = _p2_best.parent / "ckpt_last.pt"
 _p2_ckpt = _p2_best if _p2_best.exists() else (_p2_last if _p2_last.exists() else None)
-if _p2_ckpt is None:
-    raise FileNotFoundError("No Phase-2 checkpoint found. Cannot run Phase-3.")
-model_p3, *_ = GPT.load(str(_p2_ckpt), embedder=embedder)
-print(f"[Phase 2]: Loaded from {_p2_ckpt}")
+
+if _p3_last.exists():
+    print(f"[Phase 3]: Resuming from phase3/ckpt_last.pt...")
+    model_p3, *_ = GPT.load(str(_p3_last), embedder=embedder)
+    resume_p3 = True
+elif _p2_ckpt is not None:
+    print(f"[Phase 2]: Loading Phase-2 best checkpoint from {_p2_ckpt}...")
+    model_p3, *_ = GPT.load(str(_p2_ckpt), embedder=embedder)
+    resume_p3 = False
+else:
+    raise FileNotFoundError("No Phase-2 or Phase-3 checkpoint found. Cannot run Phase-3.")
 
 # Phase 3 fine-tuning
-print("[Phase 3]: Starting outcome head fine-tuning...")
+print(f"[Phase 3]: Starting outcome head fine-tuning (resume={resume_p3})...")
 model_p3, _, p3_val_losses = finetune_transformer(
     model             = model_p3,
     train_dl          = phase3_train_dl,
     val_dl            = val_dl,
-    resume            = False,
+    resume            = resume_p3,
     checkpoint_path   = PHASE3_CHECKPOINT,
     training_settings = TRAINING_SETTINGS,
 )
