@@ -141,7 +141,9 @@ def generate(model,
              tqdm_position=0,
              tqdm_desc='Generating',
              temperature_start=3.0,
-             temperature_anneal_steps=10):
+             temperature_anneal_steps=10,
+             hazard_suppress=True,
+             hazard_min_hours=24.0):
     """
     Unified autoregressive generation for all patients in *dataset*.
 
@@ -181,6 +183,14 @@ def generate(model,
         temperature_anneal_steps (int): Steps over which to decay temperature_start
             → temperature (default 10).  After this many generated tokens the
             steady-state temperature applies.
+        hazard_suppress (bool): F3 flag. When True, uses the outcome head's predicted
+            P(DEATH or RELEASE in next 48 h) at the seed-end position to draw a
+            per-patient terminal suppression time T from an Exponential distribution
+            (E[T] = 48 / p_terminal hours), clamped to ≥ hazard_min_hours. Terminal
+            tokens (DEATH/RELEASE) are masked to −∞ until elapsed generated time ≥ T.
+        hazard_min_hours (float): Hard floor for drawn terminal suppression times
+            (default 24.0 h). Ensures no patient terminates within the first 24 h
+            of generated time even if the outcome head predicts very high terminal risk.
 
     Returns:
         pd.DataFrame with columns PatientId, Step, TimePoint, Token, IsInput,
@@ -281,6 +291,23 @@ def generate(model,
             time_exceeded = current_abs_ts >= max_abs_ts_norm
             finished      = finished | time_exceeded
 
+            # F3: draw per-patient terminal suppression times from outcome head.
+            # p_terminal = P(DEATH or RELEASE in next 48 h) at seed-end position.
+            # T ~ Exp(rate = p_terminal / 48h), clamped to >= hazard_min_hours.
+            # Terminal tokens are suppressed until elapsed generated hours >= T.
+            hazard_min_t = None
+            if hazard_suppress:
+                terminal_outcome_idxs = [i for i, n in enumerate(model.outcome_names)
+                                          if n in set(TERMINAL_OUTCOMES)]
+                if terminal_outcome_idxs:
+                    seed_outcome = input_outcome_logits[
+                        torch.arange(B, device=device), last_valid_idx
+                    ][:, terminal_outcome_idxs]                      # [B, n_term]
+                    p_term = torch.sigmoid(seed_outcome).max(dim=-1).values.clamp(1e-4, 1 - 1e-4)
+                    u = torch.rand(B, device=device).clamp(1e-6, 1 - 1e-6)
+                    drawn = -torch.log(u) * (48.0 / p_term)          # [B] hours
+                    hazard_min_t = drawn.clamp(min=hazard_min_hours)  # [B] hours
+
             cache_mask        = (pos_ids != pad_id)
             open_counts, next_meal_rank = init_legality_state_batched(luts, pos_ids)
             last_tokens_batch = [[] for _ in range(B)]
@@ -303,6 +330,15 @@ def generate(model,
                 if finished.any():
                     next_logits[finished] = float("-inf")
                     next_logits[finished, pad_id] = 0.0
+
+                # F3: suppress terminal tokens for patients whose elapsed generated time
+                # is below their drawn hazard threshold.
+                if hazard_min_t is not None and terminal_ids:
+                    elapsed_gen_hours = (current_abs_ts - last_seed_ts).clamp(min=0) * 336.0
+                    suppress = (elapsed_gen_hours < hazard_min_t) & ~finished
+                    if suppress.any():
+                        for tid in terminal_ids:
+                            next_logits[suppress, tid] = float("-inf")
 
                 # F2: exponential annealing schedule from temperature_start → temperature.
                 # When temperature_start > temperature, the first temperature_anneal_steps
