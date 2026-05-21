@@ -1,118 +1,0 @@
-Device: cuda
-[Data]: Loading source temporal events and context data...
-[Data]: Processing train split (fitting scaler)...
-[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 8204 -> 6713
-[DataProcessor] Applied temporal filter: WHERE ConceptName NOT LIKE '%_PATTERN%' | rows 6713 -> 6284
-[Data]: Processing val split (applying fitted scaler)...
-[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 1985 -> 1600
-[DataProcessor] Applied temporal filter: WHERE ConceptName NOT LIKE '%_PATTERN%' | rows 1600 -> 1518
-[Data]: Loading tokenizer from cache...
-[Warning][EMRDataset] Unknown Concept values found (count=1) — mapping to [MASK]:
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-[Warning][EMRDataset] Unknown ValueToken values found (count=5) — mapping to [MASK]:
-  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia
-  - POTASSIUM_MEASURE_STATE_Moderate Hypokalemia
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-  - SODIUM_MEASURE_STATE_Moderate Hypernatremia
-  - BLOOD_PRESSURE_SYSTOLIC_MEASURE_STATE_Severe HTN
-[Warning][EMRDataset] Unknown PositionToken values found (count=9) — mapping to [MASK]:
-  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia_START
-  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia_END
-  - POTASSIUM_MEASURE_STATE_Moderate Hypokalemia_START
-  - POTASSIUM_MEASURE_STATE_Moderate Hypokalemia_END
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-  - SODIUM_MEASURE_STATE_Moderate Hypernatremia_START
-  - BLOOD_PRESSURE_SYSTOLIC_MEASURE_STATE_Severe HTN_START
-  - BLOOD_PRESSURE_SYSTOLIC_MEASURE_STATE_Severe HTN_END
-  - SODIUM_MEASURE_STATE_Moderate Hypernatremia_END
-[Data]: 34 train / 8 val / 8 test patients  (11,720 train records, 2,825 val records; test held out, processed at eval time)
-Model config: {'time2vec_dim': 48, 'embed_dim': 384, 'n_head': 6, 'n_layer': 6, 'dropout': 0.15, 'bias': True, 'ctx_dim': 7}
-[Logger] Logging to: /tmp/training.log
-
-======================================================================
-  train_embedder  |  2026-05-18 18:05:02
-  model config      : {'time2vec_dim': 48, 'embed_dim': 384, 'n_head': 6, 'n_layer': 6, 'dropout': 0.15, 'bias': True, 'ctx_dim': 7}
-  training settings : {'phase1_n_epochs': 1, 'phase2_n_epochs': 1, 'phase3_n_epochs': 1, 'sample': 50, 'lr_warmup_epochs': 5, 'early-stop-patience': 5, 'early-stop-min-delta-rel': 0.001, 'phase1_learning_rate': 0.0003, 'phase2_learning_rate': 0.0003, 'phase3_learning_rate': 0.0001, 'phase3_backbone_lr_factor': 0.1, 'phase3_weight_decay': 0.001, 'weight_decay': 0.001, 'batch_size': 16, 'grad_accumulation_steps': 4, 'phase1_bce_window_hours': 3.0, 'phase2_terminal_bce_window_hours': 168.0, 'phase1_scheduler': {'bce_only_epochs': 3, 'aux_fraction_caps': {'dt': 0.4}, 'order': [['dt']], 'ramp_epochs': {'dt': 0}}, 'phase2_scheduler': {'bce_only_epochs': 4, 'aux_fraction_caps': {'ce': 0.5, 'dt': 0.5, 'ranking': 0.2}, 'order': [['ce', 'dt'], ['ranking']], 'ramp_epochs': {'ce': 0, 'dt': 0, 'ranking': 3}, 'plateau_min_delta': 0.001, 'plateau_patience': [2]}, 'outcome_horizon_hours': 48.0}
-======================================================================
-Training:   0%|          | 0/34 [00:00<?, ?it/s]                                                Validation:   0%|          | 0/8 [00:00<?, ?it/s]                                                 [Phase-1] Epoch 001
-            --> Train=3.5880 (BCE=3.5880  Δt=0.0000)
-            --> Val=1.3504 (BCE=1.3504  Δt=0.0000)
-            --> RawTrain dt=1.4239431
-[GPT] Outcomes not in tokenizer vocab (ignored): ['ATHEROSCLEROSIS_EVENT', 'DIABETIC_COMA_EVENT', 'NERVOUS_SYSTEM_DISORDER_EVENT', 'OTHER_COMPLICATION_EVENT', 'SKIN_ULCER_EVENT']
-[GPT]: Total params: 20.78 M
-
-======================================================================
-  pretrain_transformer  |  2026-05-18 18:05:04
-  model config      : {'time2vec_dim': 48, 'embed_dim': 384, 'n_head': 6, 'n_layer': 6, 'dropout': 0.15, 'bias': True, 'ctx_dim': 7}
-  training settings : {'phase1_n_epochs': 1, 'phase2_n_epochs': 1, 'phase3_n_epochs': 1, 'sample': 50, 'lr_warmup_epochs': 5, 'early-stop-patience': 5, 'early-stop-min-delta-rel': 0.001, 'phase1_learning_rate': 0.0003, 'phase2_learning_rate': 0.0003, 'phase3_learning_rate': 0.0001, 'phase3_backbone_lr_factor': 0.1, 'phase3_weight_decay': 0.001, 'weight_decay': 0.001, 'batch_size': 16, 'grad_accumulation_steps': 4, 'phase1_bce_window_hours': 3.0, 'phase2_terminal_bce_window_hours': 168.0, 'phase1_scheduler': {'bce_only_epochs': 3, 'aux_fraction_caps': {'dt': 0.4}, 'order': [['dt']], 'ramp_epochs': {'dt': 0}}, 'phase2_scheduler': {'bce_only_epochs': 4, 'aux_fraction_caps': {'ce': 0.5, 'dt': 0.5, 'ranking': 0.2}, 'order': [['ce', 'dt'], ['ranking']], 'ramp_epochs': {'ce': 0, 'dt': 0, 'ranking': 3}, 'plateau_min_delta': 0.001, 'plateau_patience': [2]}, 'outcome_horizon_hours': 48.0}
-======================================================================
-[Phase-2]: Starting transformer training loop...
-Training:   0%|          | 0/3 [00:00<?, ?it/s]/usr/local/lib/python3.11/dist-packages/torch/utils/checkpoint.py:295: FutureWarning: `torch.cpu.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cpu', args...)` instead.
-  with torch.enable_grad(), device_autocast_ctx, torch.cpu.amp.autocast(**ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
-                                               Validation:   0%|          | 0/8 [00:00<?, ?it/s]                                                 [Phase-2]: Epoch 00
-        --> Train=0.4303 (BCE=0.4303, CE=0.0000, Δt=0.0000, Rank=0.0000)
-        --> Val=0.3995 (BCE=0.3995, CE=0.0000, Δt=0.0000, Rank=0.0000)
-        --> RawTrain ce=1.2879496 dt=0.8086773 ranking=0.6955282
-[Scheduler] epoch=0 | ce:λ=0.0000(pending) | dt:λ=0.0000(pending) | ranking:λ=0.0000(pending)
-[GPT] Outcomes not in tokenizer vocab (ignored): ['ATHEROSCLEROSIS_EVENT', 'DIABETIC_COMA_EVENT', 'NERVOUS_SYSTEM_DISORDER_EVENT', 'OTHER_COMPLICATION_EVENT', 'SKIN_ULCER_EVENT']
-[GPT]: Total params: 20.78 M
-
-======================================================================
-  finetune_transformer  |  2026-05-18 18:05:07
-  model config      : {'time2vec_dim': 48, 'embed_dim': 384, 'n_head': 6, 'n_layer': 6, 'dropout': 0.15, 'bias': True, 'ctx_dim': 7}
-  training settings : {'phase1_n_epochs': 1, 'phase2_n_epochs': 1, 'phase3_n_epochs': 1, 'sample': 50, 'lr_warmup_epochs': 5, 'early-stop-patience': 5, 'early-stop-min-delta-rel': 0.001, 'phase1_learning_rate': 0.0003, 'phase2_learning_rate': 0.0003, 'phase3_learning_rate': 0.0001, 'phase3_backbone_lr_factor': 0.1, 'phase3_weight_decay': 0.001, 'weight_decay': 0.001, 'batch_size': 16, 'grad_accumulation_steps': 4, 'phase1_bce_window_hours': 3.0, 'phase2_terminal_bce_window_hours': 168.0, 'phase1_scheduler': {'bce_only_epochs': 3, 'aux_fraction_caps': {'dt': 0.4}, 'order': [['dt']], 'ramp_epochs': {'dt': 0}}, 'phase2_scheduler': {'bce_only_epochs': 4, 'aux_fraction_caps': {'ce': 0.5, 'dt': 0.5, 'ranking': 0.2}, 'order': [['ce', 'dt'], ['ranking']], 'ramp_epochs': {'ce': 0, 'dt': 0, 'ranking': 3}, 'plateau_min_delta': 0.001, 'plateau_patience': [2]}, 'outcome_horizon_hours': 48.0}
-======================================================================
-[Phase-3]: Fine-tuning outcome head (backbone_lr_factor=0.1)...
-[Phase-3] Train:   0%|          | 0/34 [00:00<?, ?it/s]                                                       [Phase-3] Val:   0%|          | 0/8 [00:00<?, ?it/s]                                                    [Phase-3]: λ_ranking calibrated = 2.236266 (cap=0.2, raw_outcome=7.745977, raw_ranking=0.692760)
-[Phase-3]: Epoch 01  train=7.7460  val=6.0997  raw_out=7.7459771  raw_rank=0.6927598  vl_select=6.099727
-[Phase-3]: Current best model saved.
-[GPT] Outcomes not in tokenizer vocab (ignored): ['ATHEROSCLEROSIS_EVENT', 'DIABETIC_COMA_EVENT', 'NERVOUS_SYSTEM_DISORDER_EVENT', 'OTHER_COMPLICATION_EVENT', 'SKIN_ULCER_EVENT']
-[GPT]: Total params: 20.78 M
-[Eval] Processing full val sequences (ground truth)...
-[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 1807 -> 1501
-[DataProcessor] Applied temporal filter: WHERE ConceptName NOT LIKE '%_PATTERN%' | rows 1501 -> 1422
-[Warning][EMRDataset] Unknown Concept values found (count=1) — mapping to [MASK]:
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-[Warning][EMRDataset] Unknown ValueToken values found (count=4) — mapping to [MASK]:
-  - ALANINE-AMINOTRANSFERASE_MEASURE_TREND_Increasing
-  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-  - INFECTION_WBC_MEASURE_STATE_Extreme Leukocytosis
-[Warning][EMRDataset] Unknown PositionToken values found (count=7) — mapping to [MASK]:
-  - ALANINE-AMINOTRANSFERASE_MEASURE_TREND_Increasing_START
-  - ALANINE-AMINOTRANSFERASE_MEASURE_TREND_Increasing_END
-  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia_START
-  - BODY_TEMPERATURE_MEASURE_STATE_Severe Hypothermia_END
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-  - INFECTION_WBC_MEASURE_STATE_Extreme Leukocytosis_START
-  - INFECTION_WBC_MEASURE_STATE_Extreme Leukocytosis_END
-[Eval] Processing truncated val sequences (2-day input)...
-[DataProcessor] Applied temporal filter: WHERE Value NOT LIKE '%Steady%' | rows 1807 -> 1501
-[DataProcessor] Applied temporal filter: WHERE ConceptName NOT LIKE '%_PATTERN%' | rows 1501 -> 1422
-[Warning][EMRDataset] Unknown Concept values found (count=1) — mapping to [MASK]:
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-[Warning][EMRDataset] Unknown ValueToken values found (count=2) — mapping to [MASK]:
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-  - INFECTION_WBC_MEASURE_STATE_Extreme Leukocytosis
-[Warning][EMRDataset] Unknown PositionToken values found (count=2) — mapping to [MASK]:
-  - NERVOUS_SYSTEM_DISORDER_EVENT
-  - INFECTION_WBC_MEASURE_STATE_Extreme Leukocytosis_START
-[Eval] Generating risk curves...
-Generating:   0%|          | 0/1 [00:00<?, ?it/s]Generating: 100%|██████████| 1/1 [00:00<00:00,  3.14it/s]                                                         [generate] INFO  8/8 (100.0%) patient(s) reached max_len=500 without a natural terminal — forced terminal injected.
-[Eval] Generated 1279 rows for 8 patients.
-[Eval] Computing episode-level AUC and time accuracy...
-[Eval] Per-outcome AUROC:
----
-outcome_auroc:    nan
-outcome_auprc:    nan
-onset_mae_hrs:    186.33
-phase2_best_val:  0.399480
-phase2_epochs:    1
-phase3_best_val:  6.099727
-phase3_epochs:    1
-total_seconds:    33.7
-peak_vram_mb:     860.3
-embed_dim:        384
-n_layer:          6
-n_head:           6
-num_params:       20,777,320
