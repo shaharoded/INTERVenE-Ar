@@ -685,11 +685,11 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
                               training_settings=training_settings)
                 print("[Phase-1]: Early stopping triggered.")
                 break
-        else:
-            # If warmup isn't complete - do nothing.
-            continue
+        # else: warmup not complete — no best update, no early-stop counter,
+        # but still fall through to save ckpt_last so a short run / interrupted
+        # training leaves a usable checkpoint on disk.
 
-        # Save last checkpoint (after bad_epochs is updated)
+        # Save last checkpoint at end of every epoch regardless of warmup state.
         embedder.save(epoch, best_val, optimizer, scheduler, ckpt_last,
                       lambda_schedule_state=schedule_controller.state_dict(), bad_epochs=bad_epochs,
                       training_settings=training_settings)

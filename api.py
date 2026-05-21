@@ -282,7 +282,20 @@ if EVAL_ONLY:
     # the training summary the parent process wrote, and jump straight to the
     # final-evaluation block. No training memory ever loaded into this process.
     print("[Eval-only] Loading deployed checkpoints from disk...")
-    embedder, *_ = EMREmbedding.load(str(Path(EMBEDDER_CHECKPOINT)), tokenizer=tokenizer)
+    # Phase 1 may have saved ckpt_best.pt OR only ckpt_last.pt depending on
+    # whether validation improved past the embedder's warmup gate. Fall back
+    # to ckpt_last when ckpt_best is absent (matches the Phase-2/3 fallback
+    # logic further down).
+    _p1_best = Path(EMBEDDER_CHECKPOINT)
+    _p1_last = _p1_best.parent / "ckpt_last.pt"
+    _p1_path = _p1_best if _p1_best.exists() else _p1_last
+    if not _p1_path.exists():
+        raise FileNotFoundError(
+            f"[Eval-only] No Phase-1 checkpoint found (looked at {_p1_best} and {_p1_last}). "
+            "Run training first."
+        )
+    print(f"[Eval-only] Phase-1 embedder: {_p1_path.name}")
+    embedder, *_ = EMREmbedding.load(str(_p1_path), tokenizer=tokenizer)
     train_summary = {}
     if os.path.exists(TRAIN_SUMMARY_PATH):
         with open(TRAIN_SUMMARY_PATH, "r") as f:
