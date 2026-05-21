@@ -96,6 +96,72 @@ by class imbalance the way the 0.91 AUROC headline can.
 
 ---
 
+## 1b. Honest horizon-extended evaluation
+
+The Section 1 numbers above are produced by `evaluation.py::pooled_episode_auc`
+in its original form, which builds windows only over each patient's *generated*
+trajectory. Because the deployed model terminates very early (median 3
+generated tokens, ~1 hour after the 2-day seed, 100 % of patients reach a
+terminal event), each patient contributes ~1 window per outcome and ground-
+truth episodes that occur after the truncated generation never enter the
+metric. The reported AUC effectively measures **"given 2 days of admission
+history, does the outcome happen in the next 48 h?"** rather than the
+multi-day trajectory prediction the autoregressive framing implies.
+
+To probe this, `pooled_episode_auc` was extended to build a window grid for
+every patient from the seed end up to their **true horizon** (the patient's
+last untruncated event time, capped at 14 days = `max_duration_hours`).
+Windows past where the model terminated receive **score = 0**, i.e. "the
+model is silent → it predicts no event here". A ground-truth event in such a
+window becomes a positive label scored at zero — the model is now penalised
+for failing to predict it.
+
+| Outcome  | AUROC | AUPRC | Window prevalence | Random AUPRC | Lift |
+|----------|-------|-------|-------------------|--------------|------|
+| HYPERGLY | 0.547 | 0.389 | 24.68 %           | 0.247        | 1.58× |
+| HYPOGLY  | 0.539 | 0.160 |  4.41 %           | 0.044        | 3.62× |
+| KIDNEY   | 0.506 | 0.286 | 19.25 %           | 0.193        | 1.49× |
+| DEATH    | 0.479 | 0.071 |  2.86 %           | 0.029        | 2.49× |
+| RELEASE  | 0.460 | 0.258 | 23.71 %           | 0.237        | 1.09× |
+| CARDIO   | 0.449 | 0.144 | 10.09 %           | 0.101        | 1.42× |
+| **Mean (6 outcomes)** | **0.497** | **0.218** | **14.17 %** | **0.142** | **~1.54×** |
+
+Aggregated across all 13 outcomes that pass the `min_positives ≥ 3` filter
+(seven additional rare ones that didn't have enough positives in the
+truncated eval now do): **mean AUROC 0.452, mean AUPRC 0.107**.
+
+Patient-horizon distribution: median 152 h (~6.3 days), mean 166 h, p90 285 h,
+max 336 h (the cap). Total ~62,800 (patient, window) pairs per outcome — ~6×
+the truncated eval's window count, with the extra mass coming from
+post-termination windows that the model never scored.
+
+**Interpretation.** Under the truncated eval the model looks like a strong
+multi-day trajectory predictor (mean AUROC 0.918). Under the horizon-extended
+eval that posture collapses: AUROC drops to ~0.5 and AUPRC stays close to the
+prevalence baseline (mean lift ~1.5×). The two evals measure different
+quantities:
+
+- **Truncated eval (Section 1)**: a 2-day-seeded next-48 h event-window
+  classifier. This is what the Phase-3 outcome head was directly trained to
+  do and the model excels at it. Reportable in a paper, but the framing must
+  match: "given two days of admission history, the model predicts whether
+  each complication will occur in the next 48 h with AUROC 0.918 and AUPRC
+  0.630 (~9.8× lift over prevalence)".
+- **Horizon-extended eval (this section)**: an honest test of multi-day
+  autoregressive trajectory prediction. The model does *not* have this
+  capability — generations terminate within ~1 hour, so any outcome later
+  than that goes unmodelled. The chance-level AUROC is the direct
+  consequence.
+
+Both views are kept in the report because they describe the model honestly.
+The deployed checkpoints are usable as a near-term risk scorer; they are not
+a long-horizon clinical-course simulator. The raw per-outcome table for this
+horizon-extended pass is persisted at
+`results/per_outcome_82954e4_full.tsv` (the file the current run produced,
+overwriting the earlier per-outcome dump under the same commit hash).
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique

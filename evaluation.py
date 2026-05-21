@@ -52,6 +52,7 @@ EVAL_GRACE_HOURS  = 24.0  # tolerance added to each window edge for positive lab
 EVAL_MAX_LEN      = 500   # max generated steps per patient
 EVAL_TEMPERATURE  = 1.0   # sampling temperature (no top-k filtering)
 EVAL_MIN_POSITIVES = 3    # skip an outcome if fewer than this many positive windows exist
+EVAL_FULL_HORIZON_HOURS = 336.0  # cap per-patient eval horizon at 14 days (matches training/inference)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +85,27 @@ def extract_ground_truth(eval_ds, outcome_names):
                     patient_gt[tok] = t
         gt[pid] = patient_gt
     return gt
+
+
+def extract_patient_horizons(eval_ds, full_horizon_hours=EVAL_FULL_HORIZON_HOURS):
+    """
+    Purpose: Per-patient evaluation horizon = min(last event timepoint, full_horizon_hours).
+    Method: Read the maximum TimePoint from each patient's untruncated sequence; cap at
+            the training trajectory horizon so we never evaluate past in-distribution time.
+
+    Args:
+        eval_ds (EMRDataset): Full (untruncated) dataset — same one used for ground-truth.
+        full_horizon_hours (float): Hard cap (default 336 h = 14 days, matches inference).
+
+    Returns:
+        dict: {patient_id: horizon_hours}
+    """
+    out = {}
+    for pid in eval_ds.patient_ids:
+        df = eval_ds.patient_groups[pid]
+        last_t = float(df["TimePoint"].max()) if len(df) else 0.0
+        out[pid] = min(last_t, full_horizon_hours)
+    return out
 
 
 def extract_ground_truth_episodes(eval_ds, outcome_names):
@@ -119,16 +141,19 @@ def extract_ground_truth_episodes(eval_ds, outcome_names):
 def pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
                         window_hours=EVAL_WINDOW_HOURS,
                         grace_hours=EVAL_GRACE_HOURS,
-                        min_positives=EVAL_MIN_POSITIVES):
+                        min_positives=EVAL_MIN_POSITIVES,
+                        patient_horizons=None):
     """
-    Purpose: Compute episode-level AUROC and AUPRC pooled across all patients and time windows.
-    Method: Divides each generated trajectory into non-overlapping windows; labels each window
-            by whether any ground-truth episode falls within ±grace_hours; pools all pairs.
-
-    For each (patient, window) pair:
-      score = max P_<outcome> within the window
-      label = 1 if any ground-truth episode of that outcome falls in
-              [win_start - grace_hours, win_end + grace_hours]
+    Purpose: Compute episode-level AUROC and AUPRC pooled across all (patient, window) pairs.
+    Method: Build a per-patient window grid from the global earliest generated step time
+            (t_start) to each patient's evaluation horizon. For each window:
+              score = max P_<outcome> over generated tokens that fall inside the window
+                      (0.0 when the model produced no tokens in that window — i.e. the
+                      autoregressive trajectory had already terminated by then).
+              label = 1 if any ground-truth episode of that outcome falls in
+                      [win_start - grace_hours, win_end + grace_hours].
+            This penalises the model for failing to predict outcomes that occur after it
+            stopped generating: those windows become positive labels scored at zero.
 
     Args:
         risk_df (pd.DataFrame): Output of generate() with collect_risk_scores=True.
@@ -137,25 +162,59 @@ def pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
         window_hours (float): Duration of each evaluation window in hours.
         grace_hours (float): Extra tolerance added to each window edge for positive labelling.
         min_positives (int): Skip outcome if fewer than this many positive windows exist.
+        patient_horizons (dict, optional): {pid: horizon_hours} from extract_patient_horizons.
+            When provided, every patient is evaluated to its real horizon (capped at
+            EVAL_FULL_HORIZON_HOURS) regardless of where generation stopped. When None,
+            falls back to the patient's last generated step time (legacy behaviour).
 
     Returns:
         pd.DataFrame: Indexed by outcome, columns: auroc, auprc, n_pos_windows, n_neg_windows.
     """
+    import math
+
     gen_df = risk_df[risk_df["IsInput"] == 0].copy()
     p_cols = [f"P_{n}" for n in outcome_names]
+    if len(gen_df) == 0:
+        return pd.DataFrame()
 
-    t_min = gen_df["TimePoint"].min()
-    gen_df["_win"] = np.floor((gen_df["TimePoint"] - t_min) / window_hours).astype(int)
+    t_start = float(gen_df["TimePoint"].min())
 
-    # Max risk per (patient, window) — vectorised
-    peak = (gen_df
-            .groupby(["PatientId", "_win"])[p_cols]
-            .max()
-            .reset_index())
-    peak["_t_start"] = t_min + peak["_win"] * window_hours
-    peak["_t_end"]   = peak["_t_start"] + window_hours
+    # Per-patient horizon: caller-supplied or fall back to last generated step.
+    if patient_horizons is None:
+        patient_horizons = {pid: float(sub["TimePoint"].max())
+                            for pid, sub in gen_df.groupby("PatientId")}
 
+    # Group generated rows by patient once.
+    gen_by_pid = {pid: sub for pid, sub in gen_df.groupby("PatientId")}
+
+    # Build the window grid for every patient up to their horizon.
     rows = []
+    for pid, horizon in patient_horizons.items():
+        if horizon <= t_start:
+            continue
+        n_windows = max(1, int(math.ceil((horizon - t_start) / window_hours)))
+        pat_gen = gen_by_pid.get(pid)
+        for k in range(n_windows):
+            ws = t_start + k * window_hours
+            we = ws + window_hours
+            row = {"PatientId": pid, "_t_start": ws, "_t_end": we}
+            if pat_gen is not None:
+                in_win = pat_gen[(pat_gen["TimePoint"] >= ws) & (pat_gen["TimePoint"] < we)]
+                if len(in_win) > 0:
+                    for pcol in p_cols:
+                        row[pcol] = float(in_win[pcol].max())
+                else:
+                    for pcol in p_cols:
+                        row[pcol] = 0.0
+            else:
+                for pcol in p_cols:
+                    row[pcol] = 0.0
+            rows.append(row)
+
+    peak = pd.DataFrame(rows)
+
+    # Score / label loop (identical to before, just over the extended window grid).
+    result_rows = []
     for name in outcome_names:
         pcol   = f"P_{name}"
         scores, labels = [], []
@@ -174,11 +233,11 @@ def pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
         n_neg  = int((1 - labels).sum())
 
         if n_pos < min_positives:
-            rows.append({"outcome": name, "auroc": np.nan, "auprc": np.nan,
-                         "n_pos_windows": n_pos, "n_neg_windows": n_neg})
+            result_rows.append({"outcome": name, "auroc": np.nan, "auprc": np.nan,
+                                "n_pos_windows": n_pos, "n_neg_windows": n_neg})
             continue
 
-        rows.append({
+        result_rows.append({
             "outcome":       name,
             "auroc":         roc_auc_score(labels, scores),
             "auprc":         average_precision_score(labels, scores),
@@ -186,7 +245,7 @@ def pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
             "n_neg_windows": n_neg,
         })
 
-    return pd.DataFrame(rows).set_index("outcome").sort_values("auroc", ascending=False)
+    return pd.DataFrame(result_rows).set_index("outcome").sort_values("auroc", ascending=False)
 
 
 def time_accuracy(risk_df, gt_labels, outcome_names):
@@ -293,13 +352,19 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
 
     outcome_names = model.outcome_names
 
-    # -- Extract ground truth --
-    gt_first    = extract_ground_truth(eval_ds_full, outcome_names)
-    gt_episodes = extract_ground_truth_episodes(eval_ds_full, outcome_names)
+    # -- Extract ground truth + per-patient evaluation horizons --
+    gt_first         = extract_ground_truth(eval_ds_full, outcome_names)
+    gt_episodes      = extract_ground_truth_episodes(eval_ds_full, outcome_names)
+    patient_horizons = extract_patient_horizons(eval_ds_full)
+    horizons_arr     = np.array(list(patient_horizons.values()), dtype=float)
+    print(f"[Eval] Patient horizons (h): median={np.median(horizons_arr):.1f}, "
+          f"mean={horizons_arr.mean():.1f}, p90={np.percentile(horizons_arr, 90):.1f}, "
+          f"max={horizons_arr.max():.1f}")
 
     # -- Compute metrics --
     print("[Eval] Computing episode-level AUC and time accuracy...")
-    auc_table = pooled_episode_auc(risk_df, gt_episodes, outcome_names)
+    auc_table = pooled_episode_auc(risk_df, gt_episodes, outcome_names,
+                                    patient_horizons=patient_horizons)
     mae_table = time_accuracy(risk_df, gt_first, outcome_names)
 
     mean_auroc     = float(auc_table["auroc"].mean(skipna=True))
