@@ -9,7 +9,6 @@ wheels/
 # Virtual environments
 .venv
 worktrees/
-results/
 queue/
 
 # Agent prompt files (generated per-session by launchers)
@@ -24,6 +23,12 @@ results.tsv
 *.log
 progress.png
 .claude/
+
+# Final-results folder is committed (the published artefact). Add an explicit
+# negation so the standalone `results.tsv` rule above does not exclude the
+# named files under results/.
+!results/
+!results/*.tsv
 
 # Model checkpoints (large, rebuilt each experiment)
 emr_model/checkpoints/
