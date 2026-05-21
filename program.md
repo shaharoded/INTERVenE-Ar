@@ -133,15 +133,17 @@ MAE — both per-terminal (`mae_release_hrs`, `mae_death_hrs`) and aggregated
 that ranks outcomes well but emits them at wildly wrong times is not a
 publishable result.
 
-The agent must add generation-instrumentation columns to `inference.py::generate`
-as a returned `gen_stats` dict (median/mean/p90 steps and hours, fraction
-terminating in first 24 h, length-MAE vs per-patient horizon), and surface
-them in the `api.py` summary block alongside the existing `outcome_*` lines.
-
-The agent must add generation-instrumentation columns (median steps, median
-hours, fraction terminating early, length MAE) to `inference.py::generate` as
-a return-value side-channel (`gen_stats` dict), and surface them in the
-`api.py` summary block alongside the existing `outcome_*` lines.
+Generation instrumentation is **already wired** end-to-end:
+`evaluation.py::compute_gen_stats` derives all the `gen_*` numbers from the
+`risk_df` returned by `inference.generate`, `evaluate_on_test_set` returns
+them in its result dict, and `api.py` prints them in the summary block as
+`gen_median_steps:`, `gen_median_hours:`, `gen_frac_terminal_first24h:`,
+`gen_length_mae_hrs:` lines. The agent only needs to **read those lines from
+`run.log`** and log them to `results/results-trajectory-fix.tsv` — no
+plumbing work to do. If the agent rewrites `inference.py::generate` (e.g.
+to add beam search), the contract is unchanged: the returned `risk_df` must
+still have `PatientId`, `TimePoint`, `IsInput`, `IsTerminal` and the
+`P_<outcome>` columns. `compute_gen_stats` reads those.
 
 ---
 

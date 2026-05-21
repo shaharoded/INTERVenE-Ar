@@ -384,6 +384,21 @@ print("---")
 print(f"outcome_auroc:    {eval_results['mean_auroc']:.6f}")
 print(f"outcome_auprc:    {eval_results['mean_auprc']:.6f}")
 print(f"onset_mae_hrs:    {eval_results['mean_mae_hours']:.2f}")
+
+# Generation-quality stats (trajectory-collapse failure-mode diagnostic).
+# Computed in evaluation.py::compute_gen_stats from the risk_df returned by
+# inference.generate. The agent must report these for every full eval in the
+# autoresearch-trajectory branch — no instrumentation work required, they are
+# emitted here automatically.
+_gen = eval_results.get("gen_stats", {}) or {}
+print(f"gen_median_steps:           {_gen.get('gen_median_steps', float('nan'))}")
+print(f"gen_median_hours:           {_gen.get('gen_median_hours', float('nan'))}")
+print(f"gen_p90_hours:              {_gen.get('gen_p90_hours', float('nan'))}")
+print(f"gen_max_hours:              {_gen.get('gen_max_hours', float('nan'))}")
+print(f"gen_n_with_terminal:        {_gen.get('gen_n_with_terminal', 0)}")
+print(f"gen_frac_terminal_first24h: {_gen.get('gen_frac_terminal_first24h', float('nan'))}")
+print(f"gen_length_mae_hrs:         {_gen.get('gen_length_mae_hrs', float('nan'))}")
+
 print(f"phase2_best_val:  {phase2_best:.6f}")
 print(f"phase2_epochs:    {phase2_epochs}")
 print(f"phase3_best_val:  {phase3_best:.6f}")

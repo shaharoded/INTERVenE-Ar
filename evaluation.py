@@ -87,6 +87,71 @@ def extract_ground_truth(eval_ds, outcome_names):
     return gt
 
 
+def compute_gen_stats(risk_df, patient_horizons=None):
+    """
+    Purpose: Honest diagnostics for the trajectory-collapse failure mode.
+    Method:  Compute per-patient stats from the generated rows only (IsInput==0).
+             When patient_horizons is provided, also compute the length-MAE between
+             generated trajectory span and per-patient ground-truth horizon.
+
+    Args:
+        risk_df (pd.DataFrame): Output of generate() with collect_risk_scores=True.
+        patient_horizons (dict, optional): {pid: horizon_hours} from extract_patient_horizons.
+
+    Returns:
+        dict: gen_median_steps, gen_mean_steps, gen_p90_steps, gen_max_steps,
+              gen_median_hours, gen_mean_hours, gen_p90_hours, gen_max_hours,
+              gen_frac_terminal_first24h, gen_n_with_terminal, gen_length_mae_hrs.
+    """
+    stats = {"gen_n_patients": int(risk_df["PatientId"].nunique())}
+
+    gen_df = risk_df[risk_df["IsInput"] == 0]
+    if len(gen_df) == 0:
+        return stats
+
+    per_pat_steps = gen_df.groupby("PatientId").size()
+    span          = (gen_df.groupby("PatientId")["TimePoint"].max()
+                     - gen_df.groupby("PatientId")["TimePoint"].min())
+    seed_end      = gen_df.groupby("PatientId")["TimePoint"].min()
+
+    # First-terminal time per patient (only patients that emitted one).
+    term_df = gen_df[gen_df["IsTerminal"] == 1]
+    if len(term_df):
+        term       = term_df.groupby("PatientId")["TimePoint"].min()
+        within24   = (term - seed_end.loc[term.index]).lt(24.0)
+        n_terminal = int(len(term))
+        frac_early = float(within24.mean())
+    else:
+        n_terminal = 0
+        frac_early = 0.0
+
+    stats.update({
+        "gen_median_steps":          float(per_pat_steps.median()),
+        "gen_mean_steps":            float(per_pat_steps.mean()),
+        "gen_p90_steps":             float(per_pat_steps.quantile(0.9)),
+        "gen_max_steps":             int(per_pat_steps.max()),
+        "gen_median_hours":          float(span.median()),
+        "gen_mean_hours":            float(span.mean()),
+        "gen_p90_hours":             float(span.quantile(0.9)),
+        "gen_max_hours":             float(span.max()),
+        "gen_n_with_terminal":       n_terminal,
+        "gen_frac_terminal_first24h": frac_early,
+    })
+
+    # Length-MAE vs GT horizon: per patient, |generated_span - gt_horizon_from_seed_end|.
+    if patient_horizons:
+        diffs = []
+        for pid, s in span.items():
+            if pid not in patient_horizons:
+                continue
+            gt_span = max(0.0, patient_horizons[pid] - seed_end.loc[pid])
+            diffs.append(abs(float(s) - gt_span))
+        if diffs:
+            stats["gen_length_mae_hrs"] = float(np.mean(diffs))
+
+    return stats
+
+
 def extract_patient_horizons(eval_ds, full_horizon_hours=EVAL_FULL_HORIZON_HOURS):
     """
     Purpose: Per-patient evaluation horizon = min(last event timepoint, full_horizon_hours).
@@ -366,6 +431,7 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
     auc_table = pooled_episode_auc(risk_df, gt_episodes, outcome_names,
                                     patient_horizons=patient_horizons)
     mae_table = time_accuracy(risk_df, gt_first, outcome_names)
+    gen_stats = compute_gen_stats(risk_df, patient_horizons=patient_horizons)
 
     mean_auroc     = float(auc_table["auroc"].mean(skipna=True))
     mean_auprc     = float(auc_table["auprc"].mean(skipna=True))
@@ -376,6 +442,10 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
     for outcome, row in auc_table.iterrows():
         if not np.isnan(row["auroc"]):
             print(f"  {outcome:<45} AUROC={row['auroc']:.3f}  AUPRC={row['auprc']:.3f}")
+    print(f"[Eval] Generation stats: median_steps={gen_stats.get('gen_median_steps', '-')}, "
+          f"median_hours={gen_stats.get('gen_median_hours', '-')}, "
+          f"frac_terminal_first24h={gen_stats.get('gen_frac_terminal_first24h', '-')}, "
+          f"length_mae_hrs={gen_stats.get('gen_length_mae_hrs', '-')}")
 
     return dict(
         mean_auroc=mean_auroc,
@@ -383,4 +453,5 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
         mean_mae_hours=mean_mae_hours,
         auc_table=auc_table,
         mae_table=mae_table,
+        gen_stats=gen_stats,
     )
