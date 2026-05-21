@@ -684,7 +684,10 @@ class GPT(nn.Module):
 
 
     @classmethod
-    def load(cls, path, embedder, map_location="cpu"):
+    def load(cls, path, embedder, map_location=None):
+        import torch as _t
+        if map_location is None:
+            map_location = _t.device("cuda" if _t.cuda.is_available() else "cpu")
         ckpt = torch.load(path, map_location=map_location, weights_only=True)
 
         if "config" not in ckpt:

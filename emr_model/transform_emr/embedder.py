@@ -367,14 +367,15 @@ class EMREmbedding(nn.Module):
         torch.save(ckpt, path)
     
     @classmethod
-    def load(cls, path, tokenizer, map_location="cpu"):
+    def load(cls, path, tokenizer, map_location=None):
         """
         Load EMREmbedding from a checkpoint.
 
         Args:
             path (str or Path): Path to checkpoint file.
             tokenizer (EMRTokenizer): Tokenizer to verify against saved model config.
-            map_location (str): Device map for torch.load (default: 'cpu').
+            map_location: Device map for torch.load.  Defaults to CUDA when available,
+                          CPU otherwise.  Training paths pass map_location=device explicitly.
 
         Returns:
             model: Loaded EMREmbedding instance
@@ -383,6 +384,9 @@ class EMREmbedding(nn.Module):
             optimizer_state (dict): State dict for optimizer
             scheduler_state (dict): State dict for LR scheduler
         """
+        import torch as _t
+        if map_location is None:
+            map_location = _t.device("cuda" if _t.cuda.is_available() else "cpu")
         ckpt = torch.load(path, map_location=map_location, weights_only=True)
         config = ckpt.get("config")
         if config is None:
@@ -411,6 +415,7 @@ class EMREmbedding(nn.Module):
         if unexpected:
             raise RuntimeError(f"[EMREmbedding.load] Unexpected keys: {sorted(unexpected)}")
         model.load_state_dict(state, strict=False)
+        model.to(map_location)   # move to target device after state dict load
 
         # Helpful metadata for callers that want to fully restore prior training settings.
         model.checkpoint_model_config = copy.deepcopy(config)
