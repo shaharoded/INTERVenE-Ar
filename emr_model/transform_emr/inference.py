@@ -129,19 +129,19 @@ def _sample_tokens(next_logits, temperature, top_k):
 # ─────────────────────────────────────────────────────────────────────────── #
 
 @torch.no_grad()
-def generate(model,
-             dataset,
-             max_duration_hours=336.0,
-             max_len=2000,
-             temperature=1.0,
-             top_k=None,
-             rep_decay=0.6,
-             batch_size=16,
-             collect_risk_scores=False,
-             tqdm_position=0,
-             tqdm_desc='Generating',
-             temperature_start=3.0,
-             temperature_anneal_steps=10):
+def _generate_single_pass(model,
+                          dataset,
+                          max_duration_hours=336.0,
+                          max_len=2000,
+                          temperature=1.0,
+                          top_k=None,
+                          rep_decay=0.6,
+                          batch_size=16,
+                          collect_risk_scores=False,
+                          tqdm_position=0,
+                          tqdm_desc='Generating',
+                          temperature_start=3.0,
+                          temperature_anneal_steps=10):
     """
     Unified autoregressive generation for all patients in *dataset*.
 
@@ -454,6 +454,89 @@ def generate(model,
               f"max_len={max_len} without a natural terminal — forced terminal injected.")
 
     return pd.DataFrame(rows)
+
+
+@torch.no_grad()
+def generate(model,
+             dataset,
+             max_duration_hours=336.0,
+             max_len=2000,
+             temperature=1.0,
+             top_k=None,
+             rep_decay=0.6,
+             batch_size=16,
+             collect_risk_scores=False,
+             tqdm_position=0,
+             tqdm_desc='Generating',
+             temperature_start=3.0,
+             temperature_anneal_steps=10,
+             num_beams=4,
+             beam_alpha=0.6):
+    """
+    F1: Multi-beam reranking wrapper around _generate_single_pass.
+
+    When num_beams > 1, runs _generate_single_pass `num_beams` times under the
+    same stochastic temperature schedule (F2). For each patient, selects the
+    trajectory with the most generated steps — the longest beam.
+
+    Hypothesis (F1): the single-trajectory sampler is a bottleneck for generation
+    length even after the F2 temperature schedule. Running multiple independent
+    samples and keeping the longest will extend gen_median_hours and further
+    improve AUROC. If the longest beam over N runs is no longer than a single run,
+    the model's conditional distribution (not the sampler) is the binding constraint.
+
+    Length-normalised beam scoring (for reference in the journal, not used for
+    selection): score_i = sum(log P(t_k)) / n_i^beam_alpha, with beam_alpha=0.6.
+    Given the collapse, per-step log-probs strongly favour the terminal token,
+    making length-normalised log-prob a poor criterion for this failure mode.
+    We therefore select by raw generated-token count (longest beam wins).
+    """
+    if num_beams <= 1:
+        return _generate_single_pass(
+            model=model, dataset=dataset,
+            max_duration_hours=max_duration_hours, max_len=max_len,
+            temperature=temperature, top_k=top_k, rep_decay=rep_decay,
+            batch_size=batch_size, collect_risk_scores=collect_risk_scores,
+            tqdm_position=tqdm_position, tqdm_desc=tqdm_desc,
+            temperature_start=temperature_start,
+            temperature_anneal_steps=temperature_anneal_steps,
+        )
+
+    # ── Multi-beam: run num_beams passes, pick longest trajectory per patient ──
+    beam_dfs = []
+    for b in range(num_beams):
+        bdf = _generate_single_pass(
+            model=model, dataset=dataset,
+            max_duration_hours=max_duration_hours, max_len=max_len,
+            temperature=temperature, top_k=top_k, rep_decay=rep_decay,
+            batch_size=batch_size, collect_risk_scores=collect_risk_scores,
+            tqdm_position=tqdm_position,
+            tqdm_desc=f'{tqdm_desc} beam {b + 1}/{num_beams}',
+            temperature_start=temperature_start,
+            temperature_anneal_steps=temperature_anneal_steps,
+        )
+        beam_dfs.append(bdf)
+
+    all_pids = dataset.patient_ids
+    best_rows = []
+    gen_lengths = [0] * num_beams  # total generated steps per beam (for reporting)
+
+    for b, bdf in enumerate(beam_dfs):
+        gen = bdf[bdf["IsInput"] == 0]
+        gen_lengths[b] = int(len(gen))
+
+    for pid in all_pids:
+        best_b, best_n = 0, -1
+        for b, bdf in enumerate(beam_dfs):
+            pat_gen = bdf[(bdf["PatientId"] == pid) & (bdf["IsInput"] == 0)]
+            n = len(pat_gen)
+            if n > best_n:
+                best_n, best_b = n, b
+        best_rows.append(beam_dfs[best_b][beam_dfs[best_b]["PatientId"] == pid])
+
+    print(f"[generate] F1 beam stats: per-beam total gen steps = {gen_lengths}  "
+          f"(picked longest per patient; best beam gen steps chosen from {num_beams} runs)")
+    return pd.concat(best_rows, ignore_index=True)
 
 
 if __name__ == "__main__":
