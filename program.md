@@ -138,21 +138,41 @@ training cost.
 
 ## Process
 
+Two commits per experiment: **code commit** first, then **journal commit**
+(results + status). On DISCARD the code commit is reverted, but the journal
+commit stays — so every experiment, including failed ones, leaves a visible
+trail in `results/results-trajectory-fix.tsv` and `status.md`.
+
 1. **Re-read this file** at iteration start.
-2. **Check state**: `git status`, `git log --oneline -5`, last few rows of
+2. **Check state**: `git status`, `git log --oneline -8`, last few rows of
    `results/results-trajectory-fix.tsv`.
 3. **Diagnose**: run `diagnose.py` + read recent `gen_*` lines from the last
    `run.log` to confirm the failure mode being targeted is actually present.
 4. **One change per experiment, with a falsifiable hypothesis.**
 5. **Smoke test** (`sample=50, phase{1,2,3}_n_epochs=1`) — confirm the
    summary block prints sensibly including `gen_*` lines.
-6. **Commit** with a 3-part message: change / diagnostic / expectation.
-7. **Full run**: `python api.py > run.log 2>&1` (or just the eval-only path
-   when the experiment is inference-side — see "Checkpoints" below).
-8. **Log** the row to `results/results-trajectory-fix.tsv`.
-9. **KEEP / DISCARD** (rules below). On DISCARD, `git reset --hard
-   <last_keep_commit>`.
-10. **Update `status.md`**.
+6. **Code commit.** Stage the code files (not status / results) and commit
+   with a 3-part message: change / diagnostic / expectation. Tag the
+   commit hash — call it `<CODE_SHA>`. Push.
+7. **Full run**: `python api.py > run.log 2>&1` (or `--eval-only` when the
+   experiment is inference-side — see "Checkpoints").
+8. **Write the journal entry.** Append one row to
+   `results/results-trajectory-fix.tsv` with the headline metrics and a
+   verdict column (KEEP / DISCARD / CRASH / OOM). Update `status.md` with a
+   block for the experiment, ending in `Verdict: <KEEP|DISCARD> — <reason>`.
+9. **Journal commit.** Stage *only* `status.md` and `results/` and commit
+   with a message like `journal: <experiment-tag> <VERDICT> — <one-line
+   summary>`. Push.
+10. **KEEP vs DISCARD** (rules below).
+    - On **KEEP**: nothing more to do, the new code + journal stay at HEAD,
+      next experiment starts from here.
+    - On **DISCARD**: `git revert --no-edit <CODE_SHA>` to undo the code
+      change. This creates a *third* commit on top that reverts the code
+      diff but leaves the journal intact. Push. Next experiment starts
+      from this reverted state, with the failed-experiment row still
+      visible in `results.tsv` and `status.md`.
+11. **Never** use `git reset --hard` to handle a DISCARD — that destroys
+    the journal entry the user reads.
 
 ### KEEP / DISCARD
 
@@ -168,7 +188,8 @@ training cost.
   median patient horizon).
 - `gen_frac_terminal_first24h` strictly below previous best (or already < 0.10).
 
-Otherwise **DISCARD** → `git reset --hard <last_keep_commit>`.
+Otherwise **DISCARD** → see step 10 above (revert the code commit, keep
+the journal commit).
 
 ---
 
