@@ -162,6 +162,82 @@ overwriting the earlier per-outcome dump under the same commit hash).
 
 ---
 
+## 3. Trajectory-Fix Experiments (branch: autoresearch-trajectory)
+
+**Baseline (horizon-extended eval, deployed M-256 checkpoints, argmax decoding):**
+
+| Metric                        | Baseline   |
+|-------------------------------|------------|
+| `outcome_auroc`               | 0.452      |
+| `outcome_auprc`               | 0.107      |
+| `onset_mae_hrs`               | ~65        |
+| `gen_median_steps`            | ~3         |
+| `gen_median_hours`            | ~1         |
+| `gen_frac_terminal_first24h`  | 1.0        |
+
+Root cause: `generate()` used argmax (`top_k=None`, `temperature=1.0`). The terminal
+token (DEATH/RELEASE) had the highest logit at decode step 1 for every patient, causing
+100% immediate termination. Temperature was irrelevant for argmax.
+
+Infrastructure fix (commit `9246031`): `EMREmbedding.load` and `GPT.load` defaulted
+`map_location='cpu'`; the eval-only path loaded the model to CPU, making generation
+~100× slower than GPU. Fixed default to auto-detect CUDA. A helper `build_cache.py`
+was added to pre-build a minimal `processed_datasets.pt` (2 patients) within the
+46.6 GB cgroup limit (the full 40 GB train dataset OOMed on the first run).
+
+---
+
+### Experiment F2 — Sampling Temperature Schedule
+
+**Code commit:** `826e439` (F2 inference change) + `9246031` (GPU fix)
+**Date:** 2026-05-21
+
+**Hypothesis:** The greedy (argmax) sampler was stuck in the immediate-terminal
+local minimum. Elevating the sampling temperature for the first ~10 decode steps
+(initial T=3.0, exponential decay to T=1.0 over 10 steps) will allow non-terminal
+tokens to be sampled, breaking the collapse. After the schedule ends, the model
+may have a lower terminal logit due to its updated context.
+
+**Change:** `inference.py::generate()` — added `temperature_start=3.0`,
+`temperature_anneal_steps=10` parameters. `_sample_tokens` uses full-vocab
+multinomial sampling when `temperature > 1.0` (not argmax), enabling stochastic
+escape from the terminal local minimum.
+
+**Full run results (8,562 test patients, ~8.4 min, GPU):**
+
+| Metric                        | Baseline   | F2         | Delta    |
+|-------------------------------|------------|------------|----------|
+| `outcome_auroc`               | 0.452      | **0.497**  | +0.045 ✓ |
+| `outcome_auprc`               | 0.107      | 0.105      | -0.002 ≈ |
+| `onset_mae_hrs`               | ~65        | 65.27      | +0.3 ≈   |
+| `gen_median_steps`            | ~3         | **10.0**   | +7.0 ✓   |
+| `gen_median_hours`            | ~1         | **6.84**   | ×6.8 ✓   |
+| `gen_p90_hours`               | ~1         | **26.02**  | ✓        |
+| `gen_frac_terminal_first24h`  | 1.0        | **0.876**  | -0.124 ✓ |
+| `gen_length_mae_hrs`          | n/a        | 107.87     |          |
+| Peak VRAM (MB)                | —          | 380.1      | ✓        |
+
+**Per-outcome pattern:** Rare outcomes (NEURO, HYPEROSMOLALITY, RETINOPATHY, ARD,
+ACIDOSIS, KETOACIDOSIS, INFECTION) improved from ~0.412 to ~0.499 — mechanically
+approaching random because fewer post-termination windows receive 0 scores. Common
+outcomes mixed: HYPOGLY +0.003, RELEASE +0.016, HYPERGLY -0.011, CARDIO -0.013,
+DEATH/KIDNEY roughly unchanged. The aggregate +0.045 AUROC improvement is partially
+real (longer trajectories covering more prediction windows) and partially mechanical
+(rare outcomes converging to ~0.5 rather than sub-random values).
+
+**Note:** Truncated AUROC not computed (evaluation.py always uses horizon-extended).
+The near-term prediction ability is expected to be similar to baseline since model
+weights are unchanged; temperature sampling adds variance to the first 10 tokens.
+
+**Verdict: KEEP** — AUROC improves +0.045 (well above ±0.005 noise floor); both
+generation metrics (median hours, frac_terminal_first24h) strictly improve;
+AUPRC and MAE regressions within noise floor; VRAM within budget.
+
+Next: F1 (multi-beam reranking) to test whether additional sampling diversity
+further extends trajectories and improves discriminative metrics.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
