@@ -568,7 +568,28 @@ The original Phase 2 checkpoint (which gave gen_median_steps=94) was created wit
 
 ---
 
+### Experiment K — Seeded Phase 2 Initialization
 
+**Date:** 2026-05-22
+**Code commits:** `e5705f1` (smoke test) + `4e6ba3b` (full run) — both reverted, DISCARD
+
+**Hypothesis:** A fixed seed before `model = GPT(...)` at `api.py:364` might find a better Phase 2 local minimum.
+
+**Smoke test (seed=42, sample=50):** gen_median_steps=22 — backbone not degenerate with 35 training patients.
+
+**Full run (seed=42, 40k patients):** gen_median_steps=4.0 — same TERMINAL-dominant collapse.
+
+| Metric                        | F4 (best KEEP) | K          | Delta     |
+|-------------------------------|----------------|------------|-----------|
+| `outcome_auroc`               | 0.541570       | **0.499202** | **−0.042** |
+| `gen_median_steps`            | 94.0           | **4.0**    | collapsed |
+| `phase2_epochs`               | (eval-only)    | **100**    | full budget |
+
+**Post-mortem:** With 40k patients the gradient landscape overrides initialization; same local min regardless of seed. Seed optimization is a dead end on full data. User directed to stop and address the problem algorithmically from inference/training.
+
+**Verdict: DISCARD.**
+
+---
 
 ## 2. Architecture sweep
 
