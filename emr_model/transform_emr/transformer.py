@@ -1029,24 +1029,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 else:
                     mag_loss = torch.tensor(0.0, device=pred_abs.device)
 
-                # T: Soft magnitude penalty (replaces R's hard sigmoid cap).
-                # R proved a hard 24h cap fixes gen_median_steps (5→83) but disrupts
-                # hidden states (AUROC crashed 0.506→0.259). A SOFT penalty
-                # preserves the model's representational capacity (softplus stays
-                # unbounded) while creating an incentive against large Δt
-                # predictions. The penalty is ReLU(Δt - 24h)² so positions with
-                # naturally-large true Δt suffer only when the model is also
-                # predicting too large, and the gradient pressure increases
-                # quadratically with violation magnitude.
-                _MAG_CAP_SOFT = 24.0 / 336.0
-                pred_delta = pred_abs - batch["abs_ts"][:, :-1]  # [B, T-1]
-                excess_dt = F.relu(pred_delta - _MAG_CAP_SOFT)
-                # Mask to non-pad positions (mean only over valid)
-                _n_valid = nonpad.float().sum().clamp(min=1)
-                mag_penalty_raw = ((excess_dt * nonpad.float()) ** 2).sum() / _n_valid
-                _mag_pen_lam = training_settings.get("phase2_mag_penalty_lambda", 100.0)
-                mag_penalty = _mag_pen_lam * mag_penalty_raw
-
                 abs_t_loss_raw = gate_loss + mag_loss
                 abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
@@ -1098,14 +1080,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss + mag_penalty
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "traj": traj_length_loss, "magpen": mag_penalty, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "traj": traj_length_loss, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
