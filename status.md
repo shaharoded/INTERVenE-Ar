@@ -623,6 +623,31 @@ Per-outcome: DEATH +0.046, HYPERGLY +0.039, RELEASE +0.036, KIDNEY −0.028, HYP
 
 ---
 
+### Experiment M — Anti-terminal-dominance Training Mask
+
+**Date:** 2026-05-22
+**Code commit:** `24f9968` (reverted — DISCARD)
+
+**Hypothesis:** The TERMINAL BCE kernel with tau=168h gives TERMINAL high soft-label weight at nearly every position. Zero out TERMINAL soft-labels at positions where the true terminal is >24h away → backbone learns clinical event distributions instead of TERMINAL.
+
+**Change:** transformer.py — after `multi_hot = get_temporal_soft_targets(...)`, for each query position compute `dt_to_first_terminal` and zero `multi_hot[:, :, terminal_ids]` where `dt > 24h`.
+
+**Full-run results:**
+
+| Metric                        | F4 (best)  | M          | Delta     |
+|-------------------------------|------------|------------|-----------|
+| `outcome_auroc`               | 0.541570   | **0.494295** | **−0.047** |
+| `gen_median_steps`            | 94.0       | **4.0**    | collapsed |
+| `phase2_epochs`               | (eval-only)| **24**     | early-stopped |
+
+**Post-mortem:** The 24h threshold is too small for short-stay ICU patients. Many patients in this dataset have stays <24h or have positions where terminal is within 24h of most of their sequence. For these patients, the mask does nothing → TERMINAL still dominates BCE → same collapse. Need stronger fix: narrow the tau itself (direction E from program.md) instead of just thresholding.
+
+**Verdict: DISCARD.**
+
+**Next: Experiment N — Direction E (narrow terminal tau_lm).** Reduce `_log_tau_terminal` from 168h to 12h AND freeze terminal tau (gradient hook). TERMINAL soft-label decays exponentially with 12h half-life regardless of patient stay length. Combined with reduced `phase2_terminal_bce_window_hours` (168h→24h horizon), TERMINAL only gets BCE gradient within ~24h of actual occurrence.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
