@@ -361,6 +361,10 @@ if not EVAL_ONLY:
     # -----------------------------------------------------------------------
     # Phase 2 — Pretrain GPT transformer over learned embeddings
     # -----------------------------------------------------------------------
+    _p2_seed = TRAINING_SETTINGS.get("phase2_seed")
+    if _p2_seed is not None:
+        torch.manual_seed(_p2_seed)
+        torch.cuda.manual_seed_all(_p2_seed)
     model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
     model, _, val_losses = pretrain_transformer(
         model             = model,

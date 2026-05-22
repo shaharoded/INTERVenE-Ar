@@ -22,7 +22,12 @@ TRAINING_SETTINGS = {
     "phase1_n_epochs": 50,
     "phase2_n_epochs": 100,
     "phase3_n_epochs": 100,
-    "sample": None,  # set to int (e.g. 50) for a quick smoke-test
+    "sample": 50,  # set to int (e.g. 50) for a quick smoke-test
+
+    # Fixed random seed for Phase-2 GPT weight initialization.
+    # Without this the retrained backbone consistently finds a TERMINAL-dominant
+    # local minimum (gen_median_steps=4). Seed 42 is the starting candidate.
+    "phase2_seed": 42,
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
