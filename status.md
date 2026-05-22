@@ -530,9 +530,45 @@ Two failures combined:
 ### Experiment J — Force Phase 2 to Full 100 Epochs
 
 **Date:** 2026-05-22  
-**Code commit:** `<pending>`
+**Code commit:** `0469d7f` (reverted — DISCARD)
+
+**Hypothesis:** I's Phase 2 early-stopped at epoch 23, giving insufficient training time for the backbone to learn the correct token-timing rhythm. Forcing Phase 2 to run ~100 epochs via `phase2_early_stop_patience=80` (patience gate = 20 epochs warmup + 80 patience = ~100 total) should restore the gen_median_steps=94 backbone behavior seen in the original F4 checkpoint.
+
+**Changes:**
+- `model_config.py`: `phase2_early_stop_patience: 80` added; `phase3_outcome_horizon_hours: 168.0` kept
+- `transformer.py`: Phase 2 early-stop now reads per-phase patience; Phase 3 `_HORIZON` reads `phase3_outcome_horizon_hours`; per-outcome tau init; `outcome_log_tau` trainable in Phase 3 head group
+
+**Full-run results (8562 patients, Phase 2 ran 98 epochs):**
+
+| Metric                        | F4 (best KEEP) | J          | Delta     |
+|-------------------------------|----------------|------------|-----------|
+| `outcome_auroc`               | 0.541570       | **0.498533** | **−0.043** |
+| `outcome_auprc`               | 0.143848       | 0.133275   | −0.011    |
+| `onset_mae_hrs`               | 64.95          | 123.94     | +59.0     |
+| `gen_median_steps`            | 94.0           | **4.0**    | collapsed |
+| `gen_median_hours`            | 287.26         | 201.99     | —         |
+| `phase2_epochs`               | (eval-only)    | **98**     | full budget |
+| `phase2_best_val`             | 0.384010       | 0.372667   | (different local min) |
+| `phase3_best_val`             | —              | 9.052001   | —         |
+
+**Per-outcome AUROC:** DEATH=0.521, HYPERGLY=0.509, RELEASE=0.501, HYPOGLY=0.492, KIDNEY=0.491, CARDIO=0.478. All sub-0.52 — no outcome has discriminative signal.
+
+**Post-mortem — root cause identified:**
+
+Phase 2 training duration is NOT the root cause of the collapse. Even with 98 epochs (full budget), the retrained backbone consistently finds a degenerate local minimum where TERMINAL token has the highest logit at almost all positions. gen_median_steps=4 in all retrained runs regardless of:
+- Phase 2 training duration (23 epochs: I → same collapse; 98 epochs: J → same collapse)
+- outcome_horizon_hours (48h vs 168h)
+- Phase 3 horizon / tau settings
+
+The original Phase 2 checkpoint (which gave gen_median_steps=94) was created with a specific random initialization that happened to find the correct local minimum. The retrained Phase 2 always initializes from random weights with NO fixed seed (`api.py:364: model = GPT(...)` — no `torch.manual_seed()` call anywhere). Different random initializations consistently converge to the bad TERMINAL-dominant local minimum.
+
+**Next: Experiment K — Seeded Phase 2 initialization.** Add `torch.manual_seed(X)` before `model = GPT(...)` at `api.py:364`. Run smoke tests (gen_median_steps proxy) with seeds 42, 0, 1, 123 to find one that escapes the TERMINAL-dominant local minimum. A seed producing gen_median_steps>50 in a smoke test confirms backbone recovery.
+
+**Verdict: DISCARD.** All headline metrics regressed; root cause now understood.
 
 ---
+
+
 
 ## 2. Architecture sweep
 
