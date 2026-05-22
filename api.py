@@ -496,6 +496,11 @@ print(f"gen_max_hours:              {_gen.get('gen_max_hours', float('nan'))}")
 print(f"gen_n_with_terminal:        {_gen.get('gen_n_with_terminal', 0)}")
 print(f"gen_frac_terminal_first24h: {_gen.get('gen_frac_terminal_first24h', float('nan'))}")
 print(f"gen_length_mae_hrs:         {_gen.get('gen_length_mae_hrs', float('nan'))}")
+# Ground-truth horizon stats + length-ratio summary metric.
+print(f"gt_median_hours:            {_gen.get('gt_median_hours', float('nan'))}")
+print(f"gt_mean_hours:              {_gen.get('gt_mean_hours', float('nan'))}")
+print(f"gen_to_gt_ratio_median:     {_gen.get('gen_to_gt_ratio_median', float('nan'))}")
+print(f"gen_to_gt_ratio_mean:       {_gen.get('gen_to_gt_ratio_mean', float('nan'))}")
 
 print(f"phase2_best_val:  {phase2_best:.6f}")
 print(f"phase2_epochs:    {phase2_epochs}")

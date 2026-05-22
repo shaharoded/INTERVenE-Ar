@@ -22,7 +22,7 @@ locked.
   tokenizer, scaler). **This is the canonical baseline.** Every training
   experiment starts from these.
 - `emr_model/checkpoints.bak_originals/` — read-only backup of the canonical
-  baseline. **Treat as immutable.** Restore from here before every retrain.
+  baseline. **Treat as immutable.** Restore from here before every retrain, as retrain probably overrun checkpoints/
 - `emr_model/data/source/` — MIMIC-IV processed data (CSVs, gitignored).
 - `results/` — published TSV ledgers, plus per-experiment artefacts the agent
   appends to.
@@ -34,14 +34,19 @@ locked.
 Improve the **horizon-extended** eval headlines without trading the
 truncated-eval capability away:
 
-| Metric (current baseline)     | Direction | Why |
-|-------------------------------|-----------|-----|
-| `outcome_auroc` 0.452         | ↑         | Multi-day ranking. |
-| `outcome_auprc` 0.107         | ↑         | Lift over prevalence. |
-| `mae_release_hrs`, `mae_death_hrs` | ↓ | Direct test that generation timing is calibrated. |
-| `gen_median_hours` ~1         | ↑         | Trajectory length vs median patient horizon (~152 h). |
-| `gen_frac_terminal_first24h` 1.0 | ↓     | Premature terminal emission. |
-| Truncated `outcome_auroc` 0.918 | report  | Must not drop more than 0.02 — that capability already exists. |
+| Metric (current baseline)         | Direction | Why |
+|-----------------------------------|-----------|-----|
+| `outcome_auroc` 0.452             | ↑         | Multi-day ranking (horizon-extended). |
+| `outcome_auprc` 0.107             | ↑         | Lift over prevalence. |
+| `onset_mae_hrs` ~85               | ↓         | Mean onset-time error. |
+| `mae_release_hrs`, `mae_death_hrs`| ↓         | Direct test that generation timing is calibrated. |
+| `gen_length_mae_hrs` ~140         | ↓         | Trajectory-length error in hours. |
+| `gen_median_hours` ~1             | ↑         | Trajectory length (time, not steps) vs median GT horizon ~152 h. |
+| `gen_to_gt_ratio_median` ~0       | → 1.0     | gen_median_hours / gt_median_hours. 1.0 = generation covers a full hospitalisation. |
+| `gen_frac_terminal_first24h` 1.0  | ↓         | Premature terminal emission. |
+| Truncated AUROC (cap=48h) 0.918   | report    | Must not too drastically — capability already exists. |
+
+All emitted automatically by `api.py`'s summary block — just grep, no plumbing.
 
 ---
 
@@ -67,25 +72,34 @@ weren't. Three gates must pass before a full training experiment runs:
 the summary block prints including `gen_*` lines and the `multi_horizon`
 block.
 
-### Gate 2 — every loss term is honestly active
+### Gate 2 — every loss term is wired and computed correctly
 
-In the smoke run's per-epoch print lines (`tr_bce`, `tr_ce`, `tr_dt`,
-`tr_ranking`, plus any new aux you added):
+The smoke is a **wiring check**, not a training signal. 1 epoch on 50
+patients is too little data to tell whether a loss is descending — don't
+try. What the smoke does prove: the loss runs without crashing and produces
+sensible values. Check, in the smoke's per-epoch print lines (`tr_bce`,
+`tr_ce`, `tr_dt`, `tr_ranking`, plus any new aux):
 
-1. **All raw loss magnitudes within 1–2 orders of magnitude of BCE.** If your
+1. **No `nan` / `inf` in any loss term.** A new aux that emits NaN on a
+   smoke means the formulation has a divide-by-zero / log-of-zero / mask
+   gap somewhere — fix before any full run.
+2. **Raw loss magnitudes within 1–2 orders of magnitude of BCE.** If your
    new aux's raw value is 30 000 while BCE is 0.4, the scheduler's lambda
    calibration will compute `λ ≈ fraction × tr_bce / tr_aux ≈ 1e-6` — the
-   gradient on your aux head is then ~zero. **A loss "descending" at λ ≈ 1e-6
-   is not being trained**; the descent is driven by the other heads.
-   Fix the loss scale (e.g. normalise by sequence length, take log1p of
-   hours, clamp targets, use MAE instead of MSE) until raw values land near
-   the same magnitude.
-2. **All loss terms descend** across the smoke's epoch budget. No flat aux.
-3. **The intended target signal of the new mechanism moves on the smoke
-   checkpoint**, even faintly. E.g. for a trajectory-length loss: smoke-eval
-   `gen_length_mae_hrs` should drop vs the canonical baseline. If the metric
-   the new loss targets doesn't budge on a 50-patient 1-epoch smoke, the
-   formulation is broken — don't pay for a full run.
+   gradient on the aux head is then ~zero. The loss will *look* "trained"
+   (its weighted contribution is small after calibration by construction)
+   but it isn't being optimised. Fix the loss scale (normalise by sequence
+   length, take log1p of hours, clamp targets, use MAE instead of MSE) so
+   raw values land near BCE's magnitude.
+3. **Lambda calibration produces a sensible `λ`** (printed by
+   `LambdaScheduleController` at the calibration epoch). λ in roughly
+   `[1e-3, 10]` is healthy. λ < `~1e-3` means the aux is effectively
+   inactive even though the scheduler says it's "on".
+4. **The full summary block prints** including `gen_*`, `multi_horizon`,
+   and `per_outcome` lines — no missing keys, no exception swallowing.
+
+If all four hold, the loss is *wired*. Whether it actually helps is what
+the **full run** measures (see KEEP / DISCARD rules below).
 
 ### Gate 3 — every change starts from the canonical baseline
 

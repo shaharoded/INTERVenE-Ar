@@ -138,16 +138,31 @@ def compute_gen_stats(risk_df, patient_horizons=None):
         "gen_frac_terminal_first24h": frac_early,
     })
 
-    # Length-MAE vs GT horizon: per patient, |generated_span - gt_horizon_from_seed_end|.
+    # Length-MAE vs GT horizon, plus GT length statistics for the agent to read
+    # the ratio "how much of the patient's true admission did the model cover?"
+    # at a glance.
     if patient_horizons:
         diffs = []
+        gt_spans = []
         for pid, s in span.items():
             if pid not in patient_horizons:
                 continue
             gt_span = max(0.0, patient_horizons[pid] - seed_end.loc[pid])
+            gt_spans.append(gt_span)
             diffs.append(abs(float(s) - gt_span))
         if diffs:
             stats["gen_length_mae_hrs"] = float(np.mean(diffs))
+        if gt_spans:
+            gt_arr = np.asarray(gt_spans, dtype=float)
+            stats["gt_median_hours"]    = float(np.median(gt_arr))
+            stats["gt_mean_hours"]      = float(gt_arr.mean())
+            stats["gt_p90_hours"]       = float(np.percentile(gt_arr, 90))
+            # Ratios — primary trajectory-collapse summary metric. 1.0 = generation
+            # spans the patient's true horizon; 0.0 = collapsed to immediate terminal.
+            gt_median = stats["gt_median_hours"]
+            gt_mean   = stats["gt_mean_hours"]
+            stats["gen_to_gt_ratio_median"] = (float(span.median()) / gt_median) if gt_median > 0 else 0.0
+            stats["gen_to_gt_ratio_mean"]   = (float(span.mean())   / gt_mean)   if gt_mean   > 0 else 0.0
 
     return stats
 
@@ -315,7 +330,7 @@ def pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
 
 def pooled_auc_across_horizons(risk_df, gt_labels_episodes, outcome_names,
                                 eval_ds_full,
-                                horizon_caps_hrs=(48, 168, 336),
+                                horizon_caps_hrs=tuple(range(24, 337, 24)),
                                 window_hours=EVAL_WINDOW_HOURS,
                                 grace_hours=EVAL_GRACE_HOURS,
                                 min_positives=EVAL_MIN_POSITIVES):
