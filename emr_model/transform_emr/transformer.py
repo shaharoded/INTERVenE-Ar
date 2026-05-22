@@ -1032,6 +1032,22 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 abs_t_loss_raw = gate_loss + mag_loss
                 abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
+                # O (direction B): trajectory-length loss.
+                # Penalises systematic Δt-prediction bias that per-position MSE
+                # misses. Per-position MSE only minimises |pred[t] - true[t]|² per
+                # step — if the model under-predicts Δt by a small amount at every
+                # step, the per-position MSE is small but the cumulative trajectory
+                # is far too short (gen_median_steps=4, ~200h covered in 4 jumps).
+                # The cumulative MSE here captures this compound bias: predicted
+                # total Δt over the sequence must match true total span.
+                pred_dt_seq  = (pred_abs - batch["abs_ts"][:, :-1]) * nonpad.float()
+                true_dt_seq  = (batch["abs_ts"][:, 1:] - batch["abs_ts"][:, :-1]) * nonpad.float()
+                pred_total   = pred_dt_seq.sum(dim=-1)   # [B]
+                true_total   = true_dt_seq.sum(dim=-1)   # [B]
+                traj_length_loss_raw = F.mse_loss(pred_total, true_total, reduction="mean")
+                _traj_lam = training_settings.get("phase2_traj_length_lambda", 1.0)
+                traj_length_loss = _traj_lam * traj_length_loss_raw
+
                 # === Outcome Loss — Time-Decayed Soft Labels ===
                 # For each position t, the target for outcome k is a soft risk score:
                 # sum_s { exp(-dt(t,s) / tau) * 1[token_s == outcome_k] }.clamp(0, 1)
@@ -1064,14 +1080,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "traj": traj_length_loss, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
