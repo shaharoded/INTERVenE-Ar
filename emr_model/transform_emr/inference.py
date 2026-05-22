@@ -140,11 +140,11 @@ def generate(model,
              collect_risk_scores=False,
              tqdm_position=0,
              tqdm_desc='Generating',
-             temperature_start=3.0,
+             temperature_start=1.0,
              temperature_anneal_steps=10,
-             hazard_suppress=True,
+             hazard_suppress=False,
              hazard_min_hours=24.0,
-             freeze_risk_at_seed=True):
+             freeze_risk_at_seed=False):
     """
     Unified autoregressive generation for all patients in *dataset*.
 
