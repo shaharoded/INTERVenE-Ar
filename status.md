@@ -676,6 +676,45 @@ Per-outcome: DEATH +0.046, HYPERGLY +0.039, RELEASE +0.036, KIDNEY −0.028, HYP
 
 ---
 
+### Experiment O — Direction B: Trajectory-Length Loss (KEEP)
+
+**Date:** 2026-05-22
+**Code commit:** `c6c1c05` (KEEP)
+
+**Hypothesis (per program.md direction B):** Per-position Δt MSE optimises individual (pred[t] - true[t])² but doesn't capture systematic compound bias. If the time head under-predicts Δt by ~1h at every step, per-position MSE stays small but cumulative trajectory length is off by N×1h = 100h. This produces gen_median_steps=4 with 50h jumps — per-step error compounds. A cumulative-Δt sequence-level MSE captures this bias directly.
+
+**Change (transformer.py Phase 2 loop):** After per-position dt MSE, add:
+```python
+pred_dt_seq = (pred_abs - batch["abs_ts"][:, :-1]) * nonpad.float()
+true_dt_seq = (batch["abs_ts"][:, 1:] - batch["abs_ts"][:, :-1]) * nonpad.float()
+traj_length_loss = F.mse_loss(pred_dt_seq.sum(dim=-1), true_dt_seq.sum(dim=-1))
+```
+Added to total loss with `phase2_traj_length_lambda=1.0`.
+
+**Full-run results:**
+
+| Metric                        | K (baseline) | O          | Delta     | KEEP rule |
+|-------------------------------|--------------|------------|-----------|-----------|
+| `outcome_auroc`               | 0.499202     | **0.506022** | **+0.007** | ✓ ≥+0.005 |
+| `outcome_auprc`               | 0.134487     | 0.135572   | +0.001    | flat (no regression) |
+| `onset_mae_hrs`               | 118.93       | **112.69** | **-6.24h** | ✓ ≤-5h |
+| `gen_median_steps`            | 4.0          | 5.0        | +1        | — |
+| `gen_median_hours`            | 208.65       | **223.39** | **+14.7h** | ✓ strictly above K |
+| `gen_frac_terminal_first24h`  | 0.00666      | 0.00409    | -0.0026   | ✓ below K |
+| `phase2_best_val`             | 0.4004       | 5196.71    | (new loss term dominates) |
+
+**Per-outcome AUROC improvements (vs K):** DEATH +0.000, HYPERGLY +0.017, RELEASE +0.013, KIDNEY +0.008, HYPOGLY +0.006, CARDIO +0.002. All non-negative; HYPERGLY/RELEASE/KIDNEY show meaningful gains.
+
+**Analysis:** First training-side experiment with a clear positive signal. The trajectory-length loss captures systematic Δt bias that per-position MSE misses. phase2_best_val=5196 is dominated by the new traj loss term (untrained magnitude head starts at large softplus outputs); the headline AUROC/AUPRC/MAE metrics show this didn't hurt convergence of the other losses. AUROC gain is small but real (well above noise floor).
+
+**Gap to F4 (0.542):** Still −0.036. The trajectory-length loss alone doesn't close the gap — additional training-side fixes needed.
+
+**Verdict: KEEP.** First training-side improvement on retrained backbone.
+
+**Next: build on O.** Combine with direction E (narrow terminal tau + freeze) and/or add per-step Δt cap regularisation to further reduce the 50h-per-step pattern.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
