@@ -29,6 +29,11 @@ progress.png
 # named files under results/.
 !results/
 !results/*.tsv
+# But: per-run audit dumps from api.py / eval_only stay local-only. The grep
+# block in run.log is the canonical record; results/ holds only the curated
+# KEEP/DISCARD ledger TSVs.
+results/per_outcome_*.tsv
+results/multi_horizon_*.tsv
 
 # Model checkpoints (large, rebuilt each experiment)
 emr_model/checkpoints/
