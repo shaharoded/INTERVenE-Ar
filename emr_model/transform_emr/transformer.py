@@ -579,9 +579,16 @@ class GPT(nn.Module):
         outcome_logits = self.outcome_head(x)           # [B, T, K]
 
         # 5. Absolute time prediction (two-head: gate + magnitude)
+        # R: magnitude head HARD-BOUNDED to 24h via sigmoid scaling.
+        # Previously softplus(raw) was unbounded → retrained model learned
+        # ~50h Δt at the seed-end position (gen_median_steps=4). With a 24h
+        # cap the model architecturally CANNOT produce >24h-per-step generation.
+        # MSE residual is bounded but training stays stable. Combined with O's
+        # trajectory-length loss, generation MUST use many small steps.
         gate_logit = self.dt_gate(x).squeeze(-1)       # [B,T] logit for P(Δt>0)
         mag_raw = self.dt_magnitude(x).squeeze(-1)     # [B,T]
-        mag_pos = F.softplus(mag_raw)                  # non-negative magnitude
+        _MAG_CAP = 24.0 / 336.0                          # 24h in normalised units
+        mag_pos = _MAG_CAP * torch.sigmoid(mag_raw)    # bounded [0, 24h]
 
         gate_prob = torch.sigmoid(gate_logit)
         delta_pos = gate_prob * mag_pos
@@ -652,7 +659,8 @@ class GPT(nn.Module):
         outcome_logits = self.outcome_head(x)
 
         gate_logit = self.dt_gate(x).squeeze(-1)
-        mag_pos    = F.softplus(self.dt_magnitude(x).squeeze(-1))
+        _MAG_CAP   = 24.0 / 336.0
+        mag_pos    = _MAG_CAP * torch.sigmoid(self.dt_magnitude(x).squeeze(-1))
         delta_pos  = torch.sigmoid(gate_logit) * mag_pos
         abs_t_pred = abs_ts + delta_pos
 
