@@ -1029,14 +1029,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 else:
                     mag_loss = torch.tensor(0.0, device=pred_abs.device)
 
-                # T-redo: Soft Δt magnitude penalty (replaces R's hard cap with
-                # gradient-only pressure). λ=200 (stronger than previous T=100).
-                _DT_CAP_NORM = 24.0 / 336.0
-                _pred_delta = pred_abs - batch["abs_ts"][:, :-1]
-                _excess_dt  = F.relu(_pred_delta - _DT_CAP_NORM)
-                _n_valid    = nonpad.float().sum().clamp(min=1)
-                mag_penalty = 200.0 * ((_excess_dt * nonpad.float()) ** 2).sum() / _n_valid
-
                 abs_t_loss_raw = gate_loss + mag_loss
                 abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
@@ -1092,7 +1084,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss + mag_penalty
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss
 
                 # === Backprop and Log ===
                 if train_flag:
