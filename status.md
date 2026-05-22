@@ -475,6 +475,40 @@ Two failures combined:
 
 ---
 
+### Experiment H — Per-Outcome Tau Initialization
+
+**Date:** 2026-05-22  
+**Code commit:** `7492e5f` (reverted — DISCARD)
+
+**Hypothesis:** G's failure was the global tau=96h. Per-outcome tau initialization (DEATH/RELEASE=24h, CARDIO=120h, others=48h) with 168h horizon should fix CARDIO while preserving short-term signal.
+
+**What actually happened:** Phase 2 re-ran 26 epochs from scratch (api.py lines 257-261 unconditionally clear and retrain Phase 2 on every non-eval-only run). With `outcome_horizon_hours=168h`, Phase 2's ranking loss trained the backbone with 168h-calibrated soft labels, fundamentally altering token-timing behavior — `gen_median_steps` collapsed to 4 again, identical to G. The per-outcome tau fix for Phase 3 never got a chance to help because the backbone was already broken by Phase 2.
+
+**Full-run results:**
+
+| Metric                        | F4 (best KEEP) | H          | Delta     |
+|-------------------------------|----------------|------------|-----------|
+| `outcome_auroc`               | 0.541570       | 0.501608   | −0.040    |
+| `outcome_auprc`               | 0.143848       | 0.133590   | −0.010    |
+| `gen_median_steps`            | 94.0           | **4.0**    | collapsed |
+| `phase2_epochs`               | (eval-only)    | **26**     | Phase 2 retrained |
+| `phase2_best_val`             | 0.384010       | 0.368680   | (different regime) |
+
+**Root cause — api.py architecture:** `api.py` (lines 252-261) always clears Phase 2 AND Phase 3 checkpoints at the start of every training run and retrains both from scratch. Changing `outcome_horizon_hours=168h` caused Phase 2 to retrain with different soft-label targets, breaking backbone token-timing behavior. This happens regardless of whether the change was intended for Phase 3 only.
+
+**Fix for experiment I:** Separate Phase 2 and Phase 3 horizon settings. Add `phase3_outcome_horizon_hours=168h` used exclusively by Phase 3's `_HORIZON` calculation. Keep `outcome_horizon_hours=48h` so Phase 2 trains with the original soft labels → correct backbone behavior preserved.
+
+**Verdict: DISCARD.** Identical failure mode to G. Infrastructure fix required before horizon extension can work.
+
+---
+
+### Experiment I — Phase-3-Only Extended Horizon (Separated Horizons)
+
+**Date:** 2026-05-22  
+**Code commit:** `<pending>`
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
