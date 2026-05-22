@@ -914,67 +914,16 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                                       forbid_ids=luts["forbid_mask_ids"],
                                       p=p)
 
-                # U (direction A): Scheduled sampling - mix teacher forcing with predictions.
-                # Compute current ss_p (anneal from 0 → ss_p_max over [ss_start, ss_start+ss_anneal]).
-                _ss_p_max  = training_settings.get("phase2_ss_p_max", 0.0)
-                _ss_start  = training_settings.get("phase2_ss_start_epoch", 1000)
-                _ss_anneal = max(1, training_settings.get("phase2_ss_anneal_epochs", 1))
-                if train_flag and _ss_p_max > 0 and epoch >= _ss_start:
-                    _ss_p = min(_ss_p_max, _ss_p_max * (epoch - _ss_start + 1) / _ss_anneal)
-                else:
-                    _ss_p = 0.0
-
-                if train_flag and _ss_p > 0:
-                    # Step 1: teacher-forced forward without gradient — just to get model predictions.
-                    with torch.no_grad():
-                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                            _tf_logits, _, _, _ = model(
-                                parent_raw_ids=batch["parent_raw_ids"],
-                                concept_ids=batch["concept_ids"],
-                                value_ids=batch["value_ids"],
-                                position_ids=batch["position_ids"],
-                                abs_ts=batch["abs_ts"],
-                                context_vec=batch["context_vec"]
-                            )
-                    _pred_token_ids = _tf_logits.argmax(dim=-1)  # [B, T]
-                    # Shift: position t's input was real, but if we replace it with the model's own
-                    # prediction, that prediction came from position t-1's logits.
-                    _shifted = torch.cat([batch["position_ids"][:, :1], _pred_token_ids[:, :-1]], dim=1)
-
-                    # Sample positions to replace with model predictions.
-                    _pad_id = model.embedder.padding_idx
-                    _rep_mask = torch.rand_like(batch["position_ids"], dtype=torch.float) < _ss_p
-                    _rep_mask = _rep_mask & (batch["position_ids"] != _pad_id) & (_shifted != _pad_id)
-                    _rep_mask[:, 0] = False  # never replace BOS
-
-                    # Re-derive concept/value/parent for replaced positions via LUTs.
-                    _t2parent = model.embedder.tokenizer.tokenid2parent_raw_ids.to(device)
-                    _new_pos    = torch.where(_rep_mask, _shifted, batch["position_ids"])
-                    _new_concept = torch.where(_rep_mask, luts["tok2concept"][_new_pos].clamp(min=0), batch["concept_ids"])
-                    _new_value   = torch.where(_rep_mask, luts["tok2value"][_new_pos].clamp(min=0),   batch["value_ids"])
-                    _new_parent  = torch.where(_rep_mask.unsqueeze(-1), _t2parent[_new_pos], batch["parent_raw_ids"])
-
-                    # Step 2: forward with mixed inputs (with gradient).
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                        logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
-                            parent_raw_ids=_new_parent,
-                            concept_ids=_new_concept,
-                            value_ids=_new_value,
-                            position_ids=_new_pos,
-                            abs_ts=batch["abs_ts"],
-                            context_vec=batch["context_vec"]
-                        )
-                else:
-                    # === Original logits from Model ===
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
-                        logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
-                            parent_raw_ids=batch["parent_raw_ids"],
-                            concept_ids=batch["concept_ids"],
-                            value_ids=batch["value_ids"],
-                            position_ids=batch["position_ids"],
-                            abs_ts=batch["abs_ts"],
-                            context_vec=batch["context_vec"]
-                        )
+                # === Original logits from Model ===
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    logits, abs_t_pred, outcome_logits, dt_gate_logit = model(
+                        parent_raw_ids=batch["parent_raw_ids"],
+                        concept_ids=batch["concept_ids"],
+                        value_ids=batch["value_ids"],
+                        position_ids=batch["position_ids"],
+                        abs_ts=batch["abs_ts"],
+                        context_vec=batch["context_vec"]
+                    )
                 logits = logits.float()
                 abs_t_pred = abs_t_pred.float()
                 outcome_logits = outcome_logits.float().clamp(-20.0, 20.0)
