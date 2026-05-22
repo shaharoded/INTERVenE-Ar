@@ -313,6 +313,51 @@ def pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
     return pd.DataFrame(result_rows).set_index("outcome").sort_values("auroc", ascending=False)
 
 
+def pooled_auc_across_horizons(risk_df, gt_labels_episodes, outcome_names,
+                                eval_ds_full,
+                                horizon_caps_hrs=(48, 168, 336),
+                                window_hours=EVAL_WINDOW_HOURS,
+                                grace_hours=EVAL_GRACE_HOURS,
+                                min_positives=EVAL_MIN_POSITIVES):
+    """
+    Purpose: Compute pooled_episode_auc at multiple per-patient horizon caps so
+             the agent can read off a horizon curve in a single eval pass —
+             a cheap "next-48h", a medium "first-week", and the full 14-day
+             extension, all from the same generated risk_df.
+    Method:  Build a patient_horizons dict per cap = min(GT_last_event, cap),
+             call pooled_episode_auc for each, stack the results as a long
+             DataFrame indexed by (horizon_cap_hrs, outcome).
+
+    Args:
+        risk_df (pd.DataFrame): generate() output with collect_risk_scores=True.
+        gt_labels_episodes (dict): from extract_ground_truth_episodes.
+        outcome_names (list[str]): canonical outcome names.
+        eval_ds_full (EMRDataset): untruncated test dataset for horizon extraction.
+        horizon_caps_hrs (tuple): per-patient horizon caps to evaluate at.
+        window_hours, grace_hours, min_positives: forwarded to pooled_episode_auc.
+
+    Returns:
+        pd.DataFrame: columns horizon_cap_hrs, outcome, auroc, auprc, n_pos, n_neg.
+    """
+    rows = []
+    for cap in horizon_caps_hrs:
+        horizons = extract_patient_horizons(eval_ds_full, full_horizon_hours=float(cap))
+        tbl = pooled_episode_auc(risk_df, gt_labels_episodes, outcome_names,
+                                  window_hours=window_hours, grace_hours=grace_hours,
+                                  min_positives=min_positives,
+                                  patient_horizons=horizons)
+        for outcome, row in tbl.iterrows():
+            rows.append({
+                "horizon_cap_hrs": int(cap),
+                "outcome":         outcome,
+                "auroc":           row["auroc"],
+                "auprc":           row["auprc"],
+                "n_pos":           int(row["n_pos_windows"]),
+                "n_neg":           int(row["n_neg_windows"]),
+            })
+    return pd.DataFrame(rows)
+
+
 def time_accuracy(risk_df, gt_labels, outcome_names):
     """
     Purpose: Compute mean absolute error between predicted and actual complication onset time.
@@ -428,8 +473,16 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
 
     # -- Compute metrics --
     print("[Eval] Computing episode-level AUC and time accuracy...")
+    # Primary AUC table uses each patient's true horizon (horizon-extended eval).
     auc_table = pooled_episode_auc(risk_df, gt_episodes, outcome_names,
                                     patient_horizons=patient_horizons)
+    # Multi-horizon view: same generated trajectories, scored against three
+    # progressively-longer windows so the agent can read off a horizon curve
+    # (next-48h, first-week, full 14-day) without re-generating.
+    multi_horizon_table = pooled_auc_across_horizons(
+        risk_df, gt_episodes, outcome_names, eval_ds_full,
+        horizon_caps_hrs=(48, 168, 336),
+    )
     mae_table = time_accuracy(risk_df, gt_first, outcome_names)
     gen_stats = compute_gen_stats(risk_df, patient_horizons=patient_horizons)
 
@@ -438,7 +491,7 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
     mean_mae_hours = float(mae_table["mae_hours"].mean(skipna=True))
 
     # Summarise per-outcome for the log
-    print("[Eval] Per-outcome AUROC:")
+    print("[Eval] Per-outcome AUROC (horizon-extended):")
     for outcome, row in auc_table.iterrows():
         if not np.isnan(row["auroc"]):
             print(f"  {outcome:<45} AUROC={row['auroc']:.3f}  AUPRC={row['auprc']:.3f}")
@@ -446,6 +499,12 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
           f"median_hours={gen_stats.get('gen_median_hours', '-')}, "
           f"frac_terminal_first24h={gen_stats.get('gen_frac_terminal_first24h', '-')}, "
           f"length_mae_hrs={gen_stats.get('gen_length_mae_hrs', '-')}")
+    # Multi-horizon mean — quick read on where the model is good vs collapsed.
+    print("[Eval] Multi-horizon mean (across all outcomes with sufficient positives):")
+    for cap, sub in multi_horizon_table.groupby("horizon_cap_hrs"):
+        m_auroc = float(sub["auroc"].mean(skipna=True))
+        m_auprc = float(sub["auprc"].mean(skipna=True))
+        print(f"  cap={cap:>3d}h   AUROC={m_auroc:.3f}   AUPRC={m_auprc:.3f}")
 
     return dict(
         mean_auroc=mean_auroc,
@@ -454,4 +513,5 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
         auc_table=auc_table,
         mae_table=mae_table,
         gen_stats=gen_stats,
+        multi_horizon_table=multi_horizon_table,
     )

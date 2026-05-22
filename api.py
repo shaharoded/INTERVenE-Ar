@@ -534,3 +534,18 @@ if _auc_table is not None:
     _out_path = os.path.join(_out_dir, f"per_outcome_{_commit}.tsv")
     _auc_table.to_csv(_out_path, sep="\t", index=True, index_label="outcome")
     print(f"per_outcome_csv:  {os.path.relpath(_out_path, PROJECT_ROOT)}")
+
+# Multi-horizon AUC table — same generated risk_df scored at 48h / 168h / 336h
+# per-patient horizon caps. Lets the agent read off a horizon curve: a healthy
+# fix should look strong at 48h AND not collapse at 336h. Emitted both as a
+# grep-friendly block and persisted to a TSV.
+print("multi_horizon\thorizon_cap_hrs\toutcome\tauroc\tauprc\tn_pos\tn_neg")
+_mh_table = eval_results.get("multi_horizon_table")
+if _mh_table is not None and len(_mh_table) > 0:
+    for _, _row in _mh_table.iterrows():
+        _auroc = f"{_row['auroc']:.6f}" if not pd.isna(_row['auroc']) else "nan"
+        _auprc = f"{_row['auprc']:.6f}" if not pd.isna(_row['auprc']) else "nan"
+        print(f"multi_horizon\t{int(_row['horizon_cap_hrs'])}\t{_row['outcome']}\t{_auroc}\t{_auprc}\t{int(_row['n_pos'])}\t{int(_row['n_neg'])}")
+    _mh_path = os.path.join(_out_dir, f"multi_horizon_{_commit}.tsv")
+    _mh_table.to_csv(_mh_path, sep="\t", index=False)
+    print(f"multi_horizon_csv: {os.path.relpath(_mh_path, PROJECT_ROOT)}")
