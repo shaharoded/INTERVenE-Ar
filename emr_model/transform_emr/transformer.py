@@ -892,8 +892,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_dt = total_ranking = 0.0
-        total_ce_raw = total_dt_raw = total_ranking_raw = 0.0
+        total_loss = total_bce = total_ce = total_dt = total_ranking = total_traj = 0.0
+        total_ce_raw = total_dt_raw = total_ranking_raw = total_traj_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -1032,21 +1032,25 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 abs_t_loss_raw = gate_loss + mag_loss
                 abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
-                # O (direction B): trajectory-length loss.
+                # O (direction B): trajectory-length loss — SCHEDULER-INTEGRATED.
                 # Penalises systematic Δt-prediction bias that per-position MSE
                 # misses. Per-position MSE only minimises |pred[t] - true[t]|² per
                 # step — if the model under-predicts Δt by a small amount at every
                 # step, the per-position MSE is small but the cumulative trajectory
-                # is far too short (gen_median_steps=4, ~200h covered in 4 jumps).
-                # The cumulative MSE here captures this compound bias: predicted
-                # total Δt over the sequence must match true total span.
+                # is far too short. The cumulative MSE here captures this compound
+                # bias: predicted total Δt over the sequence must match true total span.
+                #
+                # CRITICAL: λ_traj is now calibrated by the LambdaScheduleController
+                # (lambdas["traj"]) at the first active epoch as fraction_cap *
+                # tr_bce / tr_traj_raw, so traj_loss is bounded at fraction_cap × BCE
+                # rather than dominating gradients (the bug in the original O run
+                # where raw λ=1.0 made traj_loss=29555 vs BCE=0.42, freezing BCE/CE).
                 pred_dt_seq  = (pred_abs - batch["abs_ts"][:, :-1]) * nonpad.float()
                 true_dt_seq  = (batch["abs_ts"][:, 1:] - batch["abs_ts"][:, :-1]) * nonpad.float()
                 pred_total   = pred_dt_seq.sum(dim=-1)   # [B]
                 true_total   = true_dt_seq.sum(dim=-1)   # [B]
                 traj_length_loss_raw = F.mse_loss(pred_total, true_total, reduction="mean")
-                _traj_lam = training_settings.get("phase2_traj_length_lambda", 1.0)
-                traj_length_loss = _traj_lam * traj_length_loss_raw
+                traj_length_loss = traj_length_loss_raw * lambdas.get("traj", 0.0)
 
                 # === Outcome Loss — Time-Decayed Soft Labels ===
                 # For each position t, the target for outcome k is a soft risk score:
@@ -1122,6 +1126,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce_raw      += loss_ce_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
+                total_traj        += traj_length_loss.item()
+                total_traj_raw    += traj_length_loss_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1141,22 +1147,24 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_dt      / n_batches,
             total_ranking / n_batches,
+            total_traj    / n_batches,
             total_ce_raw      / n_batches,
             total_dt_raw      / n_batches,
             total_ranking_raw / n_batches,
+            total_traj_raw    / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ce_raw, tr_dt_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_traj, tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_traj_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_traj, _, _, _, _                                       = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f}, Traj={tr_traj:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f}, Traj={vl_traj:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f} traj={tr_traj_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1165,6 +1173,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             ranking=tr_ranking_raw,
+            traj=tr_traj_raw,
         )
         for msg in schedule_events:
             print(msg)

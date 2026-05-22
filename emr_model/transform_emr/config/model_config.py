@@ -74,12 +74,14 @@ TRAINING_SETTINGS = {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
+            "traj":    0.30,    # Trajectory-length cumulative-Δt loss (direction B)
         },
-        "order": [["ce", "dt"], ["ranking"]],
+        "order": [["ce", "dt", "traj"], ["ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
-            "ranking": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
+            "traj":    0,   # Activates with stage-0 auxiliaries; calibrated at first active epoch
+            "ranking": 3,   # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
