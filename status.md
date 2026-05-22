@@ -648,6 +648,34 @@ Per-outcome: DEATH +0.046, HYPERGLY +0.039, RELEASE +0.036, KIDNEY −0.028, HYP
 
 ---
 
+### Experiment N — Direction E: Narrow Terminal tau_lm + Freeze
+
+**Date:** 2026-05-22
+**Code commit:** `9d29c1f` (reverted — DISCARD)
+
+**Hypothesis (per program.md direction E):** TERMINAL tau=168h is so wide that nearly every training position has high TERMINAL BCE weight (most sequences end within 168h). Narrowing tau to 12h confines TERMINAL gradient to within ~24h of actual terminal events. Freeze tau_terminal so the optimiser cannot drift it back to 168h.
+
+**Changes:**
+- `transformer.py:437`: `_log_tau_terminal = math.log(12.0 / 336.0)` (was 168/336)
+- `transformer.py`: register backward hook on `log_tau_lm` that zeros gradient at terminal indices
+
+**Full-run results:**
+
+| Metric                        | F4 (best)  | N          | Delta     |
+|-------------------------------|------------|------------|-----------|
+| `outcome_auroc`               | 0.541570   | 0.499149   | −0.042    |
+| `gen_median_steps`            | 94.0       | **4.0**    | collapsed |
+| `phase2_epochs`               | (eval-only)| **26**     | early-stopped |
+| `phase2_best_val`             | —          | 0.404      | —         |
+
+**Post-mortem:** The narrow-tau BCE fix didn't change the generation behavior. gen_median_steps=4 persists. This is strong evidence the mode collapse is NOT solely driven by TERMINAL BCE width — likely the Δt MAGNITUDE HEAD is the real culprit. The retrained time head learns to predict large Δt at the seed-end position regardless of TERMINAL handling. The original deployed backbone happened to find different time-head weights via a specific optimization path that's hard to reproduce.
+
+**Verdict: DISCARD.**
+
+**Next: Experiment O — Completely exclude TERMINAL from Phase 2 BCE/CE.** Most aggressive variant of direction E. Zero ALL TERMINAL columns in multi_hot (not just decayed by tau). LM head receives ZERO BCE/CE gradient for TERMINAL tokens. The backbone learns purely clinical-event distributions; TERMINAL discrimination is handled solely by the ranking loss on the OUTCOME HEAD (which already exists and is independent of LM head).
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
