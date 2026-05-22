@@ -143,8 +143,9 @@ def generate(model,
              temperature_start=3.0,
              temperature_anneal_steps=10,
              hazard_suppress=True,
-             hazard_min_hours=24.0,
-             freeze_risk_at_seed=True):
+             hazard_min_hours=336.0,
+             freeze_risk_at_seed=True,
+             max_step_hours=3.0):
     """
     Unified autoregressive generation for all patients in *dataset*.
 
@@ -206,6 +207,14 @@ def generate(model,
             preserves almost all discriminative signal while eliminating the
             covariate-shift noise. Default True because evaluation.py is locked
             and cannot pass this argument explicitly; DISCARD reverts the commit.
+        max_step_hours (float | None): L flag. Maximum time-delta (hours) per generated
+            token. When the retrained backbone produces degenerate 50h-per-step
+            trajectories (gen_median_steps=4 despite hazard suppression), this cap
+            forces 3h-step rhythms → ~96 steps per patient, matching the original
+            backbone's density. With hazard_min_hours=336 (full trajectory suppression)
+            and max_step_hours=3.0, all patients generate ~(max_duration−seed)/3h tokens
+            before time_exceeded fires — restoring the window coverage that AUROC needs.
+            Default 3.0. Set None to disable.
 
     Returns:
         pd.DataFrame with columns PatientId, Step, TimePoint, Token, IsInput,
@@ -213,6 +222,7 @@ def generate(model,
         column per outcome in model.outcome_names.
     """
     max_abs_ts_norm = float(max_duration_hours) / 336.0  # comparison threshold in normalised units
+    max_step_norm   = float(max_step_hours) / 336.0 if max_step_hours is not None else None
     autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
     device    = next(model.parameters()).device
     tok       = model.embedder.tokenizer
@@ -453,6 +463,11 @@ def generate(model,
 
                 next_logits    = logits_dec[:, 0, :]
                 new_abs_t      = abs_t_dec[:, 0]
+                # L: cap per-step time delta so a TERMINAL-dominant backbone can't
+                # collapse the trajectory to 4×50h steps. Forces original 3h/step
+                # rhythm and ~96 windows of dense coverage for AUROC.
+                if max_step_norm is not None:
+                    new_abs_t = torch.minimum(new_abs_t, current_abs_ts + max_step_norm)
                 current_abs_ts = torch.maximum(new_abs_t, current_abs_ts)
 
                 # Time-based stop: patients whose absolute time hits the horizon are done.
