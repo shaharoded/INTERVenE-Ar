@@ -31,14 +31,8 @@ TRAINING_SETTINGS = {
     "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,
-    "phase2_learning_rate": 3e-5,   # V: reduced 10x for warm-start fine-tuning to stay near original local min
+    "phase2_learning_rate": 3e-4,
     "phase3_learning_rate":       1e-4,
-
-    # V (warm-start from saved original Phase-2 checkpoint).
-    # The retraining-from-scratch gap (0.508 vs original 0.542) reflects loss of
-    # the original training run's specific local minimum. Warm-starting from
-    # backup preserves the good representation; reduced LR keeps it close.
-    "phase2_warm_start_path": os.path.join(PROJECT_ROOT, 'checkpoints.bak_originals', 'phase2', 'ckpt_best.pt'),
     "phase3_backbone_lr_factor":  0.01,  # M-256 baseline setting
     "phase3_weight_decay":        1e-3,  # weight decay for outcome_head in P3 (matches backbone)
     "weight_decay": 1e-3,

@@ -814,25 +814,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         if pre_ckpt.get("training_settings") is not None:
             training_settings = pre_ckpt["training_settings"]
 
-    # V (warm-start from saved original Phase-2 checkpoint).
-    # Diagnostic (T-redo + F2/F3/F4): retrained backbone AUROC 0.508 vs original
-    # 0.542 with same inference. Retraining loses representational quality despite
-    # healthy loss trajectories. Fix: initialise Phase-2 from the original
-    # checkpoint at .bak_originals/, then fine-tune with the O2 traj-length loss
-    # (and others) at a reduced LR so the backbone stays near the good local min
-    # while still absorbing the new training signal.
-    warm_start_path = training_settings.get("phase2_warm_start_path", None)
-    if not resume and warm_start_path is not None:
-        warm_path = Path(warm_start_path).resolve()
-        if warm_path.exists():
-            print(f"[Phase-2] Warm-starting Phase 2 from {warm_path}")
-            _warm_ckpt = torch.load(str(warm_path), map_location="cpu", weights_only=True)
-            _msg = model.load_state_dict(_warm_ckpt["model_state"], strict=False)
-            print(f"[Phase-2] Warm-start load: missing_keys={len(_msg.missing_keys)} "
-                  f"unexpected_keys={len(_msg.unexpected_keys)}")
-        else:
-            print(f"[Phase-2] WARNING: warm_start_path {warm_path} not found — starting from random init")
-
     # Allow embedder weights to update starting epoch 1
     set_embedder_frozen(model, freeze=False)
     model.to(device)
