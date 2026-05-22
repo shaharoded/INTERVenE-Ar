@@ -39,6 +39,8 @@ TRAINING_SETTINGS = {
     # the original training run's specific local minimum. Warm-starting from
     # backup preserves the good representation; reduced LR keeps it close.
     "phase2_warm_start_path": os.path.join(PROJECT_ROOT, 'checkpoints.bak_originals', 'phase2', 'ckpt_best.pt'),
+    # V2: also warm-start Phase 3 outcome head (V regressed when Phase 3 retrained from scratch).
+    "phase3_warm_start_path": os.path.join(PROJECT_ROOT, 'checkpoints.bak_originals', 'phase3', 'ckpt_best.pt'),
     "phase3_backbone_lr_factor":  0.01,  # M-256 baseline setting
     "phase3_weight_decay":        1e-3,  # weight decay for outcome_head in P3 (matches backbone)
     "weight_decay": 1e-3,
