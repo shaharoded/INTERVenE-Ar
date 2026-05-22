@@ -426,6 +426,55 @@ vs baseline: +0.090 (0.452→0.542).
 
 ---
 
+### Experiment G — Extended Outcome Horizon (48→168h) + Global Tau Reset
+
+**Date:** 2026-05-22  
+**Code commit:** `8b259d3` (reverted — DISCARD)
+
+**Hypothesis:** The CARDIO AUROC inversion (0.203) is caused by the 48h prediction horizon — patients who develop CARDIO at t=200h after seed have near-zero soft-label weight under tau=12h and horizon=48h, so the outcome head never learned to predict late CARDIO. Extending `outcome_horizon_hours` 48→168h and resetting `outcome_log_tau` to tau=96h (giving exp(-168/96)=0.17 at the horizon edge) should fix CARDIO while keeping other outcomes discriminable.
+
+**Changes:**
+- `model_config.py`: `outcome_horizon_hours` 48.0 → 168.0
+- `transformer.py Phase 3`: `outcome_log_tau` reset to log(96/336) at Phase 3 start (was log(12/336)); made trainable in Phase 3 (was hard-frozen); placed in head param group at LR=1e-4 (not backbone group at 1e-6)
+
+**Full-run results (8562 patients, Phase 3 retrained, Phase 2 ran 25 extra epochs):**
+
+| Metric                        | F4 (prev KEEP) | G          | Delta     |
+|-------------------------------|----------------|------------|-----------|
+| `outcome_auroc`               | 0.541570       | **0.499777** | **−0.042** |
+| `outcome_auprc`               | 0.143848       | 0.134368   | −0.009    |
+| `onset_mae_hrs`               | 64.95          | 123.70     | +58.75    |
+| `gen_median_steps`            | 94.0           | **4.0**    | **−90** (collapse) |
+| `gen_median_hours`            | 287.26         | 202.79     | −84.47    |
+| `gen_frac_terminal_first24h`  | 0.005140       | 0.005256   | ≈0        |
+| `phase2_best_val`             | 0.384010       | 0.382950   | −0.001    |
+| `phase3_best_val`             | —              | 9.046768   | —         |
+
+**Per-outcome AUROC:**
+
+| Outcome    | F4     | G      | Delta   |
+|------------|--------|--------|---------|
+| DEATH      | 0.777  | 0.524  | **−0.253** |
+| RELEASE    | 0.695  | 0.506  | **−0.189** |
+| HYPERGLY   | 0.613  | 0.503  | −0.110  |
+| HYPOGLY    | 0.537  | 0.499  | −0.038  |
+| KIDNEY     | 0.543  | 0.490  | −0.053  |
+| CARDIO     | 0.203  | **0.476**  | **+0.273** |
+
+**Post-mortem:**
+
+Two failures combined:
+1. **Global tau=96h destroyed short-term signal.** DEATH develops within 24–48h; RELEASE (discharge) within the first few days. With tau=96h, the soft label for these outcomes is spread over 96h half-life, diffusing the near-future signal. DEATH dropped 0.253 AUROC. The single global tau should have been per-outcome: short tau for DEATH/RELEASE, long tau for CARDIO.
+2. **Phase 2 ran 25 extra epochs with 168h horizon.** Phase 2 ckpt_best.pt was at epoch 75 (F4 era); Phase 2 continued epochs 76–100 with the new 168h soft-label target. Backpropagating the ranking loss through the backbone with the new calibration changed token-timing behavior: `gen_median_steps` collapsed from 94 to 4. The backbone generates sparse trajectories with ~50h per token instead of the prior ~3h/token rhythm.
+
+**Ceiling analysis:** 7 of 13 eval outcomes have 0 positive windows (ACIDOSIS, ACUTE_RESPIRATORY, HYPEROSMOLALITY, INFECTION, KETOACIDOSIS, NEUROVASCULAR, RETINOPATHY) — these are counted as AUROC=0.5. The theoretical maximum AUROC is (6×1.0 + 7×0.5)/13 = 0.731. Reaching user's target of AUROC=0.9 requires either unlocking positive windows for the 7 NaN outcomes or re-examining the evaluation structure — not achievable with the current evaluation setup.
+
+**Verdict: DISCARD.** All headline metrics regressed; AUROC −0.042, AUPRC −0.009, gen_median_steps collapsed.
+
+**Next: Experiment H — Per-outcome tau initialization.** Keep 168h horizon (so CARDIO can still be trained). Initialize tau per outcome: DEATH/RELEASE/HYPOGLY → 24h (short), HYPERGLY/KIDNEY/others → 48h (medium), CARDIO/NEUROVASC/RETINOPATHY → 120h (long). This avoids the global tau damage while still extending CARDIO's training horizon.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
