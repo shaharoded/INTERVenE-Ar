@@ -355,6 +355,77 @@ CARDIO AUROC and overall discriminativity.
 
 ---
 
+### Experiment F4 — Frozen Seed-End Risk Scores
+
+**Code commit:** `b41287d`
+**Date:** 2026-05-22
+
+**Hypothesis:** The outcome head at mid-trajectory positions sees GENERATED clinical context
+(covariate shift), producing noisy or inverted predictions. The seed-end prediction operates
+on real 2-day clinical context (fully in-distribution). Since >99% of (positive, negative) window
+pairs are between-patient, and seed-end discrimination ≈ truncated-eval AUROC (~0.91), freezing
+the outcome head at the seed-end position should yield large AUROC gains.
+
+**Change:** `inference.py::generate()` — new parameter `freeze_risk_at_seed=True` (default
+True, because evaluation.py is locked). After prefill, captures seed-end outcome probabilities
+`sigmoid(outcome_logits[last_valid_idx])` for each patient [B, K]. All generated-position
+risk scores use these frozen values instead of per-step outcome head outputs.
+
+**Full run results (8,562 test patients, ~23 min, GPU):**
+
+| Metric                        | F3 (previous KEEP) | F4         | Delta     |
+|-------------------------------|---------------------|------------|-----------|
+| `outcome_auroc`               | 0.530               | **0.542**  | +0.012 ✓  |
+| `outcome_auprc`               | 0.133               | **0.144**  | +0.011 ✓  |
+| `onset_mae_hrs`               | 74.59               | **64.95**  | -9.64h ✓  |
+| `gen_median_hours`            | 287.256             | 287.256    | ±0.00008h (noise) |
+| `gen_frac_terminal_first24h`  | 0.004556            | 0.005140   | +5 patients (noise) |
+
+**Per-outcome AUROC shifts:**
+
+| Outcome   | F3     | F4     | Delta   | Explanation                                      |
+|-----------|--------|--------|---------|--------------------------------------------------|
+| DEATH     | 0.727  | 0.764  | +0.037  | Risk persistent → seed-end discriminates well    |
+| HYPOGLY   | 0.614  | 0.653  | +0.039  | Covariate-shift noise removed                    |
+| KIDNEY    | 0.531  | 0.576  | +0.045  | Covariate-shift noise removed                    |
+| HYPERGLY  | 0.628  | 0.655  | +0.027  | Covariate-shift noise removed                    |
+| RELEASE   | **0.733** | 0.695 | -0.038 | Temporal signal lost (F3 head tracked discharge timing correctly) |
+| CARDIO    | 0.198  | 0.203  | ≈0      | **Still broken** — different mechanism (see analysis) |
+| Rare (7)  | ~0.494 | ~0.499 | +0.005  | Negligible                                       |
+
+**Smoke test mislead:** The smoke test (50 patients) showed AUROC 0.816, AUPRC 0.518 because
+most rare outcomes had zero positive windows → NaN → excluded from mean → inflated average.
+With 8562 patients, all 13 outcomes are included (especially 7 rare ones at ~0.499 each, which
+together account for 54% of the mean weight, capping it near 0.5).
+
+**Root cause of CARDIO anomaly (unchanged):** Patients who develop CARDIO late (t=200h) had
+LOW seed-end P_CARDIO (correctly: "no CARDIO in next 48h from day-2 seed"). But their
+windows at t=200h are POSITIVE. The frozen low score makes positive-CARDIO windows rank
+BELOW negative windows of high-immediate-risk patients → inverted. This is a prediction-horizon
+mismatch (48h training horizon vs 336h evaluation horizon) — not the same covariate-shift issue
+F4 was designed to fix.
+
+**Why generation metrics show tiny regression:** F4 changes no generation code — gen_median_hours
+differs by 0.00008h (3 seconds) and gen_frac by 5 patients. Both are sampling noise from
+temperature-annealing stochasticity. Applying judgment: these do not represent a real regression.
+
+**Verdict: KEEP** — AUROC +0.012 and AUPRC +0.011 both exceed the ±0.005 threshold; MAE
+improves -9.64h; generation metric differences are sub-patient noise. Cumulative AUROC gain
+vs baseline: +0.090 (0.452→0.542).
+
+**Key insight for next experiments:** Two distinct problems remain:
+1. **Prediction-horizon mismatch (CARDIO, late events):** Outcome head trained with 48h horizon
+   cannot predict events occurring >48h after each generated position. Fix: retrain Phase 3 with
+   a longer horizon OR with outcome-time-to-event regression.
+2. **Rare-outcome discrimination:** 7 outcomes stuck at ~0.499. Fix: training-side improvements
+   to better leverage rare outcome signal (scheduled sampling, more training data for rare events).
+3. **RELEASE temporal dynamics:** F4 lost F3's temporal tracking of discharge timing. Fix:
+   on-policy Phase 3 so head is calibrated at generated positions.
+
+**Next: Training experiment G — Phase 3 on-policy fine-tuning with extended outcome horizon.**
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
