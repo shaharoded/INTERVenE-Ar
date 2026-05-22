@@ -1322,23 +1322,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         model.to(device)
         _freeze_backbone_only(model)
         optimizer = _make_p3_optimizer(model)
-
-    # V2 (warm-start from saved original Phase-3 checkpoint).
-    # Without this, retraining Phase 3 from scratch on a warm-started Phase 2
-    # destroys the original's outcome head (V experiment: AUROC 0.499→0.454).
-    # Loading the original Phase 3 outcome head preserves its learned
-    # discriminative features.
-    p3_warm = training_settings.get("phase3_warm_start_path", None)
-    if not (resume and ckpt_last.exists()) and p3_warm is not None:
-        warm_p3_path = Path(p3_warm).resolve()
-        if warm_p3_path.exists():
-            print(f"[Phase-3] Warm-starting from {warm_p3_path}")
-            _warm_ckpt = torch.load(str(warm_p3_path), map_location="cpu", weights_only=True)
-            _msg = model.load_state_dict(_warm_ckpt["model_state"], strict=False)
-            print(f"[Phase-3] Warm-start load: missing={len(_msg.missing_keys)} unexpected={len(_msg.unexpected_keys)}")
-            model.to(device)
-            _freeze_backbone_only(model)
-            optimizer = _make_p3_optimizer(model)
         if opt_state is not None:
             optimizer.load_state_dict(opt_state)
         start_epoch += 1
