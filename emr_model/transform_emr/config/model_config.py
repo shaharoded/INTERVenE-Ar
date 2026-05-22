@@ -87,6 +87,16 @@ TRAINING_SETTINGS = {
         "plateau_patience":  [2],  # Patience per transition: [0→1]
     },
 
+    # U (direction A): Scheduled sampling via noisy teacher forcing.
+    # During Phase 2 training, at each step replace `ss_p` fraction of input
+    # CONTENT tokens (concept_ids, value_ids, parent_raw_ids) with [MASK] —
+    # forcing the model to predict despite incomplete context. Anneals from
+    # 0 to ss_p_max over [ss_start_epoch, ss_start_epoch + ss_anneal_epochs].
+    # Position-ids and abs-ts kept intact so the legality machinery still works.
+    "phase2_ss_p_max":        0.20,  # 20% of tokens masked at peak (matches Bengio et al.)
+    "phase2_ss_start_epoch":  10,    # start after BCE-only warmup + a few more epochs
+    "phase2_ss_anneal_epochs": 20,   # linear ramp 0→ss_p_max over 20 epochs
+
     # Outcome head — time-decayed soft labels.
     # For each position t the target for outcome k is:
     # sum_s { exp(-dt(t,s) / tau_k) * 1[token_s == outcome_k] }.clamp(0, 1)
