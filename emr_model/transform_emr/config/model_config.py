@@ -63,30 +63,23 @@ TRAINING_SETTINGS = {
 
     # Phase-2 auxiliary scheduler.
     # Multi-stage curriculum: stages unlock sequentially based on plateau detection.
-    #   Stage 0: [ce, dt, traj]  — active after bce_only_epochs, ramp immediately
-    #   Stage 1: [ranking]       — unlocked when stage-0 objectives plateau (after ramp)
+    #   Stage 0: [ce, dt]  — active after bce_only_epochs, ramp immediately
+    #   Stage 1: [outcome] — unlocked when stage-0 objectives plateau (after ramp)
     # Plateau is measured on vl_total (total weighted validation loss) and only checked
     # once the current stage's ramp has completed.
-    # Warmup ends after the ranking ramp completes (dynamic, set by scheduler).
-    # 'traj' (direction B): per-patient |log1p(Σ pred_Δt_hrs) − log1p(Σ true_Δt_hrs)|.
-    # Joined to stage 0 alongside dt because it's a foundational time-prediction
-    # signal (global cumulative pressure complementing dt's per-step MSE).
-    # fraction_cap = 0.30 keeps the calibrated weighted contribution between dt's
-    # 0.50 and ranking's 0.20 — meaningful share of BCE without dominating.
+    # Warmup ends after the outcome ramp completes (dynamic, set by scheduler).
     "phase2_scheduler": {
         "bce_only_epochs": 4,
         "aux_fraction_caps": {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
-            "traj":    0.30,    # Trajectory-length cap (sum-of-Δt match in log1p hours)
         },
-        "order": [["ce", "dt", "traj"], ["ranking"]],
+        "order": [["ce", "dt"], ["ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
             "ranking": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
-            "traj":    0,
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
