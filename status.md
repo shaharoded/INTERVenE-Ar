@@ -256,6 +256,116 @@ address. Will revisit A and C after E.
 **Verdict: DISCARD** — falsifiable hypothesis failed, multiple KEEP
 gates regress, no headline improvement.
 
+### Y-narrow-terminal-tau (direction E) — KEEP
+
+**Code SHA**: `b598835`. Backup: `emr_model/checkpoints.bak_keep_Y_narrow_terminal_tau/`.
+This is the new running best.
+
+**Hypothesis** (derived from X-traj-length's failure mechanism): the LM-head
+terminal-token soft-BCE kernel is the real gate on trajectory length at
+inference. The X-traj diagnostic showed terminal `log_tau_lm` drifted from
+its 168h init to 526-640h — the model's free choice is to make "terminal
+is near" target nonzero many hours before the actual terminal event. Narrow
+the terminal kernel to 24h *and freeze it* (init-only would drift back per
+the same diagnostic). Default and outcome (non-terminal) `log_tau_lm`
+entries remain learnable.
+
+Implementation: `_log_tau_terminal = math.log(24/336)` in `GPT.__init__`
+plus a backward hook on `log_tau_lm` that `masked_fill`s the gradient to 0
+at the two terminal token positions (DEATH_EVENT id=328, RELEASE_EVENT
+id=148). `log_tau_lm` is dim=1 → no_decay → weight_decay=0, so zero grad =
+zero AdamW update. The hook resolves the freeze mask through `self`
+each call so the buffer is read from its current device after
+`model.to(device)`.
+
+**Training** (with the infra-fix `num_workers=2`): Phase 2 ran the full
+50 epochs (best at the end, no early stop). All four schedule lambdas
+calibrated as expected: ce=0.098, dt=0.097, ranking=0.021 (no traj this
+time). Stage 1 unlocked at epoch 31, warmup completed at epoch 34.
+Phase 3 ran 48 epochs and **early-stopped** — first time in this loop
+the training converged within budget rather than being OOM-killed.
+22 Phase-3 "Current best" saves through the run.
+
+**Freeze verification** (loaded Phase-2 best ckpt after training):
+terminal log_tau stayed at -2.639057 with delta < 1e-7 from `log(24/336)`
+across both phases. Non-terminal outcome entries drifted normally
+(17.2h, 48.0h, 85.7h, 149.7h, 163.7h) — confirming selective freezing.
+Default tokens drifted to median 4.2h, similar to baseline.
+
+**Headline result** (vs bak_originals baseline):
+
+| metric | bak_orig | Y-narrow-terminal-tau | Δ |
+|---|---|---|---|
+| outcome_auroc | 0.4986 | **0.5042** | **+0.0056** |
+| outcome_auprc | 0.1063 | **0.1185** | **+0.0122** |
+| onset_mae_hrs | 64.98 | 62.35 | -2.6 h |
+| gen_median_steps | 5.0 | **16.0** | +11 steps |
+| gen_median_hours | 1.05 | **20.36** | **+19.3 h (20× longer)** |
+| gen_p90_hours | 6.22 | **77.98** | 12.5× |
+| gen_max_hours | 33.26 | **333.5** | reaches full 14-day horizon |
+| gen_n_with_terminal | 8561 | 8561 | same |
+| gen_frac_terminal_first24h | 0.999 | **0.542** | **-0.457** |
+| gen_length_mae_hrs | 115.10 | **87.99** | -27.1 h |
+| gen_to_gt_ratio_median | 0.010 | **0.197** | 20× |
+| gen_to_gt_ratio_mean | 0.019 | **0.282** | 15× |
+| multi_horizon cap=48 mean | 0.520 | 0.514 | -0.006 (well under 0.07) |
+| peak_vram_mb | 331 | 335 | unchanged |
+
+**KEEP gates check**:
+
+- Smoke gates A-D ✓ (gate C deferred to full run, where it passed).
+- Peak VRAM 335 MB ≪ 24 GB cap ✓.
+- ≥ 1 horizon-extended headline improves past noise floor:
+  outcome_auroc +0.006 ≥ 0.005 ✓ ; outcome_auprc +0.012 ≥ 0.005 ✓.
+- No headline regresses past noise floor ✓.
+- Truncated AUROC (multi_horizon cap=48 mean) drops 0.006, well under 0.07 ✓.
+- gen_median_hours strictly above running best (1.05 → 20.36) ✓.
+- gen_frac_terminal_first24h strictly below running best (0.999 → 0.542) ✓.
+
+**Per-outcome trade-offs (cap=48)**: DEATH 0.701 → 0.622 and HYPOGLY
+0.573 → 0.535 dropped because their "immediate terminal" signal is no
+longer being concentrated in the first hour. But DEATH at cap=168 went
+**up** (0.481 → 0.587) and at cap=336 stayed close to baseline (0.464 →
+0.493) — the discriminative signal is now spread across the actual
+trajectory rather than packed into the seed-end window. RELEASE 0.647
+→ 0.652 flat at cap=48 ; CARDIO 0.355 → 0.379 modestly up at cap=48
+and 0.449 → 0.471 in the natural-horizon `per_outcome` table.
+
+**Gate T3 (diagnose.py)**:
+- Report 1: mean teacher-forced LM AUROC 0.826 (HYPER 0.90, HYPOGLY
+  0.80, KIDNEY 0.71, CARDIO 0.89). No collapse; bottom outcomes are
+  not at 0.5.
+- Report 2: sigmoid separation 5.009 ≫ 0.05 floor; logit[pos]
+  −0.93 vs logit[neg] −5.94 (clean separation).
+- Report 4: ce=0.098, dt=0.097, ranking=0.021 — all ≥ 1e-3.
+- Outcome-head label alignment (eval_window=48 h): per-outcome AUROC
+  0.865-0.946 on the outcomes that have positives in the diagnostic
+  sample; mean gap 4.30 logits.
+- Δt probe Pearson r=0.335, R²=-0.009. R² < 0.05 BUT identical
+  to the bak_originals baseline (Δt head limitation pre-exists this
+  experiment), so not a regression.
+
+**Why it worked**: training the LM head's terminal soft-BCE kernel
+with a narrow (24h) tau means a terminal event 100h in the future
+contributes `exp(-100/24) ≈ 0.015` to the BCE target — essentially
+zero. The LM head is no longer rewarded for predicting "terminal" at
+every position; only when a terminal is actually within ~24h. At
+inference the model now waits longer before sampling a terminal
+token; median trajectory length is now 20% of the median patient
+horizon (was 1%).
+
+**What's still left**: 54% of patients still emit a terminal in the
+first 24h (was 99.9%), gen_to_gt_ratio_median 0.20 still far from
+1.0, multi_horizon at the full 336h horizon shows discrimination
+mostly limited to HYPER/HYPOGLY/KIDNEY (the chronic-metabolic
+outcomes) — DEATH/RELEASE/CARDIO drop below 0.5 at cap=336. So Y
+opens the trajectory but doesn't reach a publishable multi-day
+predictor on its own.
+
+**Verdict: KEEP** — first KEEP of the loop; running best moves to
+`bak_keep_Y_narrow_terminal_tau`. Future experiments compare against
+this state, not against bak_originals.
+
 ---
 
 ## 2. Architecture sweep
