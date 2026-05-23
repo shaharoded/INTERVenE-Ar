@@ -738,6 +738,59 @@ Added to total loss with `phase2_traj_length_lambda=1.0`.
 
 ---
 
+### Experiment W — Direction G: Long-Horizon Pairwise Ranking Aux (168 h)
+
+**Date:** 2026-05-23
+**Code commit:** `f8286ca` (DISCARD)
+**Compared against:** O2 (running best, AUROC 0.503 / AUPRC 0.137 / gen_median_hours 211).
+
+**Hypothesis (direction G "short→long curriculum"):** O2 stopped trajectory collapse but only nudged AUROC 0.499→0.503 because the Phase-2 outcome head only sees a ranking signal at 48 h horizon. Slow-developing outcomes (CARDIO, KIDNEY, RETINOPATHY) get hard-zeroed targets beyond 48 h; the backbone never learns to discriminate them. Add a second pairwise-ranking aux on the same outcome head at 168 h horizon, ramped over 10 epochs so the long-horizon signal grows after the short-horizon one anchors.
+
+**Change** (`f8286ca`):
+- `outcome_horizon_hours_long=168.0` (new config knob; 48 h horizon untouched everywhere else).
+- Phase-2 forward computes a second `outcome_targets_long` tensor at 168 h, reuses the same outcome head logits + same per-outcome `log_tau`, and emits a `ranking_long` raw loss.
+- `phase2_scheduler.aux_fraction_caps['ranking_long']=0.20`, `ramp_epochs=10`, stage-1 alongside `ranking` (which ramps in 3).
+
+**Smoke gates (pre-run):** A (no NaN), B (raw ranking_long=0.69 ≈ 1.7× BCE — in band), C (calibrated λ_max=0.0214 in [1e-3, 10]), D (full summary + multi_horizon + per_outcome blocks emit). All passed.
+
+**Post-train gates (T1-T3):**
+- **T1 raw descent:** Phase-2 best_val=0.0998 (vs O2 0.383 — lower because the dominant CE+DT terms continued descending; aux losses descended cleanly per epoch); Phase-3 train 0.93→0.80, val 0.79→0.81. ✓
+- **T2 warmup:** ranking stage calibrated at epoch 29 (plateau-triggered), ramp completed epoch 40. Early stop fired epoch 59. ✓
+- **T3 diagnose:** TF LM AUROC mean 0.845 (Hypergly 0.91, CARDIO 0.90, Hypogly 0.83, KIDNEY 0.74); logit separation 5.04; Δt R²=0.262. Internal discrimination is real. ✓
+
+**Full-run results (vs O2):**
+
+| Metric                        | O2 (best) | W          | Δ          | KEEP rule |
+|-------------------------------|-----------|------------|------------|-----------|
+| `outcome_auroc` (cap=336 h)   | 0.5034    | 0.4991     | −0.0043    | within ±0.005 |
+| `outcome_auprc`               | 0.1373    | 0.1082     | **−0.0291**| ✗ regresses past floor |
+| `onset_mae_hrs`               | 187.54    | 64.67      | −122.87    | (artefact of collapsed gen) |
+| `gen_median_hours`            | 211.6     | **0.79**   | **−210.8** | ✗ catastrophic collapse |
+| `gen_frac_terminal_first24h`  | 0.000     | **0.999**  | **+0.999** | ✗ catastrophic regression |
+| `gen_length_mae_hrs`          | 155.78    | 116.45     | −39.3 (irrelevant: gen ≈ 0) |
+| `gen_to_gt_ratio_median`      | ≈ 1.0     | 0.008      | ✗ collapsed |
+| multi_horizon mean AUROC cap=48 h  | — | 0.534    | (truncated capability degraded) |
+| multi_horizon mean AUROC cap=168 h | — | 0.502    | flat |
+| multi_horizon mean AUROC cap=336 h | — | 0.499    | flat |
+| `phase2_best_val`             | 0.383     | 0.100      | scale shift (new ranking_long term changes total) |
+| Peak VRAM                     | —         | 0.38 GB    | ✓ ≪ 24 GB |
+
+**Analysis:** All training-side gates pass — backbone is internally healthy (TF AUROC 0.84, separation 5.04, Δt R² 0.26). **Generation, however, has collapsed back to the pre-O2 failure mode** (median 0.79 h, 99.9 % terminal-in-24 h). The pairwise-ranking aux at 168 h forces the outcome head to score "patient will have outcome X within 168 h" — for ICU patients, that target is dominated by DEATH/RELEASE, both of which are terminal tokens. The shared backbone hidden states get steered toward "this position is near a terminal," and the LM head (which shares the backbone) translates that into "emit TERMINAL immediately." Direction G's premise (multi-day signal helps slow outcomes without hurting near-term capability) does not hold for a head that's tied to the LM via a shared backbone — the long-horizon ranking signal *amplifies* terminal-token confidence at every position.
+
+**Diagnostic confirmation (Report 5):** outcome tokens rank in the **bottom half** by grad/occ (HYPERGLY 276/316, INFECTION 267, NEUROVASCULAR 315), exactly the failure mode program.md warns about ("outcome tokens ranked in top-half by grad/occ"). Insulin/dosing tokens dominate gradient signal — the LM is learning to predict events, but outcome tokens themselves are starved of LM gradient.
+
+**Verdict: DISCARD.** AUPRC regresses by −0.029 (well outside ±0.005), generation catastrophically collapses (gen_median_hours 211 → 0.79, terminal_first24h 0.000 → 0.999), and Gate T3 token-rank check shows outcome tokens demoted to the bottom half. Headline AUROC drift was inside ±0.005 but every other KEEP criterion fails hard.
+
+**Implication for next step:** Direction G as a *training-side* signal layered onto the existing outcome head is ruled out for this architecture. The shared-backbone failure mode is structural. Two viable follow-ups (in order):
+
+1. **G alternative — outcome BCE at 168 h on its own head**, decoupled from LM token prediction. Risk: requires architectural separation (a second head with its own backbone projection), which violates the "M-256 architecture locked" rule. Skip unless we can do it as a frozen-backbone Phase-3-only fine-tune.
+2. **C — TTT regression head** (already DISCARDed once on the *broken* O backbone, never tried on O2 properly with a corrected `tr_aux` scale). Direction C's signal is *per-position distance to terminal*, not "outcome happens within horizon," so it should not over-amplify terminal-imminence. Worth trying next.
+3. **A revisit** — scheduled sampling at much lower `ss_p_max` (e.g. 0.05) without CBM, addressing the U DISCARD finding that ss_p=0.20+CBM over-noised.
+
+Picking **C-redo-on-O2** next: it tests the "distance, not imminence" framing the W result implicates.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
