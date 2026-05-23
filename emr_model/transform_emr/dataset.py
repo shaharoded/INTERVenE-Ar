@@ -1243,9 +1243,17 @@ def get_dataloader(
     Build a DataLoader for an EMRDataset.
     If `oversample=True`, uses a WeightedRandomSampler to balance terminal outcomes.
     """
-    # Set sensible default for num_workers
+    # Set sensible default for num_workers.
+    # Capped at 2 (not 4): api.py builds three persistent dataloaders
+    # (transformer_train, phase3_train, val), each forking num_workers copies
+    # of the dataset. With cpu_count=8 the previous default was 4 → 12 fork
+    # children. Copy-on-write keeps them cheap in raw bytes, but Python
+    # refcounting touches every PyObject on every access, gradually breaking
+    # COW and tripping the 46.6 GB cgroup oom-killer mid-Phase-3 (observed
+    # at epoch 37 of the X-traj-length run). Two workers per loader ⇒ 6
+    # forks total, ~½ the COW pressure with a small throughput hit.
     if num_workers is None:
-        num_workers = min(os.cpu_count(), 4) if torch.cuda.is_available() else 0
+        num_workers = min(os.cpu_count(), 2) if torch.cuda.is_available() else 0
 
     # Keep workers alive across epochs to avoid Python 3.11 multiprocessing teardown
     # crashes (AssertionError: can only test a child process) and tqdm rendering errors
