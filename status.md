@@ -162,6 +162,102 @@ overwriting the earlier per-outcome dump under the same commit hash).
 
 ---
 
+## Trajectory-fix loop
+
+Per `program.md`. Comparison reference for the first experiment is
+`bak_originals` re-evaluated in this environment (generation is stochastic
+with `temperature=1.0`, no seed): `outcome_auroc=0.4986`,
+`outcome_auprc=0.1063`, `gen_median_hours=1.05`, `gen_to_gt_ratio_median=0.010`,
+`gen_frac_terminal_first24h=0.999`, `gen_length_mae_hrs=115`,
+`multi_horizon cap=48` mean ≈ 0.58 (DEATH 0.70, RELEASE 0.65, HYPOGLY 0.57,
+HYPER 0.53, KIDNEY 0.47, CARDIO 0.36, seven rare outcomes at 0.499). The
+trajectory-collapse signature matches Section 1b above.
+
+A separate **infrastructure** commit (`c1810e8`, kept on the branch as it
+is not an experiment) makes `EMRDataset` pickle-friendly so api.py's
+processed_datasets.pt cache write no longer trips the 46.6 GB cgroup
+oom-killer. The `bak_originals` cache that previously sat in the repo
+was a 1-patient stub written after exactly this OOM — the
+infra fix lets api.py persist a real 39954/8562/8562-patient cache.
+
+### X-traj-length (direction B) — DISCARD
+
+**Code SHA**: `997c44f` (reverted after journal). Smoke + full run on the
+fresh-cache training data above. Phase 2 ran the full 50 epochs (no early
+stop, all four auxes calibrated by epoch 3: `ce=0.1019, dt=0.0977,
+traj=0.0084, ranking=0.0216 (post stage-1 unlock at epoch 30)`). Phase 3
+was killed by the cgroup oom at epoch 37 of 50 with the epoch-36 best
+ckpt persisted (`vl_select=0.695`, still descending — early stop never
+fired). Reporting on the epoch-36 Phase-3 ckpt: outcome-head behaviour
+is dominated by the backbone, which finished cleanly, so the headline
+trajectory metrics are honest even though the Phase-3 budget was
+truncated.
+
+**Hypothesis**: a per-patient `|log1p(Σ pred_Δt_hrs) − log1p(Σ true_Δt_hrs)|`
+auxiliary, summed over every non-pad position using the existing dt-head's
+output, would push `gen_length_mae_hrs ↓` and `gen_to_gt_ratio ↑` by adding
+end-to-end pressure on cumulative trajectory length on top of the per-step
+Δt MSE.
+
+**Headline result**:
+
+| metric | bak_orig | X-traj-length | Δ |
+|---|---|---|---|
+| outcome_auroc | 0.4986 | 0.4955 | -0.003 |
+| outcome_auprc | 0.1063 | 0.1008 | -0.006 |
+| onset_mae_hrs | 64.98 | 63.55 | -1.4 h |
+| gen_median_hours | 1.05 | 0.37 | **-0.7 h** (shorter, not longer) |
+| gen_to_gt_ratio_median | 0.0102 | 0.0035 | **-0.0067** (dropped, not risen) |
+| gen_frac_terminal_first24h | 0.999 | 1.000 | +0.001 |
+| gen_length_mae_hrs | 115.1 | 119.6 | +4.5 h |
+| multi_horizon cap=48 mean | 0.584 | 0.551 | -0.033 (within ±0.07) |
+
+Falsifiable hypothesis **fails**: the predicted trajectory got *shorter*,
+not longer; `gen_to_gt_ratio_median` halved instead of rising. The KEEP
+gate "≥ 1 horizon-extended headline improves past noise floor" is not met
+by any of AUROC / AUPRC / MAE. Two additional KEEP gates regress:
+`gen_median_hours` (below baseline) and `gen_frac_terminal_first24h`
+(at the ceiling).
+
+**Per-outcome (cap=48) split**: DEATH 0.70 → 0.96, RELEASE 0.65 → 0.87
+both jump ~0.25 — the model became sharper at "this short window
+contains a terminal" without actually extending generation. CARDIO drops
+0.36 → 0.22; KIDNEY 0.47 → 0.43. So the aux moved DEATH/RELEASE
+calibration without changing the *length* the model emits before
+terminating; the head is just confidently predicting "terminal soon".
+
+**Why it failed (mechanism)**: `pred_Δt = sigmoid(gate) · softplus(mag)`
+is non-negative. The traj loss penalises `|sum_pred − sum_true|` in
+log1p hours but does **not** distinguish "many small Δts that sum to S"
+from "fewer larger Δts that sum to S". With per-step MSE already pulling
+each Δt toward the true (mostly small) per-event interval, the optimum
+the model reaches is *shorter* per-step Δt and *more* of them within
+teacher-forced training — which is the OPPOSITE of what is needed at
+inference, where the model decides *when to stop* via the LM head's
+terminal-token probability. The traj loss never touches that decision.
+The fundamental gating for trajectory length sits in the LM head's
+terminal kernel (the `log_tau_lm` for terminal tokens, init 168h), not
+in the magnitude of per-step Δt.
+
+**Diagnostic implications for direction selection**: future training-side
+attempts should target the terminal-emission decision (LM head's
+terminal posterior) rather than the time-magnitude side. Direction C
+(time-to-terminal regression head) is similar in spirit to B — adds a
+backbone-side signal that doesn't directly change the LM-head terminal
+probability — and is at risk of the same failure mode. Direction E
+(narrow terminal `tau_lm` so the soft-BCE kernel only treats a terminal
+token as "near" within ~12-24 h instead of 168 h) most directly
+addresses the LM-head terminal-emission decision; I'll try it next, even
+though the program.md ordering puts it under "secondary". Direction A
+(scheduled sampling) is the other candidate — it closes the
+train/inference gap, which is the gap the traj loss tried and failed to
+address. Will revisit A and C after E.
+
+**Verdict: DISCARD** — falsifiable hypothesis failed, multiple KEEP
+gates regress, no headline improvement.
+
+---
+
 ## 2. Architecture sweep
 
 Four architecture sizes evaluated. Each row is a unique
