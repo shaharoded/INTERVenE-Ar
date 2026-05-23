@@ -947,7 +947,27 @@ class EMRDataset(Dataset):
         )
 
         self.patient_ids = self.tokens_df['PatientId'].unique()
-        self.patient_groups = {pid: self.tokens_df[self.tokens_df['PatientId'] == pid] for pid in self.patient_ids}
+        # Group once via pandas groupby (O(N), uses pandas' internal C-level
+        # grouping) instead of the previous O(N²) dict-of-boolean-filters,
+        # which on the full 16.9M-row training split materialised 40k slice
+        # DataFrames and overran the 46.6 GB cgroup during torch.save.
+        self.patient_groups = dict(tuple(self.tokens_df.groupby("PatientId", sort=False)))
+
+    def __getstate__(self):
+        # patient_groups is a redundant view over tokens_df: pickling 40k slice
+        # DataFrames OOMs the cgroup during torch.save (api.py processed_datasets
+        # cache write). We persist only tokens_df + light attrs and rebuild
+        # patient_groups in __setstate__ via the same groupby used in __init__.
+        state = self.__dict__.copy()
+        state["patient_groups"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.patient_groups is None and self.tokens_df is not None:
+            self.patient_groups = dict(
+                tuple(self.tokens_df.groupby("PatientId", sort=False))
+            )
 
     def __encode_parent_list(self, parents: List[str]) -> List[int]:
         ids = []
