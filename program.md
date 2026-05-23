@@ -122,15 +122,45 @@ too: any aux whose raw magnitude differs from BCE by 4+ orders gets
 
 ### Primary — credible gradient path to terminal-token decision
 
-- **C. Time-to-terminal regression head.** Add an auxiliary head
-  predicting `log1p(t_terminal − t_now)` at every non-terminal position;
-  MSE against the GT time. The head shares the backbone with the LM
-  head, so the gradient forces the backbone representation to encode
+- **C. Time-to-terminal regression head** (cheapest of the primaries —
+  try first). Add an auxiliary head predicting
+  `log1p(t_terminal − t_now)` at every non-terminal position; MSE
+  against the GT time. The head shares the backbone with the LM head,
+  so the gradient forces the backbone representation to encode
   distance-to-terminal — which the LM head can then use to decide *when*
-  to emit DEATH/RELEASE. Direct attack on the failure mode.
+  to emit DEATH/RELEASE. Direct attack on the failure mode; one extra
+  head + one MSE term — minimal engineering surface.
   *Falsifiable*: head R² > 0.3; `mae_release_hrs` / `mae_death_hrs` drop;
   `gen_median_hours` rises; LM head's terminal logits shift across
   positions accordingly.
+
+- **B-rollout. Scheduled multi-step rollout with sequence-level length
+  loss** (reformulated B; the dead TF-only B is ruled out below). Try
+  if C doesn't move the needle — it's the more expensive but more
+  direct attack. Phase 2 starts with pure teacher forcing (existing
+  BCE / CE / dt losses). After `bce_only_epochs`, anneal a rollout
+  depth `k` from 1 upward across epochs — at the last `k` positions of
+  each sequence the model emits its own token (Gumbel-softmax with
+  annealed temperature τ: 2.0 → 0.5) and uses its own Δt prediction.
+  Per-position BCE / CE / dt losses still apply at rolled-out positions,
+  but they're now measured on the model's *own* output distribution.
+  Additionally, a **sequence-level length loss** on the rollout:
+  `|log1p(Σ_rollout pred_Δt_hrs) − log1p(target_rollout_horizon_hrs)|`.
+  This is the gradient path X lacked: emitting terminal early in rollout
+  → tiny Σ → high length loss → backprop pushes the LM-head terminal
+  logit down. Naturally combines A (scheduled sampling) + B (length
+  loss); as `k` grows the model's effective training distribution
+  shifts smoothly from TF to autoregressive.
+  *Falsifiable*: at end of training (k_max ~ 16–32), rolled-out
+  `gen_median_hours` matches GT within ±25 % on the smoke checkpoint;
+  `gen_frac_terminal_first24h` drops; 48 h `multi_horizon` AUROC
+  doesn't drop more than 0.07 below baseline.
+  *Engineering risks*: memory (k extra forward passes retained for
+  backward — likely halve batch + double grad-accum); gradient noise
+  (anneal both k AND τ slowly); Gumbel-softmax stability (start τ=2,
+  anneal to 0.5 not 0). Watch raw length-loss magnitude vs BCE for the
+  Gate-B check — keep both within 1–2 orders of magnitude.
+
 - **G. Short → long horizon curriculum.** Phase-2 loss = weighted mix of
   next-48 h BCE (preserves 0.918) + multi-day cumulative signal,
   multi-day weight ramped up across epochs. Anchored on what the model
@@ -138,6 +168,7 @@ too: any aux whose raw magnitude differs from BCE by 4+ orders gets
   prediction horizon without abandoning near-term.
   *Falsifiable*: end of training, 48 h `multi_horizon` AUROC ≥ 0.91 AND
   336 h clearly above 0.45.
+
 - **D. Discrete-time hazard for terminals.** Replace BCE on DEATH/RELEASE
   with a hazard head predicting `P(terminal in [t, t+Δ])` over log-spaced
   Δ bins; structured time-to-terminal supervision. Direct attack on the
@@ -167,17 +198,15 @@ too: any aux whose raw magnitude differs from BCE by 4+ orders gets
 
 ### Ruled out
 
-- **B. Trajectory-length loss on teacher-forced dt-head outputs.** X
-  (experiment) DISCARDed; post-hoc analysis showed the loss formulation
-  has **no gradient path to the LM head's terminal-token decision** —
-  it only constrains the dt head's per-step Δt predictions during
-  teacher forcing (which the per-step dt MSE already covers), and the
-  dt head is decoupled from token choice at inference. The observed
-  `log_tau_lm` drift in X is a downstream symptom, not the cause.
-  A retry with a fundamentally different formulation could work — e.g.
-  **autoregressive generation during training** with a length penalty
-  on the generated trajectory (not on TF outputs). Without that
-  reformulation, B is closed.
+- **B (original — TF-only trajectory-length loss).** X DISCARDed;
+  post-hoc analysis showed the loss formulation has **no gradient path
+  to the LM head's terminal-token decision** — it only constrains the
+  dt head's per-step Δt predictions during teacher forcing (which the
+  per-step dt MSE already covers), and the dt head is decoupled from
+  token choice at inference. The `log_tau_lm` drift in X is a downstream
+  symptom, not the cause. The legitimate reformulation is **B-rollout**
+  above — same length-loss intuition, but applied to autoregressive
+  rollout output where the gradient actually reaches the LM head.
 
 ### Inference-side — only after the backbone is honest
 
