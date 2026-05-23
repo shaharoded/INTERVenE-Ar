@@ -112,39 +112,72 @@ banned (the previous session's failure mode).
 
 ## Research directions
 
-Ordered by leverage. **Loss / training first** — teach the model *when*
-to stop. Inference-side tweaks only after the backbone has been honestly
-improved.
+Ordered by **whether the gradient actually reaches the failure mode**.
+Generation length at inference is set by **when the LM head emits a
+terminal token** (DEATH/RELEASE). A direction is high-priority iff its
+loss / mechanism has a credible gradient path to that terminal-token
+decision (directly or via the shared backbone). Loss-scale matters
+too: any aux whose raw magnitude differs from BCE by 4+ orders gets
+`λ ≈ 1e-6` after calibration and isn't trained.
 
-### Primary — train the model to know when to finish
+### Primary — credible gradient path to terminal-token decision
 
-Loss-scale matters more than novelty: any aux whose raw magnitude differs
-from BCE by 4+ orders gets `λ ≈ 1e-6` after calibration and isn't trained.
+- **C. Time-to-terminal regression head.** Add an auxiliary head
+  predicting `log1p(t_terminal − t_now)` at every non-terminal position;
+  MSE against the GT time. The head shares the backbone with the LM
+  head, so the gradient forces the backbone representation to encode
+  distance-to-terminal — which the LM head can then use to decide *when*
+  to emit DEATH/RELEASE. Direct attack on the failure mode.
+  *Falsifiable*: head R² > 0.3; `mae_release_hrs` / `mae_death_hrs` drop;
+  `gen_median_hours` rises; LM head's terminal logits shift across
+  positions accordingly.
+- **G. Short → long horizon curriculum.** Phase-2 loss = weighted mix of
+  next-48 h BCE (preserves 0.918) + multi-day cumulative signal,
+  multi-day weight ramped up across epochs. Anchored on what the model
+  already does well; the curriculum forces the LM head to extend its
+  prediction horizon without abandoning near-term.
+  *Falsifiable*: end of training, 48 h `multi_horizon` AUROC ≥ 0.91 AND
+  336 h clearly above 0.45.
+- **D. Discrete-time hazard for terminals.** Replace BCE on DEATH/RELEASE
+  with a hazard head predicting `P(terminal in [t, t+Δ])` over log-spaced
+  Δ bins; structured time-to-terminal supervision. Direct attack on the
+  LM head's terminal output.
+  *Falsifiable*: terminal MAE drops; calibrated hazard CDF matches GT
+  terminal-time distribution within ~24 h.
 
-- **B. Trajectory-length loss.** Penalise `|sum_pred_Δt − sum_true_Δt|`
-  per patient. `pred_abs`, `true_abs` are normalised to [0, 1]; keep the
-  loss in O(1) — use log1p-hours or MAE, not raw squared normalised
-  units. *Falsifiable*: `gen_length_mae_hrs` drops; `gen_to_gt_ratio` rises.
-- **C. Time-to-terminal regression head.** Auxiliary regression on
-  `log1p(t_terminal − t_now)` at every non-terminal position. The
-  backbone learns *distance* to discharge/death, not just *imminence*.
-  *Falsifiable*: head R² > 0.3; terminal MAE drops.
+### Secondary — addresses adjacent issues, not the terminal decision directly
+
 - **A. Scheduled sampling.** Anneal teacher-forcing replacement
-  `p: 0 → ~0.3` across Phase 2. Closes the train/inference gap.
-  *Falsifiable*: median generation length rises monotonically with `p`.
-- **G. Short → long horizon curriculum.** Phase 2 loss = weighted mix of
-  next-48 h BCE (preserves 0.918) + multi-day cumulative term, multi-day
-  weight ramping up. *Falsifiable*: end of training, 48 h
-  `multi_horizon` AUROC ≥ 0.91 *and* 336 h clearly above 0.45.
+  `p: 0 → ~0.3` across Phase 2. Closes the train/inference distribution
+  gap — important if the failure mode partly reflects exposure bias.
+  Doesn't directly target the terminal-token decision; pairs naturally
+  with C or G.
+  *Falsifiable*: median generation length rises monotonically with `p`
+  on an in-training probe.
 
-### Secondary
+### Symptom-attacking — last resort, not root cause
 
-- **D. Discrete-time hazard for terminals** (replace BCE on DEATH/RELEASE
-  with hazard bins, sample terminal time from the distribution). Larger
-  structural change.
-- **E. Narrow terminal `tau_lm`** (current 168 h kernel teaches "terminal
-  is always near"; try 12–24 h, or down-weight terminal in `pos_weight`).
-  Small surface; may not be enough on its own.
+- **E. Narrow terminal `tau_lm`** (frozen). Tries to make the LM head's
+  terminal soft-kernel narrower so terminal BCE targets aren't positive
+  at distant positions. Attacks the kernel-widening symptom, not the
+  upstream "model doesn't know when terminal should come" cause. Y
+  (current run) is the freeze-via-gradient-hook version. A prior
+  initialise-only attempt landed flat; if Y is flat too, the direction
+  is exhausted.
+
+### Ruled out
+
+- **B. Trajectory-length loss on teacher-forced dt-head outputs.** X
+  (experiment) DISCARDed; post-hoc analysis showed the loss formulation
+  has **no gradient path to the LM head's terminal-token decision** —
+  it only constrains the dt head's per-step Δt predictions during
+  teacher forcing (which the per-step dt MSE already covers), and the
+  dt head is decoupled from token choice at inference. The observed
+  `log_tau_lm` drift in X is a downstream symptom, not the cause.
+  A retry with a fundamentally different formulation could work — e.g.
+  **autoregressive generation during training** with a length penalty
+  on the generated trajectory (not on TF outputs). Without that
+  reformulation, B is closed.
 
 ### Inference-side — only after the backbone is honest
 
