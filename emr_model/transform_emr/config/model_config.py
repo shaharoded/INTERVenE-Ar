@@ -14,14 +14,14 @@ MODEL_CONFIG = {
       "embed_dim": 256,
       "n_head": 4,
       "n_layer": 4,
-      "dropout": 0.10,
+      "dropout": 0.1,
       "bias": True,
     }
 
 TRAINING_SETTINGS = {
     "phase1_n_epochs": 50,
-    "phase2_n_epochs": 100,
-    "phase3_n_epochs": 100,
+    "phase2_n_epochs": 50,
+    "phase3_n_epochs": 50,
     "sample": None,  # set to int (e.g. 50) for a quick smoke-test
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
@@ -33,7 +33,7 @@ TRAINING_SETTINGS = {
     "phase1_learning_rate": 3e-4,
     "phase2_learning_rate": 3e-4,
     "phase3_learning_rate":       1e-4,
-    "phase3_backbone_lr_factor":  0.01,  # M-256 baseline setting
+    "phase3_backbone_lr_factor":  0.01,  # backbone LR = phase3_lr * factor (1e-6); 0.0 = fully frozen
     "phase3_weight_decay":        1e-3,  # weight decay for outcome_head in P3 (matches backbone)
     "weight_decay": 1e-3,
 
@@ -74,14 +74,12 @@ TRAINING_SETTINGS = {
             "ce":      0.50,    # Next-token CE nudge cap
             "dt":      0.50,    # Time regression cap
             "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
-            "traj":    0.30,    # Trajectory-length cumulative-Δt loss (direction B)
         },
-        "order": [["ce", "dt", "traj"], ["ranking"]],
+        "order": [["ce", "dt"], ["ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
-            "traj":    0,   # Activates with stage-0 auxiliaries; calibrated at first active epoch
-            "ranking": 3,   # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
+            "ranking": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]

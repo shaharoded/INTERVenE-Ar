@@ -684,10 +684,7 @@ class GPT(nn.Module):
 
 
     @classmethod
-    def load(cls, path, embedder, map_location=None):
-        import torch as _t
-        if map_location is None:
-            map_location = _t.device("cuda" if _t.cuda.is_available() else "cpu")
+    def load(cls, path, embedder, map_location="cpu"):
         ckpt = torch.load(path, map_location=map_location, weights_only=True)
 
         if "config" not in ckpt:
@@ -892,8 +889,8 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
         else:
             model.eval()
 
-        total_loss = total_bce = total_ce = total_dt = total_ranking = total_traj = 0.0
-        total_ce_raw = total_dt_raw = total_ranking_raw = total_traj_raw = 0.0
+        total_loss = total_bce = total_ce = total_dt = total_ranking = 0.0
+        total_ce_raw = total_dt_raw = total_ranking_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -1032,26 +1029,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 abs_t_loss_raw = gate_loss + mag_loss
                 abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
-                # O (direction B): trajectory-length loss — SCHEDULER-INTEGRATED.
-                # Penalises systematic Δt-prediction bias that per-position MSE
-                # misses. Per-position MSE only minimises |pred[t] - true[t]|² per
-                # step — if the model under-predicts Δt by a small amount at every
-                # step, the per-position MSE is small but the cumulative trajectory
-                # is far too short. The cumulative MSE here captures this compound
-                # bias: predicted total Δt over the sequence must match true total span.
-                #
-                # CRITICAL: λ_traj is now calibrated by the LambdaScheduleController
-                # (lambdas["traj"]) at the first active epoch as fraction_cap *
-                # tr_bce / tr_traj_raw, so traj_loss is bounded at fraction_cap × BCE
-                # rather than dominating gradients (the bug in the original O run
-                # where raw λ=1.0 made traj_loss=29555 vs BCE=0.42, freezing BCE/CE).
-                pred_dt_seq  = (pred_abs - batch["abs_ts"][:, :-1]) * nonpad.float()
-                true_dt_seq  = (batch["abs_ts"][:, 1:] - batch["abs_ts"][:, :-1]) * nonpad.float()
-                pred_total   = pred_dt_seq.sum(dim=-1)   # [B]
-                true_total   = true_dt_seq.sum(dim=-1)   # [B]
-                traj_length_loss_raw = F.mse_loss(pred_total, true_total, reduction="mean")
-                traj_length_loss = traj_length_loss_raw * lambdas.get("traj", 0.0)
-
                 # === Outcome Loss — Time-Decayed Soft Labels ===
                 # For each position t, the target for outcome k is a soft risk score:
                 # sum_s { exp(-dt(t,s) / tau) * 1[token_s == outcome_k] }.clamp(0, 1)
@@ -1084,14 +1061,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + traj_length_loss
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "traj": traj_length_loss, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1126,8 +1103,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_ce_raw      += loss_ce_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
-                total_traj        += traj_length_loss.item()
-                total_traj_raw    += traj_length_loss_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1147,24 +1122,22 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_ce      / n_batches,
             total_dt      / n_batches,
             total_ranking / n_batches,
-            total_traj    / n_batches,
             total_ce_raw      / n_batches,
             total_dt_raw      / n_batches,
             total_ranking_raw / n_batches,
-            total_traj_raw    / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_traj, tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_traj_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_traj, _, _, _, _                                       = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ce_raw, tr_dt_raw, tr_ranking_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, _, _, _                              = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f}, Traj={tr_traj:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f}, Traj={vl_traj:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f} traj={tr_traj_raw:.7f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1173,7 +1146,6 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             ce=tr_ce_raw,
             dt=tr_dt_raw,
             ranking=tr_ranking_raw,
-            traj=tr_traj_raw,
         )
         for msg in schedule_events:
             print(msg)
@@ -1422,8 +1394,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
     for epoch in range(start_epoch, start_epoch + n_epochs):
         tr = run_epoch(train_dl, train_flag=True)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
         vl = run_epoch(val_dl,   train_flag=False)
 
         # One-shot λ_ranking calibration at the end of epoch 1 (mirrors P2).

@@ -109,19 +109,12 @@ def _sample_tokens(next_logits, temperature, top_k):
     """
     Sample (or argmax) the next token from [B, V] logits.
     Returns LongTensor [B].
-    When temperature > 1.0 and top_k is None, uses full-vocabulary multinomial
-    sampling — argmax is kept only at temperature == 1.0 (the steady-state).
     """
     if top_k:
         topv, topi = torch.topk(next_logits, top_k, dim=-1)
         probs = F.softmax(topv / temperature, dim=-1)
         idx   = torch.multinomial(probs, 1).squeeze(-1)          # [B]
         return topi[torch.arange(topi.shape[0], device=topi.device), idx]
-    elif temperature > 1.0:
-        # Softmax over full vocabulary at elevated temperature — enables escape
-        # from the immediate-terminal local minimum without any hard rule.
-        probs = F.softmax(next_logits / temperature, dim=-1)
-        return torch.multinomial(probs, 1).squeeze(-1)           # [B]
     else:
         return torch.argmax(next_logits / temperature, dim=-1)   # [B]
 
@@ -139,12 +132,7 @@ def generate(model,
              batch_size=16,
              collect_risk_scores=False,
              tqdm_position=0,
-             tqdm_desc='Generating',
-             temperature_start=1.0,
-             temperature_anneal_steps=10,
-             hazard_suppress=False,
-             hazard_min_hours=24.0,
-             freeze_risk_at_seed=False):
+             tqdm_desc='Generating'):
     """
     Unified autoregressive generation for all patients in *dataset*.
 
@@ -165,9 +153,8 @@ def generate(model,
             14 days by default) so Time2Vec stays in-distribution. Going past
             this point produces meaningless extrapolated embeddings.
         max_len (int): Hard ceiling on new tokens per patient (safety only).
-        temperature (float): Steady-state softmax temperature (1.0 = neutral;
-            also the final temperature after annealing when temperature_start > 1).
-        top_k (int | None): Top-k sampling; argmax if None (and temperature == 1).
+        temperature (float): Softmax temperature (1.0 = neutral).
+        top_k (int | None): Top-k sampling; argmax if None.
         rep_decay (float): Repetition penalty strength (0 = disabled).
         batch_size (int): Patients processed in parallel.
         collect_risk_scores (bool): When True, attach outcome-head probabilities
@@ -175,37 +162,6 @@ def generate(model,
             step, same efficiency as the decode forward pass itself.  When False
             only Token / TimePoint / IsInput / IsOutcome / IsTerminal are emitted.
         tqdm_position, tqdm_desc: tqdm display controls.
-        temperature_start (float): Initial temperature for the F2 annealing schedule
-            (default 3.0). When > temperature, sampling switches from argmax to
-            full-vocab multinomial for the first temperature_anneal_steps steps,
-            then exponentially decays back to temperature.  This lets the model
-            escape the immediate-terminal local minimum without any hard rule.
-            Set equal to temperature (e.g. temperature_start=1.0) to disable.
-        temperature_anneal_steps (int): Steps over which to decay temperature_start
-            → temperature (default 10).  After this many generated tokens the
-            steady-state temperature applies.
-        hazard_suppress (bool): F3 flag. When True, uses the outcome head's predicted
-            P(DEATH or RELEASE in next 48 h) at the seed-end position to draw a
-            per-patient terminal suppression time T from an Exponential distribution
-            (E[T] = 48 / p_terminal hours), clamped to ≥ hazard_min_hours. Terminal
-            tokens (DEATH/RELEASE) are masked to −∞ until elapsed generated time ≥ T.
-        hazard_min_hours (float): Hard floor for drawn terminal suppression times
-            (default 24.0 h). Ensures no patient terminates within the first 24 h
-            of generated time even if the outcome head predicts very high terminal risk.
-        freeze_risk_at_seed (bool): F4 flag. When True (default), the outcome-head
-            probabilities used to score every generated window are frozen to the
-            seed-end prediction rather than re-evaluated at each decode step.
-            Motivation: the outcome head was calibrated on real teacher-forced
-            trajectories. After 50+ generated tokens the hidden state drifts from
-            the training distribution (covariate shift), producing unreliable —
-            sometimes inverted — risk scores mid-trajectory.  The seed-end
-            prediction is computed from real patient context (the full 2-day seed)
-            and reflects the model's calibrated between-patient discrimination
-            (AUROC ~0.91 in the truncated eval).  Because between-patient pairs
-            dominate AUROC (>99% of positive/negative pairs), freezing scores
-            preserves almost all discriminative signal while eliminating the
-            covariate-shift noise. Default True because evaluation.py is locked
-            and cannot pass this argument explicitly; DISCARD reverts the commit.
 
     Returns:
         pd.DataFrame with columns PatientId, Step, TimePoint, Token, IsInput,
@@ -264,15 +220,6 @@ def generate(model,
             if collect_risk_scores:
                 input_probs = torch.sigmoid(input_outcome_logits).cpu().numpy()  # 1 sync [B, T_max, K]
 
-            # F4: capture seed-end outcome probabilities once per batch.
-            # All generated positions will use these instead of mid-trajectory
-            # outcome head outputs, eliminating covariate-shift noise.
-            frozen_probs_cpu = None
-            if freeze_risk_at_seed and collect_risk_scores:
-                frozen_probs_cpu = torch.sigmoid(
-                    input_outcome_logits[torch.arange(B, device=device), last_valid_idx, :]
-                ).cpu().numpy()  # [B, K]
-
             # ── log input tokens ──────────────────────────────────────────
             # Bulk CPU transfers: 3 syncs total (+ 1 for risk scores above).
             pos_ids_cpu = pos_ids.cpu().tolist()
@@ -315,23 +262,6 @@ def generate(model,
             time_exceeded = current_abs_ts >= max_abs_ts_norm
             finished      = finished | time_exceeded
 
-            # F3: draw per-patient terminal suppression times from outcome head.
-            # p_terminal = P(DEATH or RELEASE in next 48 h) at seed-end position.
-            # T ~ Exp(rate = p_terminal / 48h), clamped to >= hazard_min_hours.
-            # Terminal tokens are suppressed until elapsed generated hours >= T.
-            hazard_min_t = None
-            if hazard_suppress:
-                terminal_outcome_idxs = [i for i, n in enumerate(model.outcome_names)
-                                          if n in set(TERMINAL_OUTCOMES)]
-                if terminal_outcome_idxs:
-                    seed_outcome = input_outcome_logits[
-                        torch.arange(B, device=device), last_valid_idx
-                    ][:, terminal_outcome_idxs]                      # [B, n_term]
-                    p_term = torch.sigmoid(seed_outcome).max(dim=-1).values.clamp(1e-4, 1 - 1e-4)
-                    u = torch.rand(B, device=device).clamp(1e-6, 1 - 1e-6)
-                    drawn = -torch.log(u) * (48.0 / p_term)          # [B] hours
-                    hazard_min_t = drawn.clamp(min=hazard_min_hours)  # [B] hours
-
             cache_mask        = (pos_ids != pad_id)
             open_counts, next_meal_rank = init_legality_state_batched(luts, pos_ids)
             last_tokens_batch = [[] for _ in range(B)]
@@ -355,25 +285,7 @@ def generate(model,
                     next_logits[finished] = float("-inf")
                     next_logits[finished, pad_id] = 0.0
 
-                # F3: suppress terminal tokens for patients whose elapsed generated time
-                # is below their drawn hazard threshold.
-                if hazard_min_t is not None and terminal_ids:
-                    elapsed_gen_hours = (current_abs_ts - last_seed_ts).clamp(min=0) * 336.0
-                    suppress = (elapsed_gen_hours < hazard_min_t) & ~finished
-                    if suppress.any():
-                        for tid in terminal_ids:
-                            next_logits[suppress, tid] = float("-inf")
-
-                # F2: exponential annealing schedule from temperature_start → temperature.
-                # When temperature_start > temperature, the first temperature_anneal_steps
-                # tokens are sampled from a flatter distribution to escape the terminal
-                # local minimum.  After the schedule, the steady-state temperature applies.
-                if temperature_start > temperature and temperature_anneal_steps > 0:
-                    t_frac   = min(1.0, steps / temperature_anneal_steps)
-                    step_temp = temperature_start * ((temperature / temperature_start) ** t_frac)
-                else:
-                    step_temp = temperature
-                next_token_ids = _sample_tokens(next_logits, step_temp, top_k)
+                next_token_ids = _sample_tokens(next_logits, temperature, top_k)
 
                 open_counts, next_meal_rank = update_legality_state_batched(
                     luts, next_token_ids, open_counts, next_meal_rank, finished)
@@ -461,16 +373,10 @@ def generate(model,
 
                 # Fill outcome probs for this step — 1 bulk sync for the whole batch.
                 if collect_risk_scores and step_row_idx:
-                    if frozen_probs_cpu is not None:
-                        # F4: use seed-end frozen probs (no GPU sync needed here).
-                        for bi, row_idx in step_row_idx.items():
-                            for j, col in enumerate(outcome_cols):
-                                rows[row_idx][col] = float(frozen_probs_cpu[bi, j])
-                    else:
-                        step_probs_cpu = torch.sigmoid(outcome_logits_dec[:, 0, :]).cpu().numpy()
-                        for bi, row_idx in step_row_idx.items():
-                            for j, col in enumerate(outcome_cols):
-                                rows[row_idx][col] = float(step_probs_cpu[bi, j])
+                    step_probs_cpu = torch.sigmoid(outcome_logits_dec[:, 0, :]).cpu().numpy()
+                    for bi, row_idx in step_row_idx.items():
+                        for j, col in enumerate(outcome_cols):
+                            rows[row_idx][col] = float(step_probs_cpu[bi, j])
 
             # ── terminal fallback for patients that exited without natural terminal ─────
             # Triggers when a patient hit max_duration_hours OR max_len.
@@ -500,12 +406,8 @@ def generate(model,
                         "IsTerminal": 1,
                     }
                     if collect_risk_scores:
-                        if frozen_probs_cpu is not None:
-                            for j, col in enumerate(outcome_cols):
-                                row[col] = float(frozen_probs_cpu[bi, j])
-                        else:
-                            for col in outcome_cols:
-                                row[col] = 0.0
+                        for col in outcome_cols:
+                            row[col] = 0.0   # no forward pass for the forced token
                     rows.append(row)
 
     # ── post-generation report ────────────────────────────────────────────────
