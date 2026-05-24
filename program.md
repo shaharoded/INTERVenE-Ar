@@ -41,25 +41,53 @@ across model experiments. **No mid-training resume ever happens.** Don't
 use `phase2_warm_start_path` / `phase3_warm_start_path` — that pattern is
 banned (the previous session's failure mode).
 
-## Goal — current → target
+## Goal — three coupled objectives, not one
 
-| Metric (current)                     | Direction |
-|--------------------------------------|-----------|
-| `outcome_auroc` 0.452                | ↑ |
-| `outcome_auprc` 0.107                | ↑ |
-| `gen_length_mae_hrs` ~140            | ↓ |
-| `gen_to_gt_ratio_median` ~0          | → 1.0 |
-| `gen_frac_terminal_first24h` 1.0     | ↓ |
-| Truncated AUROC (cap=48 h) 0.918     | preserve (don't drop > 0.07) |
+Closing the gap is **simultaneously** about:
+
+1. **Trajectory collapse** — generation length and termination timing
+   (`gen_to_gt_ratio_median`, `gen_frac_terminal_first24h`, `gen_length_mae_hrs`).
+2. **Full-trajectory AUC** — horizon-extended ranking & precision-recall
+   (`outcome_auroc`, `outcome_auprc`, multi_horizon cap=336h).
+3. **Short-term AUC** — preserve the strong next-48h capability
+   (`multi_horizon` cap=48h ≥ canonical −0.07).
+
+A fix that solves (1) at the cost of (2) or (3) isn't a fix — it's a
+trade. The expectation is that **several different strategies will be
+needed**, each addressing one or two of the three. No single experiment
+has to solve everything; the goal is for the running-best stack to
+collectively close all three.
+
+| Metric (current)                     | Direction | Tied to |
+|--------------------------------------|-----------|---------|
+| `outcome_auroc` 0.452                | ↑         | (2) full AUC |
+| `outcome_auprc` 0.107                | ↑         | (2) full AUC |
+| `gen_length_mae_hrs` ~140            | ↓         | (1) collapse |
+| `gen_to_gt_ratio_median` ~0          | → 1.0     | (1) collapse |
+| `gen_frac_terminal_first24h` 1.0     | ↓         | (1) collapse |
+| multi_horizon cap=48h AUROC mean     | preserve  | (3) short-term |
 
 ## The loop
 
-**Two-pass screening for speed.** New strategies first run on a **10 000
-patient sample** (~4× faster than full). Only strategies that pass the
-10k screen get re-run on the full dataset to confirm — that's the run
-that produces the canonical KEEP/DISCARD numbers compared against the
-running best. The screen exists to kill bad ideas cheaply, not to
-generate publishable numbers.
+**10k-sample loop is the primary workspace.** Trajectory collapse, full-
+horizon AUC, and short-horizon (cap=48h) AUC are three coupled
+objectives — closing the gap likely needs many different architectural
+attempts, not one silver bullet. Burning a full-data run on every idea
+wastes hours per experiment. Instead:
+
+- **All experiments run at `sample=10000`** (~25 min on GPU per training
+  experiment) — this is the running iteration loop. KEEP/DISCARD
+  verdicts and the running best are tracked at 10k scale.
+- **Full-data confirm runs are reserved for the end of an architectural
+  block** — when the agent has run through the primary directions, the
+  running best has settled, and further 10k experiments are not yielding
+  meaningful gains. Only then do we re-run the running best (and
+  optionally the second/third candidates) at `sample=None` to produce
+  publishable numbers.
+- The full-data run is a **validation step**, not a verdict step. If
+  the 10k running best fails to replicate at full scale, that's a
+  signal we have a sample-size artifact and need more 10k probing —
+  not an automatic DISCARD.
 
 ```
 1. Read `program.md`. Check `git log --oneline -5`, last rows of
@@ -79,66 +107,74 @@ generate publishable numbers.
       git add <code files> && git commit -m "<tag>: change / why / expected"
       git push
    Note <CODE_SHA>.
-5. SCREEN RUN  (sample=10000, full epochs):
-      # set sample=10000 in model_config.py (was None)
-      python api.py > run_screen.log 2>&1
-   Goal: ~25–30 min on GPU, fast enough to iterate. Gates T1-T3 still
-   apply (same loss-descent / early-stop / diagnose criteria as full).
-   SCREEN PASS iff:
-     - All T1-T3 gates pass on the 10k run.
-     - At least one headline metric clearly moves in the right direction
-       relative to a 10k-rerun of the running best (re-run baseline at
-       sample=10000 once per running-best change to get a comparable
-       reference). "Clearly" = at least double the noise floor at 10k:
-       AUROC > +0.010, AUPRC > +0.010, MAE < −10 h, OR gen_to_gt_ratio
-       up by ≥ 0.05, OR gen_frac_terminal_first24h down by ≥ 0.10.
-   If the screen FAILS → DISCARD on the 10k result, no full-data run.
-   Revert code (step 9). Don't burn 4 hours confirming a dead idea.
-6. FULL CONFIRM RUN  (sample=None, only if screen passed):
-      # set sample back to None
+5. EXPERIMENT RUN  (sample=10000, full epochs):
+      # set sample=10000 in model_config.py
       python api.py > run.log 2>&1
-   Re-apply T1-T3. The full-run numbers are what the KEEP/DISCARD
-   verdict uses.
-   (Inference-side experiments: --eval-only, skip the screen — they're
-   already cheap at full.)
+   ~25-30 min on GPU. Gates T1-T3 apply.
+   (Inference-side experiments: --eval-only against current
+   checkpoints — already cheap, no sample knob needed.)
 
    POST-TRAIN VALIDATION (mandatory before logging a verdict):
-   Gate-T1: Read run.log epoch-by-epoch. Every aux's RAW loss term must
-            show a real decrease across its active phase (no flat aux,
-            no NaNs, no oscillation indicating exploded gradients).
+   Gate-T1: Read run.log epoch-by-epoch. Every aux's RAW loss term
+            must show a real decrease across its active phase (no
+            flat aux, no NaNs, no oscillation).
    Gate-T2: Early stop / warmup gate did not trigger before all aux
             losses finished ramping (scheduler prints `warmup ends at
             epoch N` — early stop must not have fired before N).
    Gate-T3: Run diagnose.py and read it. The model must show real
-            discrimination — not trivial predictions:
+            discrimination:
               cd emr_model && python -m transform_emr.diagnose > ../diag.log 2>&1
-            Check Report 1 (per-outcome AUROC: bottom outcomes not
-            collapsed to ~0.5), Report 2 (sigmoid separation ≥ 0.05),
-            Report 4 (calibrated λ ≥ 1e-3 per aux), Report 5 (outcome
-            tokens ranked in top-half by grad/occ), Δt probe (R² > 0.05).
-            If any of these regress materially vs the running best, the
-            training is not honest — treat as DISCARD candidate even if
-            headlines look OK.
+            Reports 1/2/4/5 + Δt probe per program.md rules. If any
+            regresses materially vs the running best, treat as DISCARD
+            candidate even if headlines look OK.
    Only when Gates T1–T3 all pass: write the verdict.
-7. Append one row to results/results-trajectory-fix.tsv with the
-   summary-block headlines (incl. multi_horizon caps 24/48/168/336 and
-   gen_* / mae_* / outcome_*). Mark `sample=10000` rows clearly in the
-   `description` column (e.g. "SCREEN-10K") so they aren't confused
-   with full-data baselines.
-8. Write a `### <tag>` block in status.md ending with
-   `Verdict: KEEP|DISCARD — <reason>`. Both the screen result and the
-   full-confirm result should be summarised in the block.
-9. Journal commit:
+
+   KEEP iff (at 10k scale, comparing against the running best
+   re-evaluated at sample=10000 — see step 11):
+     - All T1-T3 gates passed.
+     - At least one headline metric clearly moves in the right
+       direction beyond the 10k noise floor:
+         AUROC ≥ +0.010, AUPRC ≥ +0.010, MAE ≤ −10 h, OR
+         gen_to_gt_ratio_median up by ≥ 0.05, OR
+         gen_frac_terminal_first24h down by ≥ 0.10.
+     - No headline metric regresses by the same threshold.
+     - Truncated AUROC (multi_horizon cap=48h mean) doesn't drop
+       more than 0.07 vs running best.
+
+6. Append one row to results/results-trajectory-fix.tsv with the
+   summary-block headlines (multi_horizon caps 24/48/168/336 and
+   gen_* / mae_* / outcome_*). Mark sample size in description
+   (e.g. "10k" or "FULL").
+7. Write a `### <tag>` block in status.md ending with
+   `Verdict: KEEP|DISCARD — <reason>`.
+8. Journal commit:
       git add status.md results/ && git commit -m "journal: <tag> <VERDICT> — <summary>"
       git push
-10. If DISCARD:  git revert --no-edit <CODE_SHA>  &&  git push
+9. If DISCARD:  git revert --no-edit <CODE_SHA>  &&  git push
    (Never `git reset --hard` — that erases the journal entry.)
-11. If KEEP: this is the new running best. Back up checkpoints:
+10. If KEEP: new running best. Back up checkpoints:
       cp -r emr_model/checkpoints emr_model/checkpoints.bak_keep_<tag>
-    The KEEP'd code stays in HEAD; the next experiment builds on top
-    of it. Compare future experiments against THIS state, not against
-    bak_originals. Re-run the *new* running best at sample=10000 once
-    so the next screen has a same-scale comparison reference.
+    KEEP'd code stays in HEAD; next experiment builds on top.
+
+11. AFTER each new KEEP, re-eval the running best at sample=10000 once
+    to refresh the baseline for the next screen. Inference-only
+    re-evals (`python api.py --eval-only` on the new checkpoints)
+    are fine here — no need to retrain.
+
+12. FULL-DATA CONFIRM (sample=None) is NOT part of the per-experiment
+    loop. Trigger it only when:
+      a) the running best has been stable across at least 2–3
+         consecutive DISCARD experiments (i.e. you've exhausted the
+         most promising primary directions and aren't finding more
+         10k gains), OR
+      b) all primary directions (C, B-rollout, G, D) have been
+         honestly attempted, OR
+      c) the user explicitly asks.
+    Then re-run the running best (and optionally the runner-up) at
+    `sample=None` for publishable numbers. Mark these rows "FULL" in
+    the ledger. If full-scale numbers don't replicate the 10k story,
+    that's a sample-size artifact to investigate — not an automatic
+    DISCARD.
 ```
 
 ## Research directions
