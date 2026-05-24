@@ -54,6 +54,13 @@ banned (the previous session's failure mode).
 
 ## The loop
 
+**Two-pass screening for speed.** New strategies first run on a **10 000
+patient sample** (~4× faster than full). Only strategies that pass the
+10k screen get re-run on the full dataset to confirm — that's the run
+that produces the canonical KEEP/DISCARD numbers compared against the
+running best. The screen exists to kill bad ideas cheaply, not to
+generate publishable numbers.
+
 ```
 1. Read `program.md`. Check `git log --oneline -5`, last rows of
    `results/results-trajectory-fix.tsv`.
@@ -67,13 +74,33 @@ banned (the previous session's failure mode).
    Gate-C: calibrated λ from LambdaScheduleController in [1e-3, 10].
    Gate-D: summary block + `multi_horizon` block + `per_outcome` block
            all print. No silent exceptions.
-   If any gate fails → fix formulation, do NOT pay for a full run.
+   If any gate fails → fix formulation, do NOT pay for any longer run.
 4. Commit code only:
       git add <code files> && git commit -m "<tag>: change / why / expected"
       git push
    Note <CODE_SHA>.
-5. FULL RUN:  python api.py > run.log 2>&1
-   (or --eval-only for inference-side experiments)
+5. SCREEN RUN  (sample=10000, full epochs):
+      # set sample=10000 in model_config.py (was None)
+      python api.py > run_screen.log 2>&1
+   Goal: ~25–30 min on GPU, fast enough to iterate. Gates T1-T3 still
+   apply (same loss-descent / early-stop / diagnose criteria as full).
+   SCREEN PASS iff:
+     - All T1-T3 gates pass on the 10k run.
+     - At least one headline metric clearly moves in the right direction
+       relative to a 10k-rerun of the running best (re-run baseline at
+       sample=10000 once per running-best change to get a comparable
+       reference). "Clearly" = at least double the noise floor at 10k:
+       AUROC > +0.010, AUPRC > +0.010, MAE < −10 h, OR gen_to_gt_ratio
+       up by ≥ 0.05, OR gen_frac_terminal_first24h down by ≥ 0.10.
+   If the screen FAILS → DISCARD on the 10k result, no full-data run.
+   Revert code (step 9). Don't burn 4 hours confirming a dead idea.
+6. FULL CONFIRM RUN  (sample=None, only if screen passed):
+      # set sample back to None
+      python api.py > run.log 2>&1
+   Re-apply T1-T3. The full-run numbers are what the KEEP/DISCARD
+   verdict uses.
+   (Inference-side experiments: --eval-only, skip the screen — they're
+   already cheap at full.)
 
    POST-TRAIN VALIDATION (mandatory before logging a verdict):
    Gate-T1: Read run.log epoch-by-epoch. Every aux's RAW loss term must
@@ -93,21 +120,25 @@ banned (the previous session's failure mode).
             training is not honest — treat as DISCARD candidate even if
             headlines look OK.
    Only when Gates T1–T3 all pass: write the verdict.
-6. Append one row to results/results-trajectory-fix.tsv with the
+7. Append one row to results/results-trajectory-fix.tsv with the
    summary-block headlines (incl. multi_horizon caps 24/48/168/336 and
-   gen_* / mae_* / outcome_*).
-7. Write a `### <tag>` block in status.md ending with
-   `Verdict: KEEP|DISCARD — <reason>`.
-8. Journal commit:
+   gen_* / mae_* / outcome_*). Mark `sample=10000` rows clearly in the
+   `description` column (e.g. "SCREEN-10K") so they aren't confused
+   with full-data baselines.
+8. Write a `### <tag>` block in status.md ending with
+   `Verdict: KEEP|DISCARD — <reason>`. Both the screen result and the
+   full-confirm result should be summarised in the block.
+9. Journal commit:
       git add status.md results/ && git commit -m "journal: <tag> <VERDICT> — <summary>"
       git push
-9. If DISCARD:  git revert --no-edit <CODE_SHA>  &&  git push
+10. If DISCARD:  git revert --no-edit <CODE_SHA>  &&  git push
    (Never `git reset --hard` — that erases the journal entry.)
-10. If KEEP: this is the new running best. Back up checkpoints:
+11. If KEEP: this is the new running best. Back up checkpoints:
       cp -r emr_model/checkpoints emr_model/checkpoints.bak_keep_<tag>
     The KEEP'd code stays in HEAD; the next experiment builds on top
     of it. Compare future experiments against THIS state, not against
-    bak_originals.
+    bak_originals. Re-run the *new* running best at sample=10000 once
+    so the next screen has a same-scale comparison reference.
 ```
 
 ## Research directions
