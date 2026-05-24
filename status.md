@@ -594,6 +594,111 @@ mechanism (gradient into terminal-emission decision) but with the
 two missing pieces — explicit length budget and Phase-2 exposure
 to autoregressive generation — both included.
 
+### C-soft (direction C with fraction_cap 0.30 → 0.10) — DISCARD
+
+**Code SHA**: `196129a` (on top of `89f8b63` which restored C's
+ttt_head code after the C-DISCARD revert). Single knob change:
+TTT aux fraction_cap tightened from 0.30 to 0.10. Hypothesis:
+softer TTT signal preserves common-outcome AUROC gains without
+C's 2.81× trajectory overshoot.
+
+The trajectory side worked beautifully:
+
+| metric | Z@10k | C@10k | C-soft@10k |
+|---|---|---|---|
+| gen_median_hours | 60.44 | 287.5 | **110.15** |
+| gen_to_gt_ratio_median | 0.588 | 2.81 | **1.077** |
+| gen_to_gt_ratio_mean | 0.574 | 1.890 | **1.069** |
+
+gen_to_gt_ratio_median 1.077 is essentially perfect anchoring to
+the true patient horizon. C's overshoot is gone; C's
+under-termination is corrected to near-1.0. Phase-2 best_val 0.136
+(C: 0.138, Z: 0.094 — Phase-2 still struggles to descend as much
+as Z but Phase-3 outcome head training is close to C's). λ_ttt
+calibrated to 0.0013 (3× lower than C's 0.0037, as designed).
+
+Headline result vs Z@10k:
+
+| metric | Z@10k | C-soft@10k | Δ |
+|---|---|---|---|
+| outcome_auroc | 0.4997 | 0.4367 | −0.063 (past floor) |
+| outcome_auprc | 0.1271 | 0.1169 | −0.010 (at threshold) |
+| onset_mae_hrs | 63.49 | 101.10 | +37.6 h (past floor) |
+| gen_median_hours | 60.44 | 110.15 | +49.7 h (matches GT) |
+| gen_to_gt_ratio_median | 0.588 | 1.077 | +0.49 (target ≈ 1.0) |
+| gen_frac_terminal_first24h | 0.105 | 0.116 | +0.011 |
+| gen_length_mae_hrs | 71.73 | 85.18 | +13.5 h |
+| multi_horizon cap=48 mean | 0.514 | 0.493 | −0.021 (within 0.07) |
+| multi_horizon cap=168 mean | 0.519 | 0.442 | −0.077 |
+
+**Per-outcome AUROC at natural horizon** — same split pattern as C:
+
+Common outcomes still gain (smaller magnitude than C, but real):
+
+| outcome | Z@10k | C@10k | C-soft@10k | Δ vs Z |
+|---|---|---|---|---|
+| DEATH_EVENT | 0.475 | 0.791 | 0.581 | +0.106 |
+| DISGLY_Hyperglycemia | 0.619 | 0.694 | 0.649 | +0.030 |
+| DISGLY_Hypoglycemia | 0.551 | 0.652 | 0.603 | +0.052 |
+| RELEASE_EVENT | 0.516 | 0.628 | 0.548 | +0.032 |
+| KIDNEY_COMPLICATION | 0.527 | 0.562 | 0.553 | +0.026 |
+
+Rare outcomes STILL flipped, just less severely:
+
+| outcome | Z@10k | C@10k | C-soft@10k |
+|---|---|---|---|
+| KETOACIDOSIS | 0.493 | 0.126 | 0.355 |
+| RETINOPATHY | 0.493 | 0.126 | 0.355 |
+| ACIDOSIS | 0.493 | 0.120 | 0.353 |
+| ACUTE_RESP | 0.493 | 0.118 | 0.352 |
+| NEUROVASCULAR | 0.493 | 0.126 | 0.349 |
+| HYPEROSMOLALITY | 0.493 | 0.125 | 0.346 |
+| INFECTION | 0.493 | 0.121 | 0.340 |
+| CARDIO-VASCULAR | 0.357 | 0.222 | 0.293 |
+
+The rare-outcome flip is **structural, not magnitude-dependent**.
+Even with 3× less gradient pressure, the same Phase-3-outcome-head-
+doesn't-match-the-shifted-backbone failure mode applies — just at
+~0.35 instead of ~0.12. C and C-soft together establish that
+direction C's mechanism (shared-backbone TTT-MSE gradient) is
+fundamentally incompatible with the existing Phase-3 outcome-head
+training regime for rare outcomes.
+
+**KEEP gates vs Z@10k**:
+- T1/T2/T3: pending diagnose (raw losses descended cleanly in
+  Phase-2 epochs visible in run.log; Phase-3 early-stop fired
+  per expected behaviour).
+- ≥ 1 headline improves past 10k floor: gen_to_gt_ratio_median
+  improves by +0.49 in the right direction (was 0.588, now 1.077,
+  target ~1.0) — PASS this criterion.
+- No headline regresses past floor:
+  outcome_auroc −0.063 (way past 0.010 floor) — REGRESSED ❌
+  onset_mae_hrs +37.6 h (way past 10 h floor) — REGRESSED ❌
+- multi_horizon cap=48 mean drop: 0.021 — PASS.
+
+Multiple regressions → **DISCARD**.
+
+**Direction-C ruling**: C and C-soft show the mechanism reaches
+the LM-head terminal-emission decision (gradient path works), but
+the shared-backbone perturbation also disrupts the outcome head's
+ability to discriminate rare outcomes that aren't correlated with
+terminal proximity. Tuning fraction_cap only changes the
+magnitude of the trade-off, not its existence. Direction C is
+**ruled out as a stand-alone primary** in this codebase's
+TF-Phase-2 + frozen-Phase-3 training regime. A future combined
+experiment that retrains Phase-3 outcome head against an
+autoregressive-Phase-2 backbone (which IS what B-rollout adds)
+could reopen direction C — but that's properly an extension of
+B-rollout, not a fresh C attempt.
+
+**Next-experiment plan**: B-rollout per program.md primary order.
+B-rollout's autoregressive Phase-2 exposure SHOULD fix the
+rare-outcome flip (Phase-3 then sees a backbone whose hidden state
+distribution matches what generation produces). Its sequence-level
+length loss SHOULD anchor trajectory like C-soft did. Together
+they aim to keep C's common-outcome gains AND restore rare-
+outcome discrimination AND anchor trajectory length to ~1.0.
+
 **Direction-E saturation analysis**: the path E→24h→12h is a
 single-dimensional sweep. The next obvious extension (tau=6h)
 runs into a structural problem: the Δt MSE on non-zero deltas
