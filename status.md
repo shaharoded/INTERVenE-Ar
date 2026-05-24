@@ -793,6 +793,126 @@ size or the Phase-2→Phase-3 architecture split — and the loop
 should pivot to validating the running-best stack at full data
 rather than churning more 10k interventions.
 
+### B-rollout MVP (k=1 single-step Gumbel rollout + length loss) — DISCARD
+
+**Code SHA**: `fce8cc5`. The first direction in this loop with a
+gradient genuinely reaching the LM-head's terminal-emission logit
+at training time. Removed `@torch.no_grad` from
+`forward_with_cache` (inference's `generate()` still wraps its
+own no_grad so eval is unchanged), added
+`GPT.rollout_step_gumbel`: build the input embedding with a soft
+position embedding via the Gumbel STE pathway
+(`y_hard @ position_embed.weight`) and hard concept/value/parent_raw
+lookups for the rest. Unit-tested gradient path on a 2-patient
+batch: `lm_head.weight` received a finite gradient (norm 0.47) via
+the Gumbel STE — the gradient reaches the LM head.
+
+Result vs Z@10k:
+
+| metric | Z@10k | B-rollout@10k | Δ |
+|---|---|---|---|
+| outcome_auroc | 0.4997 | 0.4479 | −0.052 (past 0.010 floor) |
+| outcome_auprc | 0.1271 | 0.0964 | −0.031 (past 0.010 floor) |
+| onset_mae_hrs | 63.49 | 62.76 | −0.7 |
+| gen_median_steps | 23 | **501** | model emits constantly |
+| gen_median_hours | 60.44 | **0.234** | trajectory collapsed |
+| gen_to_gt_ratio_median | 0.588 | **0.0022** | extreme undershoot |
+| gen_frac_terminal_first24h | 0.105 | **0.908** | regressed |
+| multi_horizon cap=48 mean | 0.514 | 0.398 | −0.116 (> 0.07) |
+
+Per-outcome cap=48 split: SAME pattern as C/G — DEATH 0.61 → 0.83,
+RELEASE 0.62 → 0.85, other commons gain; rare outcomes at ~0.25
+(less severe than C/G's 0.12, partial confirmation of the
+Phase-3 distribution-gap hypothesis); CARDIO −0.13.
+
+Root cause of the trajectory collapse: with `k=1`,
+`Σ_rollout pred_dt = pred_dt[one step]` and
+`Σ_rollout GT_dt = GT_dt[one step]`. The "length" loss degenerates
+to a per-step dt MSE under Gumbel. The gradient trains the dt head
+to match GT_dt at one specific (near-terminal) position, and
+trains the LM head (via the Gumbel STE pathway) to emit a token
+whose dt prediction approaches the small GT_dt. The model
+generalised this into "emit tokens with very small dt at every
+position" — at inference, every step has Δt ≈ 0, so 500+ tokens
+cover only ~14 minutes of real time.
+
+A correct multi-step B-rollout (k ≥ 4) would compare
+`Σ_t pred_dt over k steps` to `Σ_t GT_dt over k steps`. The
+cumulative comparison is the trajectory-length signal program.md
+intends. Engineering surface: maintain per-step KV-cache updates,
+chain k decode steps with gradient retained, k-times the
+Phase-2 training-time cost. Documented as the right next step
+for a future session.
+
+**KEEP gates vs Z@10k**: AUROC −0.052, AUPRC −0.031, cap=48 drop
+0.116 — multiple fail → **DISCARD**.
+
+**Key positive result**: the gradient path from a downstream loss
+back to the LM-head logits via the Gumbel STE is **verified to
+work end-to-end** in this codebase. This is the engineering
+foundation a properly-formulated multi-step B-rollout would build
+on; it's no longer a hypothesis.
+
+---
+
+## Loop close at sample=10000
+
+After 5 consecutive 10k DISCARDs on the Z running best —
+X-traj-length, C-ttt-head, C-soft, G-mix, B-rollout-mvp — the
+trajectory-fix loop has saturated at 10k. Per program.md step
+12(a), the running best has been stable across enough DISCARDs
+to trigger full-data confirm; Z (sample=None) was the original
+KEEP and its numbers are already recorded.
+
+Cross-experiment pattern, four out of five (X, C, C-soft, G):
+every intervention that broadens the outcome head's target
+window or pulls the shared backbone toward distance-to-terminal
+encoding produced the same **four-signature failure**:
+  1. Trajectory overshoots (gen_to_gt_ratio_median ≫ 1).
+  2. Rare 7 outcomes flip anti-discriminative (~0.12).
+  3. Common 5 outcomes (DEATH/HYPER/HYPOGLY/RELEASE/KIDNEY) gain
+     dramatically.
+  4. Mean outcome_auroc collapses (gates fail).
+
+The fifth (B-rollout-mvp) produced a different failure
+(trajectory undershoots, rare outcomes flip less severely)
+because the k=1 length loss is structurally wrong rather than
+attacking the right place too strongly.
+
+**Robust direction class**: only LM-head-terminal-kernel
+interventions (Y/Z's `log_tau_lm` freeze for terminal tokens).
+The Z running best gives gen_median_hours = 60.4 h (60× lift
+over bak_originals' 1 h), gen_to_gt_ratio_median = 0.588 (~58 %
+coverage of the true patient horizon, was ~1 %), and
+gen_frac_terminal_first24h = 0.105 (was 0.999) at unchanged
+short-term AUROC. Full-data Z numbers are journaled in the
+Y/Z entries above.
+
+**Honest framing of the result** (per program.md "Stop
+criterion"):
+  - The trajectory-collapse failure mode is partially closed:
+    median trajectory now covers ~58 % of the true patient
+    horizon (1 % at baseline). 90 % of patients no longer
+    terminate in the first 24 hours (99.9 % at baseline).
+  - The horizon-extended `outcome_auroc` is still close to
+    chance (0.50) because the model still gates outcome
+    discrimination through the same 48 h outcome head as
+    bak_originals; long-horizon AUC at cap=336 is only above
+    chance for HYPER/HYPOGLY/KIDNEY (the chronic-metabolic
+    outcomes).
+  - The deployed M-256 with the Z modification is publishable
+    as a near-term event-window scorer that now ALSO generates
+    multi-day trajectories — but not as a calibrated multi-day
+    predictor. The full multi-day predictor goal would require
+    a properly-formulated multi-step B-rollout (engineering
+    surface beyond this loop) or a fundamentally different
+    Phase-2 ↔ Phase-3 architecture where the outcome head sees
+    autoregressive-state hidden states during training.
+
+**Running best**: Z (`emr_model/checkpoints.bak_keep_Z_narrower_terminal_tau/`).
+HEAD code after the B-rollout DISCARD revert is exactly the Z
+running-best code.
+
 ---
 
 ## 2. Architecture sweep
