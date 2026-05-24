@@ -718,6 +718,81 @@ disarmed; the remaining train/inference gap (the model still
 needs 40% more coverage to reach the true horizon) is now exactly
 the gap scheduled sampling is built to close.
 
+### G-mix (direction G: 48 h + 168 h outcome-target mix) — DISCARD
+
+**Code SHA**: `c386511`. Single knob: `outcome_long_weight=0.5`
+mixes 48 h short + 168 h long outcome targets in both the
+Phase-2 ranking loss and the Phase-3 outcome BCE. No new params.
+
+Result vs Z@10k:
+
+| metric | Z@10k | G@10k | Δ |
+|---|---|---|---|
+| outcome_auroc | 0.4997 | 0.3125 | −0.187 |
+| outcome_auprc | 0.1271 | 0.1201 | −0.007 |
+| onset_mae_hrs | 63.49 | 79.23 | +15.7 h |
+| gen_median_hours | 60.44 | **280.4** | +220 h |
+| gen_to_gt_ratio_median | 0.588 | **2.71** | overshoot |
+| multi_horizon cap=48 mean | 0.514 | 0.419 | −0.095 (>0.07 limit) |
+| multi_horizon cap=168 mean | 0.519 | 0.326 | −0.193 |
+
+Per-outcome split — **SAME pattern as C and C-soft**: common 5
+(DEATH, HYPER, HYPOGLY, RELEASE, KIDNEY) gain +0.02 to +0.11;
+CARDIO −0.14; 7 rare outcomes flipped to ~0.12 each. Mean AUROC
+collapses to 0.312.
+
+This was unexpected — G doesn't add a backbone-shared head like
+C; it only weights two outcome-target formulations in the existing
+losses. Yet it produced the same trajectory overshoot and rare-
+outcome flip. Stage-1 (ranking) never unlocked in Phase 2 (the
+LambdaScheduleController's vl_total plateau detection didn't
+trigger), so the only effective change was in Phase 3's outcome
+BCE — which only updates the backbone via the tiny
+`backbone_lr_factor=0.01` × `lr=1e-4 = 1e-6` LR over 50 epochs.
+The cumulative backbone drift is small but apparently enough to
+re-shape the LM-head's terminal-emission decision.
+
+**Pattern across X, C, C-soft, G** — four experiments now showing
+the same four-signature failure when any intervention either
+(a) adds a backbone-shared signal that pulls toward terminal-
+distance encoding (C, TTT-head); or (b) broadens the outcome
+head's effective target window (G; arguably C too via shared-
+backbone effect):
+
+  1. Trajectory overshoots (gen_to_gt_ratio_median ≫ 1).
+  2. Rare outcomes flip anti-discriminative (~0.12 per_outcome).
+  3. Common outcomes gain +0.05 to +0.30 AUROC.
+  4. Mean outcome_auroc collapses.
+
+Z (running best) is robust because its only intervention is the
+narrow terminal log_tau_lm (frozen). It doesn't touch the outcome
+head's training distribution, the dt head, or the backbone's
+hidden representation. **Any intervention that DOES touch those,
+at sample=10000 scale, hits this failure mode.**
+
+Likely root cause: the Phase-2 → Phase-3 split. Phase-3 trains
+the outcome head on a backbone snapshot whose hidden-state
+distribution matches teacher-forced training, not autoregressive
+generation. C/G shift the backbone in ways that widen the
+distribution gap further — Phase-3's outcome head can't reconcile
+the shift for rare outcomes which depend on subtle hidden-state
+features.
+
+**KEEP gates**: AUROC −0.187 catastrophic; MAE +15.7 past floor;
+cap=48 mean drop 0.095 > 0.07 — **DISCARD**.
+
+**Re-plan**: Per program.md ordering, the remaining primary is
+D (terminal hazard head). D is structurally different from
+C/G: it REPLACES the LM-head's terminal BCE with a hazard-bin
+formulation. It targets the LM-head's terminal output directly,
+doesn't add a backbone-shared head, doesn't broaden outcome
+prediction window. If the four-signature failure has its root
+in (a) and (b), D shouldn't trigger it. If D DOES trigger it,
+the failure is more fundamental — likely related to 10k data
+size or the Phase-2→Phase-3 architecture split — and the loop
+should pivot to validating the running-best stack at full data
+rather than churning more 10k interventions.
+
 ---
 
 ## 2. Architecture sweep
