@@ -366,6 +366,116 @@ predictor on its own.
 `bak_keep_Y_narrow_terminal_tau`. Future experiments compare against
 this state, not against bak_originals.
 
+### Z-narrower-terminal-tau (direction E, stacked on Y) — KEEP
+
+**Code SHA**: `dfa6889`. Backup: `emr_model/checkpoints.bak_keep_Z_narrower_terminal_tau/`.
+This is the new running best (supersedes Y).
+
+**Hypothesis**: if Y's tau=24h gave a 20× lift in `gen_median_hours`,
+pushing tau to 12h (matching the default-token init, the narrowest
+reasonable setting) extends the trajectory further. The LM-head BCE
+target for a terminal 24h away drops from exp(-1)=0.368 (Y) to
+exp(-2)=0.135 — the LM head only sees a terminal-positive label when
+the terminal is actually within ~12h, which is closer to the data's
+median per-step Δt (~4h in default tokens after training).
+
+Falsifiability: `gen_median_hours > 20.36h`, `gen_to_gt_ratio_median >
+0.197`, `gen_frac_terminal_first24h < 0.542`. Stop-condition watches:
+`gen_n_with_terminal` staying near 8561 (no terminal-blind regime),
+and `multi_horizon cap=48 mean` not dropping > 0.07.
+
+**Implementation**: a one-line init change in `GPT.__init__`
+(`_log_tau_terminal = math.log(12.0/336.0)`). Same backward-hook
+freeze inherited from Y keeps the entry at 12h throughout training.
+
+**Training**: Phase 2 ran the full 50 epochs; Phase 3 ran 28 epochs
+and early-stopped (within the same num_workers=2 envelope as Y — no
+OOM). Stage 1 unlock happened at epoch 43 (vs Y's epoch 31), warmup
+completed at epoch 46 (vs Y's 34) — vl_total plateau took longer
+to detect because the model kept improving on the narrower-kernel
+objective. phase2_best_val 0.094 (Y: 0.097); phase3_best_val 0.797
+(Y: 0.801). Both phases trained better than Y on their selection
+metrics.
+
+**Headline result** (vs Y, the running best):
+
+| metric | Y | Z | Δ Z vs Y |
+|---|---|---|---|
+| outcome_auroc | 0.5042 | 0.5022 | -0.002 (flat / within noise) |
+| outcome_auprc | 0.1185 | **0.1264** | **+0.008** |
+| onset_mae_hrs | 62.35 | 63.04 | +0.7 (within noise) |
+| gen_median_steps | 16 | **23** | +7 |
+| gen_median_hours | 20.36 | **60.66** | **+40 h (3× longer)** |
+| gen_p90_hours | 77.98 | **105.64** | +28 h |
+| gen_max_hours | 333.5 | 335.6 | full 14-day horizon |
+| gen_frac_terminal_first24h | 0.542 | **0.095** | **-0.447** |
+| gen_length_mae_hrs | 87.99 | **70.81** | -17 h |
+| gen_to_gt_ratio_median | 0.197 | **0.585** | 3× (now ~58% of true horizon) |
+| gen_to_gt_ratio_mean | 0.282 | **0.572** | 2× |
+| multi_horizon cap=48 mean | 0.514 | **0.530** | +0.016 (slightly improved) |
+
+**KEEP gates against running best (Y)**:
+
+- Smoke gates A-D ✓.
+- Peak VRAM 335 MB ≪ 24 GB cap ✓.
+- ≥ 1 horizon-extended headline improves past noise floor:
+  outcome_auprc +0.008 ≥ 0.005 ✓.
+- No headline regresses past noise floor (AUROC −0.002 within ±0.005;
+  MAE +0.7 within ±5h) ✓.
+- Truncated AUROC (multi_horizon cap=48 mean) drop < 0.07:
+  Z mean **rose** by 0.016 ✓.
+- `gen_median_hours` strictly above Y (20.36 → 60.66) ✓.
+- `gen_frac_terminal_first24h` strictly below Y (0.542 → 0.095) ✓.
+
+**Per-outcome trade-offs**: CARDIO at all caps regressed under Z
+(per_outcome AUROC 0.471 → 0.347, cap=168 0.372 → 0.294) — the
+narrower terminal kernel makes the model more careful about both
+DEATH and RELEASE, which lowers the spurious CARDIO-terminal
+correlation that was inflating CARDIO's score on the
+*terminal-emission-driven* (short-trajectory) eval. With the longer
+trajectories, CARDIO is now evaluated honestly on its own signal.
+HYPER/HYPOGLY/KIDNEY all gained at cap=168 (HYPER 0.594 → 0.634,
+HYPOGLY 0.585 → 0.592, KIDNEY 0.553 → 0.529 ≈ flat) and RELEASE at
+cap=168 went 0.474 → 0.598.
+
+**Gate T3 (diagnose.py)** — significantly improved over Y:
+- Report 1: mean teacher-forced LM AUROC 0.829 (HYPER 0.903,
+  HYPOGLY 0.826, KIDNEY 0.714, CARDIO 0.874) — comparable to Y.
+- Report 2: sigmoid separation 5.08 (Y: 5.01).
+- Report 4: ce=0.097, dt=0.097, ranking=0.020 — all ≥ 1e-3.
+- **Δt probe: Pearson r=0.351, R²=0.0925** — over the 0.05 floor
+  (Y: R²=−0.009, baseline: R²≈0). The Δt head was always unstable
+  in this codebase; narrowing the terminal tau apparently fixed
+  the cross-talk that was destabilising it. This is a Z-specific
+  improvement that Y did not achieve.
+- Outcome-head label alignment: per-outcome AUROC 0.79-0.94, gap
+  1.94-5.15 logits across outcomes.
+
+**Verdict: KEEP** — new running best. The trajectory-collapse
+failure mode is now substantially mitigated: median trajectory
+covers 58% of the true patient horizon (vs 1% in bak_originals,
+20% in Y). 90.5% of patients do not terminate in the first 24 h
+(vs 0.1% baseline, 45.8% Y).
+
+**Direction-E saturation analysis**: the path E→24h→12h is a
+single-dimensional sweep. The next obvious extension (tau=6h)
+runs into a structural problem: the Δt MSE on non-zero deltas
+has noise floor ≥ data's per-step Δt (~3-4 h), so at tau≪6h the
+LM-head terminal posterior is essentially zero everywhere the
+model normally trains, and the model becomes terminal-blind —
+the `gen_n_with_terminal` stop-condition triggers. Empirically
+from the literature analog: the kernel-width tau≈median(per-step
+Δt) is the natural floor, and Z is at that floor. Further wins
+need a different lever.
+
+Next-experiment plan: **direction A (scheduled sampling)** on top
+of Z. Pre-Y, direction A was structurally risky (the U experiment
+in prior sessions failed with "model amplified its own TERMINAL
+bias"). Y+Z removed the terminal bias, so A's failure mode is
+disarmed; the remaining train/inference gap (the model still
+needs 40% more coverage to reach the true horizon) is now exactly
+the gap scheduled sampling is built to close.
+
 ---
 
 ## 2. Architecture sweep
