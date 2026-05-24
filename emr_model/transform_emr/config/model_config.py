@@ -22,7 +22,7 @@ TRAINING_SETTINGS = {
     "phase1_n_epochs": 50,
     "phase2_n_epochs": 50,
     "phase3_n_epochs": 50,
-    "sample": 10000,  # 10k is the primary screening loop per program.md; set to None only for end-of-block full-data confirms
+    "sample": None,  # set to int (e.g. 50) for a quick smoke-test
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
@@ -92,16 +92,4 @@ TRAINING_SETTINGS = {
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
     "outcome_horizon_hours": 48.0,
-
-    # Direction G — short→long horizon curriculum.
-    # Compute outcome targets at two horizons (48 h short + 168 h long) and
-    # use a weighted-mix as the actual target for both the Phase-2 ranking
-    # loss and the Phase-3 outcome BCE. The mix weight is constant — no
-    # epoch-level ramp — keeping the experiment to a single knob:
-    #     target = (1 − outcome_long_weight) · target_short
-    #            + outcome_long_weight       · target_long
-    # outcome_long_weight = 0.0 → exactly current Z behaviour (48 h only).
-    # outcome_long_weight = 0.5 → equal mix; 1.0 → 168 h only.
-    "outcome_horizon_hours_long": 168.0,
-    "outcome_long_weight": 0.5,
 }

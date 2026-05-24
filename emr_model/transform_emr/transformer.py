@@ -1067,53 +1067,30 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 abs_t_loss_raw = gate_loss + mag_loss
                 abs_t_loss = abs_t_loss_raw * lambdas["dt"]
 
-                # === Outcome Loss — Time-Decayed Soft Labels (direction G mix) ===
+                # === Outcome Loss — Time-Decayed Soft Labels ===
                 # For each position t, the target for outcome k is a soft risk score:
-                # sum_s { exp(-dt(t,s) / tau_k) * 1[token_s == outcome_k] }.clamp(0, 1)
-                # Direction G: compute the target at TWO horizons (48 h short, 168 h
-                # long) and weight-mix them with `outcome_long_weight` (config). The
-                # short-horizon target supplies the existing strong near-term signal;
-                # the long-horizon target widens the prediction window so the
-                # outcome head learns to flag events further into the future —
-                # multi_horizon cap=168/336 should pick this up while cap=48 is
-                # preserved by the (1 − w_long) share. With outcome_long_weight=0
-                # this collapses to the pre-G behaviour exactly.
+                # sum_s { exp(-dt(t,s) / tau) * 1[token_s == outcome_k] }.clamp(0, 1)
+                # Maximum gradient right before an outcome; decays to zero for distant/absent
+                # outcomes. No hard window boundaries — decay handles separation naturally.
                 _ABS_TS_SCALE = 336.0
-                _HORIZON_SHORT = training_settings.get("outcome_horizon_hours",      48.0) / _ABS_TS_SCALE
-                _HORIZON_LONG  = training_settings.get("outcome_horizon_hours_long", 168.0) / _ABS_TS_SCALE
-                _W_LONG        = float(training_settings.get("outcome_long_weight", 0.0))
+                _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
                 # Per-outcome learnable tau (initialised at log(12h / _ABS_TS_SCALE)).
                 _TAU = model.outcome_log_tau.exp()
-                outcome_targets_short = get_future_outcome_targets(
+                outcome_targets = get_future_outcome_targets(
                     target_ids=full_targets,
                     outcome_ids=outcome_token_ids,
                     all_abs_ts=batch["abs_ts"],
                     query_abs_ts=batch["abs_ts"][:, :-1],
                     tau=_TAU,
-                    horizon=_HORIZON_SHORT,
+                    horizon=_HORIZON,
                 )  # [B, T-1, K]
-                if _W_LONG > 0.0:
-                    outcome_targets_long = get_future_outcome_targets(
-                        target_ids=full_targets,
-                        outcome_ids=outcome_token_ids,
-                        all_abs_ts=batch["abs_ts"],
-                        query_abs_ts=batch["abs_ts"][:, :-1],
-                        tau=_TAU,
-                        horizon=_HORIZON_LONG,
-                    )
-                    outcome_targets = (1.0 - _W_LONG) * outcome_targets_short + _W_LONG * outcome_targets_long
-                else:
-                    outcome_targets = outcome_targets_short
 
                 # === Loss: Pairwise ranking (direct AUROC proxy on the outcome head) ===
                 # Positive positions: outcome_targets > 0 (outcome occurs within horizon).
                 # Negative positions: outcome_targets == 0 (no outcome within horizon).
-                # With G's weighted-mix target, "positive" means "outcome within either
-                # the short or long horizon" (a position is non-zero in the mix iff it's
-                # non-zero in at least one horizon). The ranking signal accordingly
-                # spans both windows — short-horizon-only positives still rank above
-                # negatives; long-only positives also rank above negatives; the head
-                # has to discriminate at both scales.
+                # Both masked by non-pad. Independent of soft-BCE — direct AUROC signal.
+                # The raw loss is always computed so the lambda scheduler can calibrate it
+                # at stage-1 unlock; gating on lam > 0 would deadlock calibration.
                 _rank_pos = (outcome_targets > 0.0) & valid_pos
                 _rank_neg = (outcome_targets == 0.0) & valid_pos
                 loss_ranking_raw = pairwise_ranking_loss(
@@ -1347,9 +1324,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     train_losses, val_losses = [], []
 
     _ABS_TS_SCALE = 336.0
-    _HORIZON_SHORT = training_settings.get("outcome_horizon_hours",      48.0) / _ABS_TS_SCALE
-    _HORIZON_LONG  = training_settings.get("outcome_horizon_hours_long", 168.0) / _ABS_TS_SCALE
-    _W_LONG_P3     = float(training_settings.get("outcome_long_weight", 0.0))
+    _HORIZON = training_settings.get("outcome_horizon_hours",   48.0) / _ABS_TS_SCALE
     # Read the learnable per-outcome tau from the model. In Phase 3 the param
     # continues to be trained alongside the outcome head.
 
@@ -1405,28 +1380,14 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 outcome_pred = outcome_logits[:, :-1, :]  # [B, T-1, K]
                 pred_logits  = logits[:, :-1, :]          # [B, T-1, V]
 
-                # Direction G: weighted mix of short (48 h) + long (168 h)
-                # horizon outcome targets — same formulation as Phase 2.
-                outcome_targets_short = get_future_outcome_targets(
+                outcome_targets = get_future_outcome_targets(
                     target_ids=full_targets,
                     outcome_ids=outcome_token_ids,
                     all_abs_ts=batch["abs_ts"],
                     query_abs_ts=batch["abs_ts"][:, :-1],
                     tau=model.outcome_log_tau.exp(),
-                    horizon=_HORIZON_SHORT,
+                    horizon=_HORIZON,
                 )  # [B, T-1, K]
-                if _W_LONG_P3 > 0.0:
-                    outcome_targets_long = get_future_outcome_targets(
-                        target_ids=full_targets,
-                        outcome_ids=outcome_token_ids,
-                        all_abs_ts=batch["abs_ts"],
-                        query_abs_ts=batch["abs_ts"][:, :-1],
-                        tau=model.outcome_log_tau.exp(),
-                        horizon=_HORIZON_LONG,
-                    )
-                    outcome_targets = (1.0 - _W_LONG_P3) * outcome_targets_short + _W_LONG_P3 * outcome_targets_long
-                else:
-                    outcome_targets = outcome_targets_short
 
                 nonpad    = (target_ids != model.embedder.padding_idx)  # [B, T-1]
                 valid_pos = nonpad.unsqueeze(-1)                        # [B, T-1, 1]
