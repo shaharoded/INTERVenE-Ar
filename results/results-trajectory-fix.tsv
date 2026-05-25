@@ -1,1 +1,2 @@
 commit	experiment	sample	patient_auroc_weighted	patient_auprc_weighted	patient_auroc_simple	patient_auprc_simple	n_outcomes_used	peak_mae_DEATH	peak_mae_RELEASE	gen_median_hours	gen_to_gt_ratio_median	gen_frac_terminal_first24h	phase2_best_val	phase3_best_val	verdict	description
+8d3cf18	B0-Z	10000	0.667099	0.620526	0.693214	0.303230	16	158.8375	85.9666	114.476	1.1157	0.1481	0.183996	1.157467	BASELINE	Z (direction E, narrow + frozen terminal log_tau_lm) on new patient-level eval. Reference baseline; no prior comparison under this eval.

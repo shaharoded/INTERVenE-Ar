@@ -37,6 +37,73 @@ per-outcome AUROC for DEATH/RELEASE/each complication, peak-MAE),
 trajectory honesty (`gen_to_gt_ratio_median`,
 `gen_frac_terminal_first24h`), verdict (KEEP / DISCARD) with reason.
 
+### B0-Z @ 10k (SHA 8d3cf18)
+
+P0 baseline. Z (direction E — narrow + frozen terminal `log_tau_lm`,
+init `log(12/336)`) on HEAD. No code change — first run on new
+patient-level peak-detector eval.
+
+Smoke (sample=50, phase{1,2,3}_n_epochs=1):
+- Gate A pass — no NaN, train=8.5680, val=7.8539 at Phase-3 epoch 1.
+- Gate B pass — raw_out=8.568, raw_rank=0.691 (~12×, within 1–2 OOM).
+- Gate C pass — λ_ranking calibrated 2.479 ∈ [1e-3, 10].
+- Gate D pass — summary block + all headline keys emit.
+
+Post-train (10k):
+- T1 pass — Phase-3 raw_out 2.20→1.05, raw_rank 0.66→0.41 across 29 epochs.
+- T2 pass — Phase-2 early stop at epoch 46 (ranking ramped from epoch 32,
+  fully active by 35, ran active 11+ epochs before stop). Phase-3 early
+  stop at epoch 29 with best val at epoch 9 (1.0105).
+- T3 pass — patient AUROC shows real discrimination on the headline
+  outcomes (see below).
+
+Headline:
+- `patient_auroc_weighted`: **0.6671**
+- `patient_auprc_weighted`: 0.6205
+- `patient_auroc_simple`:   0.6932
+- `patient_auprc_simple`:   0.3032
+- `n_outcomes_used`:        16
+
+Per-outcome AUROC (top):
+- DISGLYCEMIA_Hyperglycemia 0.904 (AUPRC 0.871, n_pos=619)
+- DISGLYCEMIA_Hypoglycemia  0.797
+- KETOACIDOSIS              0.791
+- NERVOUS_SYSTEM_DISORDER   0.788
+- RETINOPATHY               0.776
+- NEUROVASCULAR             0.749
+- KIDNEY_COMPLICATION       0.702 (AUPRC 0.634, n_pos=685)
+- CARDIO-VASCULAR_DISORDER  0.701 (AUPRC 0.744, n_pos=860)
+- **DEATH**                 0.693 (AUPRC 0.228, n_pos=192)
+- SKIN_ULCER                0.663
+- HYPEROSMOLALITY           0.644
+- ATHEROSCLEROSIS           0.608
+- ACUTE_RESPIRATORY         0.605
+- ACIDOSIS                  0.585
+- INFECTION                 0.566
+- **RELEASE**               0.521 (AUPRC 0.881, n_pos=1308)
+
+Peak MAE (hours, positives only):
+- DEATH:    158.84  (n=191)
+- RELEASE:   85.97  (n=1308)
+- DISGLYCEMIA_Hyper: 43.98
+- DISGLYCEMIA_Hypo:  66.15
+- KIDNEY:           106.36
+- CARDIO:           107.99
+- (others 145–234 h)
+
+Trajectory honesty:
+- `gen_median_hours`:         114.48
+- `gen_to_gt_ratio_median`:     1.116 (≥ 0.4 ✓)
+- `gen_frac_terminal_first24h`: 0.148
+- `gen_length_mae_hrs`:       101.48
+
+Phase stats: phase2_best_val 0.184 / 46 epochs (early stopped),
+phase3_best_val 1.157 / 29 epochs (early stopped).
+
+Verdict: **BASELINE-KEEP** — first patient-level eval reference.
+Running best until B0-C-ttt result is in. Checkpoints backed up to
+`emr_model/checkpoints.bak_keep_B0-Z/`.
+
 ---
 
 ## Reproducibility
