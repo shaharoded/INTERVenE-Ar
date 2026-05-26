@@ -1448,6 +1448,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                                      .get("ranking", 0.20))
     lambda_ranking: float | None = None  # set after epoch 1
 
+    # P5 — Per-position outcome BCE coefficient (structural diagnostic).
+    # 1.0 is baseline; setting to 0.02 makes BCE a small calibration nudge
+    # and lets ranking + Phase-2-seeded backbone drive the outcome head.
+    outcome_bce_coef = training_settings.get("phase3_outcome_bce_coef", 1.0)
+
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
         model.eval()
@@ -1495,7 +1500,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
                 loss_outcome_raw = (OutcomeCriterion(outcome_pred, outcome_targets)
                                     * valid_pos).sum() / valid_pos.sum().clamp(min=1.0)
-                loss_outcome = loss_outcome_raw
+                loss_outcome = outcome_bce_coef * loss_outcome_raw
 
                 # Pairwise ranking — same pos/neg construction as P2.
                 _rank_pos = (outcome_targets > 0.0) & valid_pos

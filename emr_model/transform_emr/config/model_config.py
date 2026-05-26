@@ -99,4 +99,17 @@ TRAINING_SETTINGS = {
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
     "outcome_horizon_hours": 48.0,
+
+    # P5 — Per-position outcome BCE coefficient in Phase 3 (structural
+    # diagnostic, not a KEEP/DISCARD candidate). The Phase-3 loss is
+    # `coef * loss_outcome_raw + λ_ranking * loss_ranking_raw`. The
+    # baseline (B0-C-ttt running best) uses coef=1.0. P5 sets coef=0.02
+    # to test whether the per-position BCE was redundant for ranking-based
+    # discrimination, or whether it's the calibration anchor that keeps
+    # 48-h logits well-formed.
+    #   - Patient AUROC holds + cap=48h doesn't collapse → per-position BCE
+    #     was redundant for ranking; keep small for calibration only.
+    #   - Patient AUROC drops OR cap=48h collapses → per-position BCE is
+    #     the calibration anchor; keep at 1.0.
+    "phase3_outcome_bce_coef": 0.02,   # P5 — diagnostic down-weight
 }
