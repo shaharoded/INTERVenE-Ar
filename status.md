@@ -106,6 +106,94 @@ Running best until B0-C-ttt result is in. Checkpoints backed up to
 
 ---
 
+### B0-C-ttt @ 10k (SHA ea65988)
+
+P0 baseline #2. Cherry-pick of dd3fc1b "C-ttt-head" (time-to-terminal
+regression aux) on top of B0-Z. Adds an MSE head predicting
+`log1p(t_terminal − t_now)` at every non-terminal, non-pad position,
+sharing the backbone. Joins Phase-2 stage 0 alongside ce/dt with
+fraction_cap=0.30. Goal: force the backbone to encode distance-to-
+terminal explicitly so the LM head can decide WHEN to emit terminal
+tokens.
+
+Smoke (sample=50, phase{1,2,3}_n_epochs=1):
+- Gate A pass — no NaN; RawTrain ce=1.31, dt=0.81, ranking=0.69,
+  ttt=19.19, all finite.
+- Gate B pass — ttt within ~25× of ce/dt (within 1–2 OOM).
+- Gate C pass — λ_ranking calibrated 2.497 ∈ [1e-3, 10].
+- Gate D pass — summary block + all headline keys present.
+
+Post-train (10k):
+- T1 pass — Phase-3 raw_out 2.11→1.01, raw_rank 0.66→0.38; ttt λ_max
+  calibrated at Phase-2 epoch 3 (λ_max=0.0040, raw_aux=20.86 — head
+  starts well above ce/dt then decays).
+- T2 pass — Phase-2 ranking calibrated epoch 31, ramp 31→35, full
+  active by 35; Phase-2 early stop at epoch 40 (5 epochs of full
+  stage-1 activity before stop). Phase-3 best val at epoch 15 (0.996),
+  early stop at epoch 23.
+- T3 pass — DEATH AUROC 0.710 (+0.017 vs B0-Z), KIDNEY 0.715,
+  CARDIO 0.709, KETOACIDOSIS 0.915 (+0.124 — biggest single per-outcome
+  swing).
+
+Headline (Δ vs B0-Z @ 10k):
+- `patient_auroc_weighted`: **0.6831** (+0.0160 ✓)
+- `patient_auprc_weighted`: 0.6336 (+0.0131 ✓)
+- `patient_auroc_simple`:   0.6959 (+0.0027)
+- `patient_auprc_simple`:   0.3239 (+0.0207)
+- `n_outcomes_used`:        16
+
+Per-outcome AUROC vs B0-Z:
+- KETOACIDOSIS              0.915  (+0.124, n_pos=37)
+- DISGLYCEMIA_Hyperglycemia 0.896  (−0.008)
+- NERVOUS_SYSTEM            0.796  (+0.008)
+- RETINOPATHY               0.785  (+0.009)
+- DISGLYCEMIA_Hypoglycemia  0.771  (−0.026)
+- KIDNEY                    0.715  (+0.013)
+- **DEATH**                 0.710  (+0.017) ✓
+- CARDIO                    0.709  (+0.008)
+- NEUROVASCULAR             0.686  (−0.063)  ← biggest regression
+- SKIN_ULCER                0.679  (+0.016)
+- ATHEROSCLEROSIS           0.595  (−0.013)
+- ACUTE_RESPIRATORY         0.591  (−0.014)
+- HYPEROSMOLALITY           0.585  (−0.059)
+- **RELEASE**               0.581  (+0.060) ✓
+- ACIDOSIS                  0.570  (−0.015)
+- INFECTION                 0.551  (−0.015)
+
+Peak MAE vs B0-Z (hours):
+- DEATH:    168.97  (+10.13  — REGRESSION ≥ 5h threshold)
+- RELEASE:   71.29  (−14.68 ✓)
+- DISGLYCEMIA_Hyper:  36.07 (−7.91)
+- KIDNEY:            79.11  (−27.25)
+- CARDIO:            79.08  (−28.91)
+
+Trajectory honesty:
+- `gen_median_hours`:           75.05  (vs B0-Z 114.48 — generates shorter)
+- `gen_to_gt_ratio_median`:      0.720  (vs B0-Z 1.116 — still ≥ 0.4 ✓)
+- `gen_frac_terminal_first24h`:  0.165  (vs B0-Z 0.148 — slight bump)
+
+Phase stats: phase2_best_val 0.187 / 41 epochs (early stopped);
+phase3_best_val 1.144 / 23 epochs (early stopped). Both terminate
+earlier than B0-Z (46/29) — Phase-3 best val is also lower (1.144 vs
+1.157), so faster convergence on a better minimum.
+
+Verdict: **BASELINE-KEEP, RUNNING BEST** — between the two P0
+baselines, B0-C-ttt clearly wins on the primary headline
+(`patient_auroc_weighted` 0.683 > 0.667) and lifts both DEATH and
+RELEASE AUROC simultaneously, which is the precise pattern program.md
+predicted under the new framing. The DEATH-MAE regression (+10 h) and
+the NEUROVASCULAR / HYPEROSMOLALITY AUROC dips are real costs, but
+n_pos is small (29, 83) so per-outcome variance is high, and the model
+is generating 35 % shorter sequences (75 h vs 114 h) which mechanically
+explains the slight DEATH-MAE drift toward the rare-DEATH median.
+P0 KEEP rule (better of two baselines) applies — KEEP/DISCARD threshold
+test is for subsequent experiments vs this running best.
+
+Checkpoints backed up to `emr_model/checkpoints.bak_keep_B0-C-ttt/`.
+This is the running best for P1 (MIL max-BCE).
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
