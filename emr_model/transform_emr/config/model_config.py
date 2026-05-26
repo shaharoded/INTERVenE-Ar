@@ -99,17 +99,4 @@ TRAINING_SETTINGS = {
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
     "outcome_horizon_hours": 48.0,
-
-    # P4 — patient-level attention pool head (Phase 3 only).
-    # Per-outcome learnable query embeddings cross-attend over the backbone's
-    # final hidden states to produce one pooled feature per (patient, outcome).
-    # A scalar projection turns each pooled feature into a patient-level
-    # logit; BCE against patient_label[b, k] = "outcome k appears anywhere in
-    # the non-pad GT trajectory". λ_pool calibrated once at the end of
-    # Phase-3 epoch 1, capped at this fraction of raw outcome BCE — same
-    # regime as ranking. Pool head trains at Phase-3 head LR; its gradient
-    # flows through the hidden-state stash into the backbone at
-    # backbone_lr_factor=0.01, protecting the outcome head from patient-level
-    # coarseness.
-    "phase3_pool_fraction_cap": 0.20,
 }
