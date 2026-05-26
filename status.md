@@ -597,6 +597,119 @@ output can only be a training-time aux, similar in spirit to P1 MIL).
 
 ---
 
+### P4-pool @ 10k (SHA fd54851) — DISCARD
+
+P4 direction. Added a patient-level attention pool head as a Phase-3
+aux: per-outcome learnable query embeddings cross-attend over the
+backbone's stashed final hidden state (`model._last_hidden`), a
+scalar projection turns the pooled feature into a patient-level logit,
+BCE against patient_label. ~270K head params (6.42 M → 6.69 M).
+
+Key structural distinction from P1-MIL: pool gradient flows backward
+through the HIDDEN STATE (into the backbone at backbone_lr_factor=
+0.01), NOT through outcome_logits → outcome_head. The outcome head's
+per-position joint Phase-2 optimum is therefore protected — a
+hypothesis worth testing given P1's universal per-outcome collapse.
+
+Note on eval: program.md's P4 spec said the pool score "replaces
+'max P_outcome' in eval", but evaluation.py is read-only. The pool
+head therefore stays a training-time aux only.
+
+Per-aux training trace (P4 run — new schema, fully captured):
+
+| Aux            | Unlock epoch | λ_max  | Anchor raw_aux | Final raw_aux | Δ      | Status |
+|----------------|--------------|--------|----------------|---------------|--------|--------|
+| ce             | 4 (Ph-2)     | 0.0905 | 1.5220         | 0.0036        | −99.8% | learning |
+| dt             | 4 (Ph-2)     | 0.1711 | 0.8047         | 0.0415        | −94.8% | learning |
+| ttt            | 4 (Ph-2)     | 0.0039 | 21.0039        | 0.0605        | −99.7% | learning |
+| ranking (Ph-2) | 33 (Ph-2)    | 0.0314 | 0.1121         | 0.0623        | −44.4% | learning |
+| out (Ph-3)     | 1 (Ph-3)     | —      | 2.1888         | 0.9381        | −57.1% | learning |
+| ranking (Ph-3) | 1 (Ph-3)     | 0.668  | 0.6554         | 0.3399        | −48.1% | learning |
+| pool (Ph-3)    | 1 (Ph-3)     | 0.396  | 1.1062         | 0.1778        | −83.9% | learning |
+
+Notable: Phase-2 ranking descends here (-44%), unlike the
+B0-C-ttt-ablation where it was stale (+7%). The presence of P4's pool
+aux during Phase 3 may not affect Phase 2 directly (P4 only fires in
+Phase 3), so the difference is likely run-to-run variance — same
+recipe, different random init / data ordering effects.
+
+Smoke (sample=50, phase{1,2,3}_n_epochs=1):
+- Gates A–D pass. raw_pool=1.06, λ_pool=1.636 ∈ [1e-3, 10].
+- Total params: 6.69 M (vs 6.42 M baseline).
+
+Headline (Δ vs B0-C-ttt running best):
+- `patient_auroc_weighted`: **0.7015** (+0.0184)
+- `patient_auprc_weighted`: 0.6461 (+0.0125)
+- `patient_auroc_simple`:   0.7063 (+0.0104)
+- `patient_auprc_simple`:   0.3173 (−0.0066)
+- `n_outcomes_used`:        16
+
+Per-outcome AUROC vs B0-C-ttt — mixed: 11 outcomes improve, 5 regress
+past the 0.010 threshold:
+- DISGLYCEMIA_Hyper:  0.893  (−0.003)
+- DISGLYCEMIA_Hypo:   0.777  (+0.006)
+- **KIDNEY**:         0.769  (+0.054) ✓
+- KETOACIDOSIS:       0.767  (**−0.148**) ✗
+- SKIN_ULCER:         0.753  (+0.074) ✓
+- NERVOUS_SYSTEM:     0.751  (−0.045) ✗
+- RETINOPATHY:        0.739  (−0.046) ✗
+- CARDIO:             0.717  (+0.008)
+- NEUROVASCULAR:      0.708  (+0.022)
+- **DEATH**:          0.672  (**−0.038**) ✗  ← key clinical outcome
+- ATHEROSCLEROSIS:    0.658  (+0.063)
+- HYPEROSMOLALITY:    0.640  (+0.055)
+- ACUTE_RESPIRATORY:  0.633  (+0.042)
+- INFECTION:          0.627  (+0.076)
+- ACIDOSIS:           0.602  (+0.032)
+- **RELEASE**:        0.597  (+0.016)
+
+Peak MAE vs B0-C-ttt:
+- DEATH:    151.85 (−17.12) ✓ — substantial improvement
+- RELEASE:   78.67 (+7.38) ✗ — regress past 5h threshold
+- KIDNEY:    60.87 (−18.24)
+- CARDIO:    58.61 (−20.47)
+
+Trajectory honesty:
+- `gen_median_hours`:           116.96  (+41.91 vs B0-C-ttt)
+- `gen_to_gt_ratio_median`:       1.148  (≥ 0.4 ✓)
+- `gen_frac_terminal_first24h`:   0.178
+
+Phase stats: phase2_best_val 0.184 / 42 epochs; phase3_best_val 1.130
+/ 30 epochs (early stopped, best at epoch 1 for selection-metric
+purposes — vl_select trajectory: 1.13 → 1.05 → 1.02 → 0.99 → 0.99
+plateau).
+
+Verdict: **DISCARD**. The falsifiable for P4 was patient AUROC ≥
++0.050 vs P1+P2+P3 best; since P1/P2/P3 all DISCARDed, the comparison
+is vs B0-C-ttt 0.6831, target ≥ 0.7331. P4 reached 0.7015 — a real
++0.018 lift but well below the +0.050 falsifiable.
+
+The KEEP rule also fails the "no headline regresses ≥ 0.010" prong:
+DEATH AUROC −0.038 (key clinical headline), KETOACIDOSIS −0.148 (rare
+but headline), NERVOUS_SYSTEM −0.045, RETINOPATHY −0.046, RELEASE MAE
++7.4 h. The weighted-AUROC lift comes from outcomes the model wasn't
+already strong on (INFECTION, ATHEROSCLEROSIS, KIDNEY, SKIN_ULCER all
++0.04 to +0.08); the structural cost is that the model trades DEATH
+and KETOACIDOSIS sensitivity for that breadth. The mechanism is
+plausible — the pool's patient-level supervision encourages the
+backbone to encode broad outcome distinguishability rather than peak-
+sharp per-outcome calibration, which is what the per-position eval
+metric rewards for DEATH/KETOACIDOSIS.
+
+All per-aux traces clean (no stale auxes in this run, including the
+Phase-2 ranking that was stale in the ablation — different
+batch-ordering noise). T1 fully passes for the new pool aux
+(−83.9 % descent).
+
+Reverting per loop step 9. B0-C-ttt remains the running best.
+
+This is the 4th DISCARD in a row (P1, P2, P3, P4). Per program.md
+stop criterion, we are at "last 2-3 10k experiments DISCARDed" — but
+P5 (BCE ablation, structural diagnostic — NOT a KEEP/DISCARD
+candidate) is still owed. Proceeding to P5.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
