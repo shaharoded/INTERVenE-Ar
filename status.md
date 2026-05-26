@@ -35,7 +35,11 @@ Each block records: tag, what changed (1–2 lines), smoke gate results,
 post-train gate results, headline numbers (`patient_auroc_weighted`,
 per-outcome AUROC for DEATH/RELEASE/each complication, peak-MAE),
 trajectory honesty (`gen_to_gt_ratio_median`,
-`gen_frac_terminal_first24h`), verdict (KEEP / DISCARD) with reason.
+`gen_frac_terminal_first24h`), **per-aux training trace** (table with
+unlock epoch, λ_max, anchor raw_aux at calibration, final raw_aux at
+end of phase, Δ%) for every aux active in any phase, verdict
+(KEEP / DISCARD) with reason. Flag `|Δ| < 5 %` auxes explicitly —
+they're not learning.
 
 ### B0-Z @ 10k (SHA 8d3cf18)
 

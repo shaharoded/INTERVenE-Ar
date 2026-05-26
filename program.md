@@ -63,6 +63,23 @@ Full-data confirm only at end of a block or when running best is stable.
    T3: diagnose.py shows real discrimination on key probes.
 6. Append row to results/results-trajectory-fix.tsv (new headline keys).
 7. Write `### <tag>` block in status.md → `Verdict: KEEP|DISCARD — …`.
+   **Mandatory in every block — per-aux training trace** (one table per
+   experiment, for every aux loss term active in any phase, both new ones
+   AND inherited ones):
+   ```
+   | Aux       | Unlock epoch | λ_max  | Anchor raw_aux | Final raw_aux | Δ      |
+   |-----------|--------------|--------|----------------|---------------|--------|
+   | ce        | 4 (Ph-2)     | 0.0779 | 1.504          | 0.234         | -84%   |
+   | dt        | 4 (Ph-2)     | 0.1440 | 0.814          | 0.412         | -49%   |
+   | ttt       | 4 (Ph-2)     | 0.0034 | 20.86          | <FILL>        | <FILL> |
+   | ranking   | 32 (Ph-2)    | 0.0337 | 0.150          | <FILL>        | <FILL> |
+   ```
+   The "final raw_aux" is the value at the last epoch the phase ran
+   (= the last `RawTrain <aux>=…` line in run.log for that phase before
+   early-stop fires). Δ shows whether the aux actually descended. If
+   |Δ| < 5 %, the aux is not learning — flag it explicitly in the
+   verdict reasoning. T1 gate is about checking descent; this is how we
+   make it auditable.
 8. Journal commit + push.
 9. DISCARD → git revert --no-edit <CODE_SHA> && git push.
 10. KEEP → cp -r emr_model/checkpoints emr_model/checkpoints.bak_keep_<tag>.
