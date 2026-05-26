@@ -99,14 +99,4 @@ TRAINING_SETTINGS = {
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
     "outcome_horizon_hours": 48.0,
-
-    # P1 — MIL patient-level max-BCE aux loss (Phase 3 only).
-    # Soft-max-attention pool of outcome logits over generated time steps,
-    # weighted by softmax(logit / T_k) with per-outcome learnable T_k
-    # (model.mil_log_T). Patient label = outcome occurred anywhere in the
-    # GT trajectory. Loss = pos-weighted BCE on (score_patient,
-    # patient_label). λ_mil is calibrated once at the end of Phase-3
-    # epoch 1 against the raw outcome BCE, capped to this fraction —
-    # mirrors the Phase-3 ranking aux regime so no new hyperparameter.
-    "phase3_mil_fraction_cap": 0.20,
 }
