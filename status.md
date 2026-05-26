@@ -284,6 +284,98 @@ Reverting code commit per loop step 9.
 
 ---
 
+### P2-time @ 10k (SHA 10abcc1) — DISCARD
+
+P2 direction. Added a positives-only soft-argmax onset-time aux to
+Phase 3: weighted softmax(logit / T_k) over time gives a continuous
+predicted onset time; smooth-L1 to the nearest GT occurrence
+(detached, scaled to hours). Per-outcome learnable `time_log_T`.
+λ_time calibrated once at Phase-3 epoch 1 (cap=0.20). Patients
+without the outcome contribute zero gradient.
+
+Smoke (sample=50, phase{1,2,3}_n_epochs=1):
+- Gates A–D pass after switching the smooth-L1 inputs from normalised
+  time (0…1) to hours (×336). Without the hour rescale λ_time
+  calibrated at 94 — outside the [1e-3, 10] band. With rescale:
+  raw_time=50.94 h, λ_time=0.034, in band.
+
+Post-train (10k):
+- T1 partial fail — raw_time barely moves over the 15 active Phase-3
+  epochs (61.9 → 57.8 h, then plateau). Aux gradient gets absorbed
+  into the joint optimum without actually reducing the time error.
+- T2 fail — Phase-3 best `vl_select` is **1.143** at epoch 10, worse
+  than B0-C-ttt's 1.010. Selection metric pure-outcome-BCE held
+  monotonically above the running-best optimum the entire run.
+- T3 fail — DEATH AUROC drops 0.710→0.631 (-0.079); the aux that was
+  supposed to refine onset timing actually weakened the per-position
+  discriminator that drives the eval headline.
+
+Headline (Δ vs B0-C-ttt running best):
+- `patient_auroc_weighted`: **0.5735** (−0.1097 — fails KEEP rule)
+- `patient_auprc_weighted`: 0.5551 (−0.0785)
+- `patient_auroc_simple`:   0.5687 (−0.1272)
+- `patient_auprc_simple`:   0.2526 (−0.0713)
+- `n_outcomes_used`:        16
+
+Per-outcome AUROC Δ vs B0-C-ttt — universal regression:
+- DISGLYCEMIA_Hyper:  0.814 (−0.082)
+- DISGLYCEMIA_Hypo:   0.641 (−0.130)
+- DEATH:              0.631 (−0.079)
+- NEUROVASCULAR:      0.623 (−0.063)
+- KIDNEY:             0.609 (−0.106)
+- ACUTE_RESPIRATORY:  0.592 (+0.001)
+- ACIDOSIS:           0.581 (+0.011)
+- CARDIO:             0.570 (−0.139)
+- RETINOPATHY:        0.547 (−0.238)
+- SKIN_ULCER:         0.531 (−0.149)
+- INFECTION:          0.529 (−0.023)
+- HYPEROSMOLALITY:    0.514 (−0.071)
+- ATHEROSCLEROSIS:    0.506 (−0.089)
+- KETOACIDOSIS:       0.493 (−0.422)  ← chance
+- NERVOUS_SYSTEM:     0.475 (−0.322)  ← below chance
+- RELEASE:            0.444 (−0.137)  ← below chance
+
+Peak MAE (hours, mixed; falsifiable wanted ≥−5 h for both):
+- DEATH:    156.06 (−12.91 ✓)
+- RELEASE:   81.38 (+10.09 ✗)
+- DISGLYCEMIA_Hyper:  26.11 (−9.96)
+- KIDNEY:             84.86 (−21.50)
+- CARDIO:            121.54 (+42.46 ✗)
+
+Trajectory honesty:
+- `gen_median_hours`:           79.40
+- `gen_to_gt_ratio_median`:      0.770 (≥ 0.4 ✓)
+- `gen_frac_terminal_first24h`:  **0.421**  ← 2.6× the B0-C-ttt rate;
+  the time aux made the model commit to early terminal emission, which
+  collapses the rare-outcome discrimination because every patient
+  trajectory ends so quickly there's no time to differentiate.
+
+Phase stats: phase2_best_val 0.187 / 40 epochs; phase3_best_val 1.152
+/ 15 epochs (early stopped, never recovered).
+
+Verdict: **DISCARD**. Falsifiable failed on both prongs (RELEASE MAE
+regressed and patient AUROC regressed catastrophically). Even DEATH
+MAE improvement is hollow — the trajectory now collapses to terminal
+within 24 h for 42 % of patients, which structurally pulls the DEATH
+peak time forward without actually predicting WHICH patient dies.
+
+Same failure family as P1: a patient-level/coarse-time aux added to
+Phase 3 corrupts the per-position discriminator that B0-C-ttt's
+per-position BCE + ranking carefully built. The shared lesson is
+that Phase-3 aux losses that target the eval metric directly (MIL
+in P1, soft-argmax onset in P2) push the head into a degenerate
+sharp-peak regime — gain on the targeted metric, collapse on the
+rest. The per-position BCE anchor at λ=1.0 is not strong enough on
+its own to hold the optimum when a 0.20-capped aux pulls in a
+fundamentally different direction.
+
+This is the second DISCARD in a row. Reverting per loop step 9.
+Proceeding to P3 (risk-aware LM head — architectural coupling),
+which works at the LM head rather than the outcome head and therefore
+won't fight the per-position BCE head-on.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
