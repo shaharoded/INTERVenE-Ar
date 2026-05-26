@@ -376,6 +376,112 @@ won't fight the per-position BCE head-on.
 
 ---
 
+### P3-coupling @ 10k (SHA 7838ac3) — DISCARD
+
+P3 direction. Added bias_proj: nn.Linear(K → V) zero-init, applied to
+sigmoid(outcome_logits), summed into lm_logits at the same position.
+Coupling forms during Phase 2 (LM CE flows through bias_proj into the
+joint backbone); Phase 3 refines outcome_head. Per-epoch ratio
+||bias|| / ||lm_only_logits|| tracked.
+
+Smoke (sample=50, phase{1,2,3}_n_epochs=1):
+- Gates A–D pass.
+- P3a constructor-time zero-init verified at __init__ (assert in __init__).
+- P3c shape contract verified — outcome_logits (B,T,K), logits (B,T,V),
+  bias (B,T,V) match.
+- P3b grad norms info: outcome_head[-1] 3.79 (active), bias_proj 0
+  (expected — no LM CE in Phase 3), lm_head 0.45 (through tied input
+  embedding).
+- Smoke p3_ratio_mean 0.108, max 0.125 — in [0.05, 0.30] healthy band.
+
+Post-train (10k):
+- T1 partial — outcome head trained (raw_out 1.20→1.02 over 35 P3
+  epochs), but Phase-3 train loss starts wildly high (epoch 1
+  train=17.90, raw_out=17.90) because Phase 2 over-trained the
+  coupling. The outcome head's logits at Phase 2 boundary are extreme
+  (the coupling shapes them toward LM utility, not BCE calibration).
+- T2 — Phase 3 ran 35 epochs (early stop at 36). vl_select dropped to
+  0.980 — actually LOWER than B0-C-ttt's 1.010 best. But this lower
+  selection metric did NOT translate to better headline AUROC, because
+  the coupling distorted the outcome logits away from per-outcome
+  ranking optima.
+- T3 — DEATH AUROC dropped to 0.670 (-0.040 vs running best).
+- p3_ratio at Phase-3 start: 1.10 (bias DOMINATES lm_only — way above
+  [0.05, 0.30]). By end of Phase 3 the ratio settled to 0.047 mean
+  (just below band), 0.46 max — Phase-3 training partially undid the
+  coupling but the model never recovered the running-best optimum.
+
+Headline (Δ vs B0-C-ttt running best):
+- `patient_auroc_weighted`: **0.6473** (−0.0358 — fails KEEP rule)
+- `patient_auprc_weighted`: 0.6217 (−0.0119)
+- `patient_auroc_simple`:   0.6714 (−0.0244)
+- `patient_auprc_simple`:   0.3051 (−0.0188)
+- `n_outcomes_used`:        16
+
+Per-outcome AUROC Δ vs B0-C-ttt — mixed but DEATH and RELEASE both regressed:
+- DISGLYCEMIA_Hyper:  0.874 (−0.022)
+- DISGLYCEMIA_Hypo:   0.818 (+0.047)
+- NERVOUS_SYSTEM:     0.773 (−0.023)
+- KIDNEY:             0.747 (+0.032)
+- CARDIO:             0.736 (+0.027)
+- RETINOPATHY:        0.720 (−0.066)
+- NEUROVASCULAR:      0.712 (+0.026)
+- **DEATH**:          0.670 (−0.040)
+- KETOACIDOSIS:       0.651 (−0.265)
+- SKIN_ULCER:         0.650 (−0.030)
+- HYPEROSMOLALITY:    0.607 (+0.022)
+- ACUTE_RESPIRATORY:  0.601 (+0.010)
+- ACIDOSIS:           0.596 (+0.026)
+- ATHEROSCLEROSIS:    0.592 (−0.003)
+- INFECTION:          0.573 (+0.022)
+- **RELEASE**:        0.425 (−0.156)  ← below chance, biggest collapse
+
+Peak MAE (hours, Δ vs B0-C-ttt):
+- DEATH:    155.08 (−13.89, ✓)
+- RELEASE:   73.55 (+2.26)
+- DISGLYCEMIA_Hyper:  34.59 (−1.48)
+- KIDNEY:             91.71 (−14.65)
+
+Trajectory honesty:
+- `gen_median_hours`:           176.06  (vs 75.05 — over-generates ~2.3×)
+- `gen_to_gt_ratio_median`:      1.694  (above 1.0 but ≥ 0.4 ✓)
+- `gen_frac_terminal_first24h`:  **0.005**  (vs 0.165 — model essentially
+  refuses to terminate early; mechanistic explanation for the RELEASE
+  collapse: RELEASE is 87% prevalence and is a terminal token, and the
+  coupling steers the LM AWAY from emitting terminals → the LM almost
+  never emits RELEASE, so its detection collapses).
+
+Phase stats: phase2 38 epochs; phase3 35 epochs (early stopped at 36).
+
+Verdict: **DISCARD**. Falsifiable required DEATH AND RELEASE AUROC
+both ≥ +0.030 — both regressed. RELEASE collapsed below chance
+(0.425). The coupling at Phase 2 trained the LM to lean on the
+outcome path for emission decisions, but the bias dominated by end of
+Phase 2 (||bias||/||lm_only||≈1.1) and the LM head atrophied — at
+inference the model can't generate trajectories that include the
+terminal-class tokens (RELEASE/DEATH) at appropriate times, so
+RELEASE detection collapses despite the coupling's intent to PROMOTE
+terminal-token emission.
+
+The architecture is sound; the problem is the LR/cap regime during
+Phase 2 — bias_proj got too much budget and the LM head atrophied.
+A targeted retry would need to (a) cap bias_proj's contribution to
+||lm_logits|| (e.g., normalize bias by a learned scalar with prior
+that keeps ratio ≤ 0.3), (b) gate bias_proj behind a slow ramp during
+Phase 2, or (c) add a regularizer on bias_proj.weight to keep it
+small. None of these are in scope for the current 10k probe regime
+— program.md's P3 spec is exactly what was tested, and that spec
+yielded a clear DISCARD.
+
+Three DISCARDs in a row. Per program.md stop criterion, this nudges
+toward halting, but P4 (patient-level pooling head) is structurally
+different from P1/P2/P3 — different head architecture, different
+loss path. Worth one more probe before concluding.
+
+Reverting (loop step 9) and proceeding to P4.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
