@@ -99,13 +99,4 @@ TRAINING_SETTINGS = {
     # at log(12 / 336). outcome_horizon_hours hard-zeros any contribution beyond that
     # horizon (kept in sync with the eval window family).
     "outcome_horizon_hours": 48.0,
-
-    # P2 — soft-argmax time loss (Phase 3, positives only).
-    # predicted_t[b, k] = sum_t softmax(logit_outcome / T_k)_t * abs_ts[t]
-    # loss_time = smooth_l1(predicted_t, nearest_GT_time_for_outcome_k)
-    # averaged over (b, k) pairs where outcome k occurred in the GT.
-    # λ_time calibrated once at end of Phase-3 epoch 1, capped at this
-    # fraction of raw outcome BCE — same regime as ranking. Per-outcome T_k
-    # is the learnable model.time_log_T parameter (init T=1.0).
-    "phase3_time_fraction_cap": 0.20,
 }

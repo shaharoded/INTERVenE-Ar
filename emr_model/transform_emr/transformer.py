@@ -420,13 +420,6 @@ class GPT(nn.Module):
         _init_log_tau = math.log(12.0 / 336.0)
         self.outcome_log_tau = nn.Parameter(torch.full((self.num_outcomes,), _init_log_tau))
 
-        # P2 — soft-argmax time loss (positives-only, Phase-3 aux). Per-outcome
-        # learnable soft-max temperature for the time-attention pool over
-        # outcome logits. init log_T = 0 → T=1.0. Clamped to [0.1, 10] in the
-        # loss to keep the softmax numerically safe. Trained in Phase 3
-        # alongside outcome_head (head LR group).
-        self.time_log_T = nn.Parameter(torch.zeros(self.num_outcomes))
-
         # Direction E (Y-narrow-terminal-tau): per-token-class log-tau for the
         # LM-head multi-hot BCE soft kernel.
         #   - default tokens          → log(12 / 336)  (~12h, learnable)
@@ -820,14 +813,6 @@ class GPT(nn.Module):
                   f"({len(_ttt_keys_missing)} keys). This is expected when "
                   f"loading a pre-direction-C checkpoint.")
             missing = missing - _ttt_keys_missing
-
-        # P2 — time_log_T was added with the soft-argmax time aux. Pre-P2
-        # checkpoints don't carry it. Allow load with zeros init (T=1.0); the
-        # parameter is a training-time aux only.
-        if "time_log_T" in missing:
-            print("[GPT.load] time_log_T not in ckpt — keeping zero init "
-                  "(softmax T=1). Expected when loading a pre-P2 checkpoint.")
-            missing = missing - {"time_log_T"}
 
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
@@ -1400,19 +1385,16 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
-        # P2: time_log_T is trained alongside outcome_head at head LR (not
-        # backbone LR). It's a 1-D tensor — no weight decay.
-        head_param_objs = list(m.outcome_head.parameters()) + [m.time_log_T]
-        head_ids = {id(p) for p in head_param_objs}
-        backbone_params = [p for _, p in m.named_parameters() if id(p) not in head_ids]
+        head_names = {"outcome_head"}
+        backbone_params = [p for n, p in m.named_parameters()
+                           if not any(h in n for h in head_names)]
+        head_params = list(m.outcome_head.parameters())
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
                  "weight_decay": training_settings["weight_decay"]},
-                {"params": list(m.outcome_head.parameters()), "lr": p3_lr,
+                {"params": head_params,     "lr": p3_lr,
                  "weight_decay": p3_wd},
-                {"params": [m.time_log_T],  "lr": p3_lr,
-                 "weight_decay": 0.0},
             ],
         )
 
@@ -1466,17 +1448,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                                      .get("ranking", 0.20))
     lambda_ranking: float | None = None  # set after epoch 1
 
-    # P2 — soft-argmax time loss, positives-only. Per-outcome soft-attention
-    # pool of outcome logits over time gives a continuous predicted onset
-    # time; smooth_l1 against the nearest GT occurrence (detached). λ_time
-    # calibrated once at end of Phase-3 epoch 1, capped at fraction of
-    # raw outcome BCE — same regime as ranking.
-    time_cap = training_settings.get("phase3_time_fraction_cap", 0.20)
-    lambda_time: float | None = None
-    # Cache outcome token ids on device — used by gt_mask in the time loss.
-    outcome_ids_t = torch.tensor(outcome_token_ids, dtype=torch.long, device=device)
-    pad_idx = model.embedder.padding_idx
-
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
         model.eval()
@@ -1484,7 +1455,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             model.outcome_head.train()
 
         total_loss = total_outcome = 0.0
-        total_outcome_raw = total_ranking_raw = total_time_raw = 0.0
+        total_outcome_raw = total_ranking_raw = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
@@ -1533,58 +1504,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 _lam = lambda_ranking if lambda_ranking is not None else 0.0
                 loss_ranking = _lam * loss_ranking_raw
 
-                # P2 — soft-argmax time loss (positives-only).
-                # weights_t = softmax(logit / T_k)_t over the T-1 generated
-                # positions (padded positions get -inf logit → zero mass).
-                # predicted_t[b, k] = sum_t weights_t * abs_ts[t]; the
-                # continuous "argmax onset time" the model emits for
-                # outcome k. Target = nearest GT occurrence time for that
-                # outcome in the patient's full trajectory; the index is
-                # picked by argmin distance and detached so it doesn't
-                # backprop through the gather. Smooth-L1 against that
-                # target, averaged over (b, k) pairs where the outcome
-                # actually occurred in the GT trajectory. Negative
-                # patients contribute zero — direct MAE optimisation
-                # without the coarse-pull failure mode P1-MIL hit.
-                _abs_ts_pred = batch["abs_ts"][:, :-1].unsqueeze(-1)        # [B, T-1, 1]
-                _abs_ts_full = batch["abs_ts"]                              # [B, T]
-                _T_time = model.time_log_T.exp().clamp(min=0.1, max=10.0).view(1, 1, -1)
-                _ti_neg_inf = torch.finfo(outcome_pred.dtype).min
-                _masked_pred = outcome_pred.masked_fill(~valid_pos, _ti_neg_inf)  # [B, T-1, K]
-                _w_time = torch.softmax(_masked_pred / _T_time, dim=1)            # [B, T-1, K]
-                predicted_t = (_w_time * _abs_ts_pred).sum(dim=1)                 # [B, K]
-
-                _ft_e = full_targets.unsqueeze(-1)                       # [B, T, 1]
-                _oid  = outcome_ids_t.view(1, 1, -1)                     # [1, 1, K]
-                _nonpad_full = (full_targets != pad_idx).unsqueeze(-1)   # [B, T, 1]
-                gt_mask = ((_ft_e == _oid) & _nonpad_full)               # [B, T, K]
-                has_outcome = gt_mask.any(dim=1)                         # [B, K]
-
-                # Nearest GT time per (b, k): argmin |abs_ts - predicted_t|
-                # restricted to GT-positive positions. Detach so gradient
-                # flows only through predicted_t, not through the gather
-                # index selection.
-                _abs_diff = (_abs_ts_full.unsqueeze(-1) - predicted_t.detach().unsqueeze(1)).abs()
-                _abs_diff_masked = _abs_diff.masked_fill(~gt_mask, float("inf"))
-                _nearest_idx = _abs_diff_masked.argmin(dim=1)                    # [B, K]
-                nearest_gt_t = _abs_ts_full.gather(1, _nearest_idx)              # [B, K]
-                # Smooth-L1 (sum over (b, k) positives, then mean).
-                # abs_ts is normalised by 336 h → multiply both sides by 336 so
-                # the loss lives in hour units: typical raw_time ~ 5-30 h, on
-                # the same order as raw_outcome BCE so the cap=0.20 calibration
-                # lands λ in [1e-3, 10] without per-experiment tuning.
-                _has = has_outcome.float()
-                _loss_per = nn.functional.smooth_l1_loss(
-                    predicted_t * _ABS_TS_SCALE,
-                    (nearest_gt_t * _ABS_TS_SCALE).detach(),
-                    reduction="none",
-                )                                                                 # [B, K]
-                _denom = _has.sum().clamp(min=1.0)
-                loss_time_raw = (_loss_per * _has).sum() / _denom
-                _lam_time = lambda_time if lambda_time is not None else 0.0
-                loss_time = _lam_time * loss_time_raw
-
-                loss = loss_outcome + loss_ranking + loss_time
+                loss = loss_outcome + loss_ranking
 
                 if train_flag:
                     if not torch.isfinite(loss):
@@ -1599,7 +1519,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 total_outcome     += loss_outcome.item()
                 total_outcome_raw += loss_outcome_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
-                total_time_raw    += loss_time_raw.item()
 
         n = max(len(loader), 1)
         return {
@@ -1607,7 +1526,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             "outcome":     total_outcome     / n,
             "outcome_raw": total_outcome_raw / n,
             "ranking_raw": total_ranking_raw / n,
-            "time_raw":    total_time_raw    / n,
         }
 
     n_epochs = training_settings["phase3_n_epochs"]
@@ -1624,13 +1542,6 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                   f"(cap={ranking_cap}, raw_outcome={tr['outcome_raw']:.6f}, "
                   f"raw_ranking={tr['ranking_raw']:.6f})")
 
-        # P2 — one-shot λ_time calibration at the end of epoch 1.
-        if lambda_time is None and tr["time_raw"] > 0.0:
-            lambda_time = time_cap * (tr["outcome_raw"] / tr["time_raw"])
-            print(f"[Phase-3]: λ_time calibrated = {lambda_time:.6f} "
-                  f"(cap={time_cap}, raw_outcome={tr['outcome_raw']:.6f}, "
-                  f"raw_time={tr['time_raw']:.6f})")
-
         tr_loss, vl_loss = tr["loss"], vl["loss"]
         # Selection metric: pure outcome BCE (stable across the λ=0 → λ=λ_cal
         # transition). This is what the eval ultimately measures.
@@ -1640,7 +1551,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
         print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}  "
               f"raw_out={tr['outcome_raw']:.7f}  raw_rank={tr['ranking_raw']:.7f}  "
-              f"raw_time={tr['time_raw']:.7f}  vl_select={vl_select:.6f}")
+              f"vl_select={vl_select:.6f}")
 
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)
