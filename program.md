@@ -66,6 +66,7 @@ Full-data confirm only at end of a block or when running best is stable.
 8. Journal commit + push.
 9. DISCARD → git revert --no-edit <CODE_SHA> && git push.
 10. KEEP → cp -r emr_model/checkpoints emr_model/checkpoints.bak_keep_<tag>.
+    Then run an ABLATION (next section) before proceeding.
 11. After each KEEP, re-eval running best at 10k (--eval-only) to refresh.
 12. FULL-DATA CONFIRM (sample=None) when running best stable across
     2–3 DISCARDs, OR a block ends, OR user asks.
@@ -79,6 +80,28 @@ Full-data confirm only at end of a block or when running best is stable.
 - `gen_to_gt_ratio_median` doesn't drop below 0.4.
 
 Otherwise DISCARD → revert.
+
+### Ablation discipline (mandatory after each KEEP)
+
+A KEEP that stacks on a prior KEEP creates **attribution debt** — you don't
+know whether the gain came from the new change or from the prior one
+still doing the work. Before declaring a new KEEP final and moving to
+the next direction, run **one ablation that isolates the new change** at
+10k: strip the prior intervention and re-test with only the new change
+on the bare baseline.
+
+Example: after `B0-C-ttt` KEEPs vs `B0-Z`, run `C-ttt-on-baseline` —
+the C-ttt aux head applied to the bare M-256 (without Z's frozen-tau).
+If AUROC is comparable, the simpler recipe wins; demote Z and use bare
+M-256 + C-ttt as the running best. If the stacked version is meaningfully
+better, the prior intervention is doing real work — keep the stack.
+
+Ablation outcomes get a journal block (`### <tag>-ablation`) and a
+ledger row tagged `ABLATION`. They never count as new KEEPs; they
+either confirm the running best or simplify it.
+
+This step is **not optional** — skipping it causes the loop to silently
+stack interventions that may be redundant.
 
 ## Research directions (in order)
 
@@ -217,13 +240,35 @@ Defer unless P1+P2+P3 plateau.
 
 **Falsifiable**: patient AUROC ≥ +0.05 vs P1+P2+P3.
 
-### P5 — Architecture scale-up
+### P5 — M0 ablation: per-position outcome BCE redundancy
 
-**Trigger**: P0–P4 honestly attempted, running best clearly beats
-`bak_originals` (≥ +0.03 patient AUROC, trajectory honesty preserved),
-recent 10k experiments DISCARDing.
+After P1–P4 honestly attempted, down-weight / disable per-position BCE
+(`aux_fraction_cap` → 0.02 or off). Structural diagnostic at 10k, not
+a KEEP/DISCARD candidate:
+- Patient AUROC holds + cap=48h doesn't collapse → per-position BCE
+  was redundant for ranking; keep small for calibration only.
+- cap=48h collapses → per-position BCE is the calibration anchor; keep.
 
-Lift M-256 lock. Scan grid with running-best loss recipe:
+This locks the **final loss recipe** before scale-up.
+
+### P6 — Architecture scale-up (FULL DATA ONLY, second-to-last)
+
+**This is NOT a 10k probe.** Architecture scale-up is reserved for the
+end of the loop, on the locked recipe, at full data. Running it at 10k
+mid-loop is **explicitly out of scope** — it burns hours on an
+architecture decision before the recipe is even finalised.
+
+**Strict trigger** (ALL must hold):
+- P0 through P5 (incl. ablations) have all been honestly attempted.
+- A clear running best exists with `patient_auroc_weighted` ≥ +0.03 vs
+  the B0-Z baseline, trajectory honesty preserved
+  (`gen_to_gt_ratio_median` ≥ 0.5).
+- The running best's loss recipe is **locked** — no further aux / coupling /
+  schedule changes will be made.
+- Last 2–3 10k experiments DISCARDed (running best stable).
+
+Lift M-256 lock. Scan grid with the locked recipe, **each variant a full-
+data run (sample=None, ~hours per variant)**:
 
 | Tag | embed_dim | n_layer | n_head | Approx params |
 |---|---|---|---|---|
@@ -233,24 +278,18 @@ Lift M-256 lock. Scan grid with running-best loss recipe:
 | M-512 | 512 | 6 | 8 | ~25 M |
 | M-768 | 768 | 8 | 12 | ~55 M |
 
-OOM at full-data confirm → halve batch + double grad-accum; if still
-OOM, that's the size ceiling.
+OOM → halve batch + double grad-accum; if still OOM, that's the size
+ceiling.
 
-**Decision**: smallest variant within ~0.005 of best (prefer smaller).
-Confirm at full data.
-
-### P6 — M0 ablation: per-position outcome BCE redundancy
-
-After P5, down-weight / disable per-position BCE (`aux_fraction_cap`
-→ 0.02 or off). Structural diagnostic, not a KEEP/DISCARD candidate:
-- Patient AUROC holds + cap=48h doesn't collapse → per-position BCE
-  was redundant for ranking; keep small for calibration only.
-- cap=48h collapses → per-position BCE is the calibration anchor; keep.
+**Decision**: smallest variant within ~0.005 of best at full data
+(prefer smaller). The winning architecture becomes the substrate for P7.
 
 ### P7 — Final: toggle `USE_QA_DATA` on the very best model
 
-**Trigger**: P5 chose architecture, P6 settled the loss recipe,
-running best is the genuine end-of-loop candidate.
+**Strict trigger** (ALL must hold):
+- P5 has settled the loss recipe.
+- P6 has chosen the winning architecture at full data.
+- The running best is the genuine end-of-loop candidate.
 
 Toggle `USE_QA_DATA = True` in
 `emr_model/transform_emr/config/dataset_config.py`. This adds context
