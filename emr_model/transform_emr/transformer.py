@@ -420,6 +420,15 @@ class GPT(nn.Module):
         _init_log_tau = math.log(12.0 / 336.0)
         self.outcome_log_tau = nn.Parameter(torch.full((self.num_outcomes,), _init_log_tau))
 
+        # P1 — MIL patient-level max-BCE aux loss (Phase 3).
+        # Per-outcome learnable soft-max temperature for the attention-pool of
+        # outcome logits over generated time-steps. log_T init = 0 → T=1.0.
+        # Trained in Phase 3 alongside outcome_head (head LR, not backbone LR).
+        # Lower T sharpens toward hard argmax (closer to peak detector at eval);
+        # higher T softens toward mean. We let each outcome learn its own
+        # operating point.
+        self.mil_log_T = nn.Parameter(torch.zeros(self.num_outcomes))
+
         # Direction E (Y-narrow-terminal-tau): per-token-class log-tau for the
         # LM-head multi-hot BCE soft kernel.
         #   - default tokens          → log(12 / 336)  (~12h, learnable)
@@ -813,6 +822,14 @@ class GPT(nn.Module):
                   f"({len(_ttt_keys_missing)} keys). This is expected when "
                   f"loading a pre-direction-C checkpoint.")
             missing = missing - _ttt_keys_missing
+
+        # P1 — mil_log_T was added with the MIL aux. Pre-P1 checkpoints don't
+        # carry it. Allow load with zeros init (T=1.0). The MIL pool is a
+        # training-time aux only; eval is unaffected.
+        if "mil_log_T" in missing:
+            print("[GPT.load] mil_log_T not in ckpt — keeping zero init "
+                  "(softmax T=1). Expected when loading a pre-P1 checkpoint.")
+            missing = missing - {"mil_log_T"}
 
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
@@ -1385,16 +1402,19 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head"}
-        backbone_params = [p for n, p in m.named_parameters()
-                           if not any(h in n for h in head_names)]
-        head_params = list(m.outcome_head.parameters())
+        # P1: mil_log_T is trained alongside outcome_head at head LR (not
+        # backbone LR). It's a 1-D tensor (no weight decay).
+        head_param_objs = list(m.outcome_head.parameters()) + [m.mil_log_T]
+        head_ids = {id(p) for p in head_param_objs}
+        backbone_params = [p for _, p in m.named_parameters() if id(p) not in head_ids]
         return torch.optim.AdamW(
             [
-                {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
+                {"params": backbone_params,  "lr": p3_lr * backbone_lr_factor,
                  "weight_decay": training_settings["weight_decay"]},
-                {"params": head_params,     "lr": p3_lr,
+                {"params": list(m.outcome_head.parameters()), "lr": p3_lr,
                  "weight_decay": p3_wd},
+                {"params": [m.mil_log_T],    "lr": p3_lr,
+                 "weight_decay": 0.0},
             ],
         )
 
@@ -1448,6 +1468,18 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                                      .get("ranking", 0.20))
     lambda_ranking: float | None = None  # set after epoch 1
 
+    # P1 — MIL patient-level max-BCE. Soft-max-attention pool of outcome
+    # logits over time, BCE'd against patient binary label
+    # (outcome occurred anywhere in the GT sequence). λ_mil is calibrated
+    # once at the end of epoch 1 from the epoch-1 raw outcome / raw mil
+    # ratio, same regime as ranking. The pool's softmax temperature is the
+    # learnable mil_log_T param (per outcome).
+    mil_cap = training_settings.get("phase3_mil_fraction_cap", 0.20)
+    lambda_mil: float | None = None
+    # Buffer the outcome token ids on device once (1-D long tensor).
+    outcome_ids_t = torch.tensor(outcome_token_ids, dtype=torch.long, device=device)
+    pad_idx = model.embedder.padding_idx
+
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
         model.eval()
@@ -1455,7 +1487,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             model.outcome_head.train()
 
         total_loss = total_outcome = 0.0
-        total_outcome_raw = total_ranking_raw = 0.0
+        total_outcome_raw = total_ranking_raw = total_mil_raw = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
@@ -1504,7 +1536,35 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 _lam = lambda_ranking if lambda_ranking is not None else 0.0
                 loss_ranking = _lam * loss_ranking_raw
 
-                loss = loss_outcome + loss_ranking
+                # P1 — MIL patient-level max-BCE.
+                # Patient label[b, k] = 1 if outcome k token appears anywhere
+                # in the (non-pad) GT trajectory. Soft-max-pool the outcome
+                # logits over T-1 generated positions, weighted by
+                # softmax(logit / T_k) with per-outcome learnable T_k.
+                # score_patient[b, k] = sum_t weights[b,t,k] * outcome_pred[b,t,k]
+                # Loss = pos-weighted BCE on (score_patient, patient_label).
+                # Padded positions get -inf logit so they contribute zero
+                # weight in the softmax.
+                _ft_e = full_targets.unsqueeze(-1)                 # [B, T, 1]
+                _oid  = outcome_ids_t.view(1, 1, -1)               # [1, 1, K]
+                _nonpad_full = (full_targets != pad_idx).unsqueeze(-1)  # [B, T, 1]
+                patient_label = ((_ft_e == _oid) & _nonpad_full).any(dim=1).float()  # [B, K]
+
+                _T = model.mil_log_T.exp().clamp(min=0.1, max=10.0).view(1, 1, -1)
+                _neg_inf = torch.finfo(outcome_pred.dtype).min
+                _masked_logits = outcome_pred.masked_fill(~valid_pos, _neg_inf)  # [B, T-1, K]
+                _weights = torch.softmax(_masked_logits / _T, dim=1)             # [B, T-1, K]
+                score_patient = (_weights * outcome_pred).sum(dim=1)             # [B, K]
+                # Use the same pos_weights as per-position BCE so rare outcomes
+                # don't vanish under the patient-level supervision.
+                loss_mil_raw = nn.functional.binary_cross_entropy_with_logits(
+                    score_patient, patient_label,
+                    pos_weight=pos_weights, reduction="mean",
+                )
+                _lam_mil = lambda_mil if lambda_mil is not None else 0.0
+                loss_mil = _lam_mil * loss_mil_raw
+
+                loss = loss_outcome + loss_ranking + loss_mil
 
                 if train_flag:
                     if not torch.isfinite(loss):
@@ -1519,6 +1579,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 total_outcome     += loss_outcome.item()
                 total_outcome_raw += loss_outcome_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
+                total_mil_raw     += loss_mil_raw.item()
 
         n = max(len(loader), 1)
         return {
@@ -1526,6 +1587,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             "outcome":     total_outcome     / n,
             "outcome_raw": total_outcome_raw / n,
             "ranking_raw": total_ranking_raw / n,
+            "mil_raw":     total_mil_raw     / n,
         }
 
     n_epochs = training_settings["phase3_n_epochs"]
@@ -1542,6 +1604,13 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                   f"(cap={ranking_cap}, raw_outcome={tr['outcome_raw']:.6f}, "
                   f"raw_ranking={tr['ranking_raw']:.6f})")
 
+        # P1 — one-shot λ_mil calibration at the end of epoch 1.
+        if lambda_mil is None and tr["mil_raw"] > 0.0:
+            lambda_mil = mil_cap * (tr["outcome_raw"] / tr["mil_raw"])
+            print(f"[Phase-3]: λ_mil calibrated = {lambda_mil:.6f} "
+                  f"(cap={mil_cap}, raw_outcome={tr['outcome_raw']:.6f}, "
+                  f"raw_mil={tr['mil_raw']:.6f})")
+
         tr_loss, vl_loss = tr["loss"], vl["loss"]
         # Selection metric: pure outcome BCE (stable across the λ=0 → λ=λ_cal
         # transition). This is what the eval ultimately measures.
@@ -1551,7 +1620,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
         print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}  "
               f"raw_out={tr['outcome_raw']:.7f}  raw_rank={tr['ranking_raw']:.7f}  "
-              f"vl_select={vl_select:.6f}")
+              f"raw_mil={tr['mil_raw']:.7f}  vl_select={vl_select:.6f}")
 
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)
