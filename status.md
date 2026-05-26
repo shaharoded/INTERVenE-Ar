@@ -194,6 +194,96 @@ This is the running best for P1 (MIL max-BCE).
 
 ---
 
+### P1-MIL @ 10k (SHA 422dcbc) — DISCARD
+
+P1 direction. Added a patient-level multiple-instance-learning aux to
+Phase 3: soft-max-attention pool of outcome logits across time steps,
+BCE against `patient_label = outcome occurs anywhere in GT`. Soft-max
+temperature `mil_log_T` learnable per outcome. λ_mil calibrated once
+at end of Phase-3 epoch 1, capped at fraction 0.20 of raw outcome BCE
+(same regime as ranking). Per-position BCE kept as 48-h calibration
+anchor.
+
+Smoke (sample=50, phase{1,2,3}_n_epochs=1):
+- Gates A–D all pass. raw_out=8.52, raw_rank=0.69, raw_mil=1.07
+  (within 1× of BCE). λ_mil=1.585, λ_ranking=2.46, both ∈ [1e-3, 10].
+
+Post-train (10k):
+- T1 fail — Phase-3 raw_out drops from 2.053 to 1.174 between epoch 1
+  and 2 (this is normal — calibration kick when λ_ranking goes 0→cal).
+  raw_mil rises 3.685→4.635 over the 6 active epochs: the MIL aux is
+  being optimised AGAINST, not toward. Aux gradient too weak to fight
+  per-position BCE conflict.
+- T2 fail — Phase-3 early stop fires at epoch 6, with best `vl_select`
+  at epoch 1 (1.1125) — i.e., before λ_mil was even active.
+  Subsequent epochs (with λ_mil=0.111) consistently increased vl_select.
+- T3 fail — DEATH AUROC drops 0.710→0.665 (-0.045); the head no longer
+  shows the discrimination the run was supposed to add.
+
+Headline (Δ vs B0-C-ttt running best):
+- `patient_auroc_weighted`: **0.6427** (−0.0404 — fails ≥+0.030 KEEP)
+- `patient_auprc_weighted`: 0.5855 (−0.0481)
+- `patient_auroc_simple`:   0.6112 (−0.0847)
+- `patient_auprc_simple`:   0.2792 (−0.0447)
+- `n_outcomes_used`:        16
+
+Per-outcome AUROC Δ vs B0-C-ttt — universal regression except RELEASE:
+- DISGLYCEMIA_Hyper:  0.805 (−0.091)
+- DEATH:              0.665 (−0.045)  ← contra direction's intent
+- NEUROVASCULAR:      0.651 (−0.035)
+- NERVOUS_SYSTEM:     0.649 (−0.147)
+- RELEASE:            0.645 (+0.064)  ← only winner (majority class)
+- DISGLYCEMIA_Hypo:   0.643 (−0.128)
+- KIDNEY:             0.639 (−0.076)
+- CARDIO:             0.616 (−0.093)
+- RETINOPATHY:        0.613 (−0.172)
+- SKIN_ULCER:         0.590 (−0.089)
+- ACUTE_RESPIRATORY:  0.586 (−0.005)
+- ATHEROSCLEROSIS:    0.555 (−0.040)
+- ACIDOSIS:           0.553 (−0.017)
+- KETOACIDOSIS:       0.538 (−0.377)  ← collapse from 0.915
+- HYPEROSMOLALITY:    0.531 (−0.054)
+- INFECTION:          0.499 (−0.052)
+
+Peak MAE (hours) Δ vs B0-C-ttt:
+- DEATH:   172.74 (+3.77, marginal)
+- RELEASE:  79.16 (+7.87)
+- DISGLYCEMIA_Hyper:  32.59 (−3.47, small improvement)
+- KIDNEY:             63.33 (−15.78)
+
+Trajectory honesty:
+- `gen_median_hours`:           91.22 (vs 75.05)
+- `gen_to_gt_ratio_median`:      0.900 (≥ 0.4 ✓)
+- `gen_frac_terminal_first24h`:  0.245 (vs 0.165 — terminal-first jumps)
+
+Phase stats: phase2 ran all 50 epochs; phase3 early-stopped at 6 with
+best at epoch 1.
+
+Verdict: **DISCARD**. Falsifiable (patient AUROC ≥ +0.030) missed by
+0.070. The MIL aux pulled Phase 3 away from the running best optimum
+within 1 epoch of activation, and the model never recovered. The
+likely mechanism: with patient_label being "outcome occurs anywhere",
+the soft-max-pooled score is dominated by the position with the
+highest logit, and BCE gradient on the pool propagates back to that
+position. For a negative patient on a rare outcome, the path of least
+resistance is to lower ALL logits — destroying per-position
+discrimination that B0-C-ttt had carefully built. The per-position
+BCE anchor was insufficient to hold ground (its λ=1.0 vs MIL's
+effective contribution ~0.20 of BCE, but the gradient directions
+conflict). The single positive class (RELEASE, 87 % prevalence)
+benefits because the pool's collective lift is aligned with its
+target.
+
+This is a learning-recipe problem, not a code/architecture bug. The
+direction is sound in principle, but the loss formulation as
+specified is too coarse next to per-position BCE for rare outcomes.
+P2's soft-argmax time loss is a positives-only loss — that constraint
+may avoid this failure mode. Proceeding to P2.
+
+Reverting code commit per loop step 9.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
