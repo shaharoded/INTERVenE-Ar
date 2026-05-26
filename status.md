@@ -710,6 +710,93 @@ candidate) is still owed. Proceeding to P5.
 
 ---
 
+### P5-bce-ablation @ 10k (SHA fa0da81) — DIAGNOSTIC: KEEP BCE AT 1.0
+
+P5 structural diagnostic per program.md (was P6 before refocus).
+Down-weights Phase-3 per-position outcome BCE by 50× (coef 1.0 → 0.02).
+Ranking + Phase-2-seeded backbone now drive the outcome head; tests
+whether BCE is redundant or the calibration anchor.
+
+Per-aux training trace:
+
+| Aux            | Unlock epoch | λ_max  | Anchor raw_aux | Final raw_aux | Δ      | Status |
+|----------------|--------------|--------|----------------|---------------|--------|--------|
+| ce             | 4 (Ph-2)     | 0.0920 | 1.5146         | (P2 final omitted — identical to running-best B0-C-ttt seed) | descends |
+| dt             | 4 (Ph-2)     | 0.1720 | 0.8096         | (omitted)                  | descends |
+| ttt            | 4 (Ph-2)     | 0.0039 | 21.3950        | (omitted)                  | descends |
+| ranking (Ph-2) | 32 (Ph-2)    | 0.0319 | 0.1018         | (omitted)                  | descends |
+| out (Ph-3)     | 1 (Ph-3)     | —      | 2.2288         | 1.10–1.05     | ≈ −51% | learning |
+| ranking (Ph-3) | 1 (Ph-3)     | ~0.6   | 0.6912         | 0.36–0.39     | ≈ −47% | learning |
+
+P5's change is Phase-3-only; Phase 2 is byte-identical to B0-C-ttt.
+
+Headline (Δ vs B0-C-ttt running best):
+- `patient_auroc_weighted`: **0.6658** (−0.0173)
+- `patient_auprc_weighted`: 0.6297 (−0.0039)
+- `cap=48h AUROC` (legacy):     0.407 (vs B0-C-ttt 0.438 → **−0.031**)
+- DEATH AUROC:    0.670 (−0.040)
+- RELEASE AUROC:  0.532 (−0.049)
+- DEATH MAE:    147.03 (−21.94 — actually improves)
+- RELEASE MAE:   67.21 (−4.08  — actually improves)
+- `gen_to_gt_ratio_median`:  1.161 (≥ 0.4 ✓)
+- `gen_frac_terminal_first24h`: 0.131
+
+Per-outcome AUROC vs B0-C-ttt:
+- DISGLYCEMIA_Hyper:  0.901 (+0.004)
+- NEUROVASCULAR:      0.797 (+0.111) ← best gain
+- DISGLYCEMIA_Hypo:   0.786 (+0.015)
+- RETINOPATHY:        0.767 (−0.018)
+- NERVOUS_SYSTEM:     0.758 (−0.038)
+- KETOACIDOSIS:       0.724 (**−0.191**) ← worst regression (rare-outcome
+                      calibration loss confirms the BCE anchor hypothesis)
+- KIDNEY:             0.722 (+0.007)
+- CARDIO:             0.697 (−0.012)
+- SKIN_ULCER:         0.693 (+0.014)
+- **DEATH**:          0.670 (−0.040)
+- ATHEROSCLEROSIS:    0.632 (+0.037)
+- HYPEROSMOLALITY:    0.603 (+0.018)
+- INFECTION:          0.573 (+0.022)
+- ACUTE_RESPIRATORY:  0.560 (−0.031)
+- ACIDOSIS:           0.547 (−0.024)
+- **RELEASE**:        0.532 (+0.011)
+
+Phase stats: phase2_best_val 0.184 / 40 epochs; phase3_best_val 1.176
+/ 42 epochs (early stopped). Phase 3 ran longer than B0-C-ttt's 23
+epochs because raw_out converges slower under reduced BCE weight.
+
+Verdict: **DIAGNOSTIC — keep `phase3_outcome_bce_coef` at 1.0**.
+
+Both decision criteria (program.md):
+  1. Patient AUROC drops −0.017 — small but real.
+  2. cap=48h AUROC drops −0.031 — meaningful collapse of the
+     48-h-horizon legacy metric, which is the **calibration tell-tale**.
+
+Combined signal: **per-position BCE IS the calibration anchor**.
+Ranking + Phase-2-seeded backbone preserves coarse ordering (overall
+AUROC drops only modestly, peak-MAE actually improves), but loses the
+per-position 48-h-window calibration the BCE soft-kernel enforces.
+KETOACIDOSIS −0.191 (rare outcome, n_pos=37) is the same pattern the
+P1/P2/P3/P4 DISCARDs showed: rare outcomes need position-level BCE
+pressure to keep their logits well-formed.
+
+Programmatic implication: **the final loss recipe is locked at
+B0-C-ttt's settings** (M-256 + Z frozen log_tau_terminal + C-ttt aux +
+Phase-2 curriculum + Phase-3 BCE coef=1.0 + ranking).
+
+Diagnostic does not become a running-best candidate. B0-C-ttt remains
+the running best. Reverting the 0.02 coef back to 1.0 (loop step 9 —
+for a diagnostic this is reverting the config knob, not the
+intervention).
+
+Stop-criterion status:
+- P0 baselines + ablation done.
+- P1/P2/P3/P4 all DISCARDed at 10k.
+- P5 diagnostic confirms recipe lock.
+- P6 (architecture scale-up) and P7 (QA toggle) are full-data end-of-
+  loop steps. P6's strict trigger now applies — recipe is locked.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
