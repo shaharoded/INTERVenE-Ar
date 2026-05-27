@@ -266,7 +266,155 @@ a KEEP/DISCARD candidate:
   was redundant for ranking; keep small for calibration only.
 - cap=48h collapses → per-position BCE is the calibration anchor; keep.
 
-This locks the **final loss recipe** before scale-up.
+## Post-P5 iteration (before P6 lock-in)
+
+P0–P5 done. Running best `B0-C-ttt`. Three retries of close misses + three
+new directions + one agent-discretion slot before the recipe is locked
+for P6 full-data scale-up. Run in this exact order at 10k; same loop
+discipline (smoke gates A–D, post-train T1–T3, two-commit pattern,
+per-aux trace in the journal, revert on DISCARD, ablation discipline on
+KEEPs).
+
+### I1 — P3-v2: risk-aware LM head with LM head FROZEN in Phase 3
+
+Same `bias_proj: K → V` and shape-contract design as original P3, but
+in Phase 3 set `phase3_backbone_lr_factor=0.0` AND freeze the LM head
+explicitly (`requires_grad=False` on `lm_head.*`). Only `bias_proj` +
+outcome head train. Original P3 died because the LM head atrophied as
+`bias_proj` learned; freezing it removes that failure path. All P3-prefix
+smoke gates (P3a zero-init no-op, P3b gradient probe on bias_proj +
+outcome head, P3c shape asserts) and per-epoch coupling-ratio /
+behavioural-probe diagnostics still apply.
+
+**Falsifiable**: patient-level AUROC ≥ +0.010 vs running best; bias_proj
+row weights show interpretable outcome→token routing
+(e.g. DEATH→TERMINAL row norm large and positive).
+
+### I2 — P4-tight: pooling head with cap=0.05
+
+Same attention pool design as original P4, lower `aux_fraction_cap`
+(0.20 → 0.05). Single config change. Original P4 lifted AUROC +0.018 but
+tripped RELEASE MAE +7.4 h and per-outcome regressions; lower cap should
+preserve the AUROC lift while killing the calibration disruption.
+
+**Falsifiable**: patient-level AUROC ≥ +0.010 vs running best; RELEASE
+MAE doesn't regress past 5 h; no per-outcome AUROC drops past 0.020.
+
+### I3 — P-CTTT-bounds: structural bounds on the ttt head
+
+Currently `ttt_head = Linear → ReLU → Linear` with unconstrained scalar
+output and pure MSE loss against `log1p(t_terminal − t_now)`. Nothing
+enforces output ≥ 0, monotonicity across positions, or consistency
+with the GT hospitalization duration. Two bounds, recommended together
+as one experiment:
+
+**(a) Positivity** — final layer activation = `softplus`, mirroring the
+dt magnitude head. ~5 LOC.
+
+**(b) Consistency loss** — at each position with absolute time `T(t)`:
+```
+loss_ttt_consistency = | expm1(ttt_pred[t]) + T(t) − GT_duration |
+```
+averaged over valid positions. Pins the two time-heads (dt and ttt) to
+agree on patient duration. Added as an auxiliary loss with its own
+scheduler entry; calibrated to ~0.1 fraction of main BCE. ~15 LOC.
+
+If results are ambiguous, agent may split into two experiments
+(I3a positivity-only, I3b consistency-only). Default: both in one run.
+
+**Falsifiable**: patient-level AUROC doesn't regress; raw_ttt
+**descends** (now properly auditable per the per-aux trace requirement);
+ttt-vs-dt consistency error < 10 h on held-out batch.
+
+### I4 — Sub-trajectory augmentation in Phase 2
+
+Build multiple views per training patient, each a coherent sub-trajectory:
+- View A: full sequence (current)
+- View B: drop a random 12 h gap in the middle
+- View C: keep only labs + outcomes (drop interventions/meals)
+- View D: keep only clinical events + outcomes (drop labs)
+
+**Hard constraint: outcome tokens AND terminal tokens are never removed**
+from any view (they are events with clinical reality). Pass a forbid_ids
+list to the augmenter exactly like CBM uses.
+
+K=2–3 views per patient per epoch. Implemented in dataloader, not in
+the loss. **Targets Phase 2 backbone training** — gives the model
+multiple consistent "views" of the same patient. Coexists with CBM
+(both at Phase 2; CBM is token-level noise, augmentation is structural
+view variety).
+
+**Falsifiable**: patient-level AUROC ≥ +0.010; auxes still descend
+cleanly under the larger effective training set; trajectory honesty
+preserved.
+
+### I5 — P-AR-FT: AR-generated data + frozen Phase-3 backbone
+
+Closes the train/eval distribution gap. Pre-generate K=1–2 trajectories
+per train patient using the current running-best model (cached to disk,
+`torch.no_grad`). In Phase 3:
+- `phase3_backbone_lr_factor = 0.0` (backbone frozen)
+- Mix dataloader: GT sequences + cached generated sequences (50/50 or
+  similar; ramp generated fraction across epochs)
+- BCE labels at every position computed from GT outcome timestamps
+  using the existing soft-kernel mechanism — labels are GT-derived,
+  inputs are model-derived. **The outcome head reads backbone features,
+  not emitted tokens**, so the LM not emitting outcomes is fine — the
+  head learns to predict from context.
+
+~190 LOC: generation+caching script, dataloader mix mode, Phase-3 freeze
+flag. Strongest single bet for moving RELEASE because nothing else
+attacks the train/eval distribution mismatch.
+
+**Falsifiable**: RELEASE AUROC ≥ +0.030; patient-level AUROC ≥ +0.010;
+no per-outcome regressions past 0.020; gen_to_gt_ratio_median preserved.
+
+### I6 — CBM in Phase 3 with aggressive masking
+
+CBM currently runs in Phase 2 (input token masking, p=0.25) with a
+forbid list that excludes intervals/meals to preserve LM-head temporal
+coherence. Phase 3 doesn't need that coherence — outcome head reads
+backbone features, can tolerate masked input. Move/duplicate CBM to
+Phase 3 with:
+- p starts at 0.25, can probe up to 0.40
+- Same outcome-preserving forbid list (outcomes + terminals never masked)
+- Other tokens (interventions, labs, meals, context) all eligible
+
+Also consider raising Phase-2 CBM ratio if I4 doesn't already saturate
+the input-noise regime.
+
+**Falsifiable**: patient-level AUROC ≥ +0.005; outcome head shows
+robustness gain measurable as smaller eval-time AUROC variance across
+seeds.
+
+### I7 — Agent-discretion slot
+
+ONE experiment of agent latitude IF (and only if) a specific observable
+problem has surfaced in earlier experiments' logs/journals. Strict rules:
+
+- **Trigger required**: cite the specific run.log line / journal entry /
+  diagnose probe motivating the proposed change. "I felt like trying X"
+  is NOT a trigger. "Aux Y stayed within 5% of anchor across the full
+  phase" IS.
+- **Single modification, falsifiable hypothesis, normal loop discipline**:
+  smoke gates A–D, post-train T1–T3, two-commit pattern, per-aux trace,
+  ablation discipline if KEEP.
+- **Scope limits**: stays within loss / aux / data-side modifications.
+  NO architecture/size changes (that's P6). NO QA toggle (that's P7).
+  NO scope creep into "tried a paper I read".
+- **Hard rules to respect**: every active aux must contribute and visibly
+  descend during its phase; no degenerate outputs (trajectory collapse,
+  terminal starvation, majority-class collapse); all token types emit
+  with reasonable frequency.
+
+If no clear trigger has surfaced by this point, skip the slot — go
+straight to P6.
+
+### Recipe lock
+
+After I1–I7 complete, the running best's loss / aux / schedule recipe is
+**locked**. No further training-side changes until P6/P7 finish. The
+recipe at recipe-lock time is what gets scaled in P6.
 
 ### P6 — Architecture scale-up (FULL DATA ONLY, second-to-last)
 
@@ -331,19 +479,21 @@ since the result is publishable, not a 10k probe.
 QA-introduced tokens visibly emitted in generated trajectories. If
 neither, the non-QA running best stands as the final result.
 
-## Inference-side directions (no retraining)
+## Inference-side directions (no retraining) — between P6 and P7
 
 `python api.py --eval-only`:
 - **F1**. Beam search with length-normalised scoring.
 - **F2**. Temperature schedule to escape immediate-terminal local minimum.
 
-Try after backbone work plateaus.
+Run after P6's winning architecture is locked, before P7's QA toggle.
+Cheap (no training), so they're sequenced after architecture choice but
+before the final QA experiment.
 
 ## Stop criterion
 
 No quality target — push as high as the model honestly allows. Stop when:
-- All P0–P7 honestly attempted,
-- Last 2–3 10k experiments DISCARDed,
+- All directions in order — P0–P5, I1–I7, P6, F1/F2, P7 — honestly attempted,
+- Last 2–3 10k experiments DISCARDed at recipe-lock time,
 - Full-data confirm of running best done.
 
 Write final report in `status.md`: running-best numbers (weighted
