@@ -11,24 +11,26 @@ TEST_TEMPORAL_DATA_FILE  = os.path.join(PROJECT_ROOT, 'data', 'test', 'temporal_
 TEST_CTX_DATA_FILE       = os.path.join(PROJECT_ROOT, 'data', 'test', 'context_data.csv')
 QA_DATA_FILE             = os.path.join(PROJECT_ROOT, 'data', 'source', 'qa_data.csv')
 
-# Define the prediction targets, <bot>, <eot> tokens to terminate the inference
+# Define the prediction targets, <bot>, <eot> tokens to terminate the inference.
+# Outcome-snip (16 -> 11 head targets): five outcomes that never achieved
+# above-prevalence discrimination under any recipe across the P-/I-sequences
+# were removed as outcome-head targets — HYPEROSMOLALITY_EVENT, INFECTION_EVENT,
+# ACIDOSIS_EVENT, ATHEROSCLEROSIS_EVENT, ACUTE_RESPIRATORY_DISORDER_EVENT. Their
+# tokens REMAIN in the LM vocabulary (the tokenizer is built from training data,
+# not from this list), so their occurrences still shape backbone context; they
+# simply stop being head-BCE targets, CBM-forbid-protected, and sampler-upweighted.
 OUTCOMES = [
     "DISGLYCEMIA_EVENT_Hyperglycemia",
     "DISGLYCEMIA_EVENT_Hypoglycemia",
     "KIDNEY_COMPLICATION_EVENT",
-    "ACUTE_RESPIRATORY_DISORDER_EVENT",
-    "INFECTION_EVENT",
-    "ATHEROSCLEROSIS_EVENT",
     "CARDIO-VASCULAR_DISORDER_EVENT",
     "NERVOUS_SYSTEM_DISORDER_EVENT",
     "NEUROVASCULAR_COMPLICATION_EVENT",
     "SKIN_ULCER_EVENT",
     "OTHER_COMPLICATION_EVENT",
     "RETINOPATHY_EVENT",
-    "HYPEROSMOLALITY_EVENT",
     "DIABETIC_COMA_EVENT",
     "KETOACIDOSIS_EVENT",
-    "ACIDOSIS_EVENT",
 ]
 
 ADMISSION_TOKEN = "ADMISSION_EVENT"
