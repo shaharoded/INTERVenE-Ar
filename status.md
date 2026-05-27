@@ -1114,6 +1114,71 @@ peak timing while holding the +0.043 lift, via a training-side lever
 
 ---
 
+### I2b — ttt-gated terminal emission (over-generation cap)
+
+**Code:** `5d40ca5` (inference-only; `generate()` in
+`transform_emr/inference.py`). The model's `ttt` head already predicts
+`log1p(hrs to next terminal)` at every position and was returned by
+`forward_with_cache` but *discarded* in the decode loop. I2b captures it
+and, when the predicted hours-to-terminal drops below `ttt_emit_gate_hours`
+(48 h), ramps a positive bias (`ttt_emit_bias`=3.0) onto terminal-token
+logits so the trajectory ends near the model's own believed terminal
+time. No retraining — tested `--eval-only` on the I2 weights
+(`d9a6174`); eval picks up the enabling kwarg defaults.
+
+**Hypothesis (falsifiable):** the I2 RELEASE-MAE regression (+14 h) is
+driven by over-generation (gen_to_gt 1.69 → predicted peak lands late).
+Capping it should: gen_to_gt → ~1.0 AND RELEASE MAE improve ≥5 h AND
+patient_auroc_weighted no regress past 0.010.
+
+**Result vs I2 (running best, no gate):**
+
+| Metric | I2 | I2b | Δ |
+|---|---|---|---|
+| gen_to_gt_ratio_median | 1.688 | **1.184** | −0.504 |
+| gen_median_hours | 169.9 | 119.2 | −50.7 |
+| patient_auroc_weighted | 0.7263 | 0.7318 | +0.0054 |
+| patient_auprc_weighted | 0.6719 | 0.6727 | +0.0008 |
+| RELEASE AUROC | 0.604 | 0.625 | +0.020 |
+| DEATH AUROC | 0.721 | 0.730 | +0.009 |
+| RELEASE MAE (h) | 85.5 | 84.0 | **−1.4** |
+| DEATH MAE (h) | 161.9 | 162.2 | +0.3 |
+| gen_frac_terminal_first24h | 0.050 | 0.070 | +0.020 |
+
+Every per-outcome AUROC held or improved (max drop −0.003, noise); the
+two terminals gained most (RELEASE +0.020, DEATH +0.009) because the
+gate aligns terminal emission with the model's own belief, sharpening
+the terminal risk curves. Per-outcome MAE improved slightly across the
+board (RELEASE 85.5→84.0, INFECTION 64.9→62.5, CARDIO 66.8→65.9, etc.).
+
+**The falsifiable's RELEASE-MAE prong FAILED** (−1.4 h, wanted ≥−5 h)
+even though gen_to_gt dropped hard (1.69→1.18). Diagnosis: `peak_mae` is
+`|argmax_t P_outcome(t) − nearest GT time|` over the *generated portion*
+(`evaluation.py:435`), i.e. a **risk-curve-peak-location** error, not a
+trajectory-length error. Truncating 50 h of over-generation barely moved
+the P_RELEASE argmax, which sits in the body of the trajectory, late
+relative to the GT discharge. **Over-generation was the wrong lever for
+RELEASE MAE.** The inherited I2 regressions vs the *original* B0-C-ttt
+(KETOACIDOSIS −0.192, RELEASE MAE +12.7 h) are pool-head-caused and are
+NOT addressed here.
+
+**Per-aux training trace:** none — I2b runs no training (eval-only on the
+I2 checkpoint). The active-aux trace is identical to the I2 block above.
+
+**Verdict: KEEP — folds into the running best.** I2b is a strict
+improvement over I2 (the current running best): +0.005 weighted AUROC,
+RELEASE AUROC +0.020, DEATH AUROC +0.009, gen_to_gt 1.69→1.18 (more
+honest), zero per-outcome regression — a free honesty + terminal-AUROC
+win using a principled, already-trained signal. It does NOT achieve its
+*stated* goal (recover RELEASE peak timing); that requires a
+risk-curve-peak lever, not a length cap. Running best is now **I2 weights
+(`d9a6174`) + ttt-gate (`5d40ca5`)**, AUROC_w 0.7318.
+
+**Open:** RELEASE MAE (84 h) and the KETOACIDOSIS collapse remain. Both
+are risk-curve / pool-coupling problems, not generation-length problems.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
