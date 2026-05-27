@@ -1318,6 +1318,70 @@ frontier. If the objective is later reweighted toward calibrated peak
 
 ---
 
+### I5 — P-AR-FT (AR-generated data + frozen Phase-3 backbone)
+
+**Code:** `dc91007` (new `ar_ft.py` + `finetune_transformer` hooks). The
+"strongest single bet" for closing the train/eval distribution gap.
+Generate K=1 trajectory per train patient from a 48 h seed using the
+just-trained model (cached to `checkpoints/phase3/ar_ft_cache.pt`,
+`no_grad`); Phase 3 **freezes the backbone** and trains the outcome head
+on a 50/50 mix of GT + generated trajectories; for generated inputs the
+per-position labels come from the patient's GT outcome timestamps via a
+future-only soft kernel (`get_outcome_targets_from_gt_times`, verified to
+exactly reproduce `get_future_outcome_targets`, max|diff|=0). Val stays
+GT-only. api.py/evaluation.py untouched.
+
+**Hypothesis (falsifiable):** RELEASE AUROC ≥ +0.030; patient AUROC ≥
++0.010; no per-outcome regression > 0.020; gen_to_gt preserved.
+
+**Per-aux training trace (Phase 2 — unchanged by I5, Phase-3-only change):**
+
+| Aux | Unlock ep | λ_max | Anchor raw | Final raw | Δ% | Learning? |
+|---|---|---|---|---|---|---|
+| ce | 3 | 0.0897 | 1.5517 | 0.00289 | −99.8% | yes |
+| dt | 3 | 0.1684 | 0.8266 | 0.0554 | −93.3% | yes |
+| ttt | 3 | 0.0039 | 21.4700 | 0.0747 | −99.7% | yes |
+| ranking | 34 | 0.0308 | 0.1081 | 0.0745 | −31.1% | yes |
+
+**Result vs running best I2b (0.732) — DECISIVE FAILURE (worst of I1–I5):**
+
+| Metric | I2b | I5 | Δ |
+|---|---|---|---|
+| patient_auroc_weighted | 0.732 | **0.666** | **−0.066** |
+| patient_auroc_simple | 0.724 | 0.607 | **−0.117** |
+| cap=48h AUROC | 0.478 | 0.395 | −0.083 |
+| RELEASE AUROC | 0.604 | 0.679 | +0.075 |
+| DEATH MAE (h) | 162.2 | 181.1 | +18.9 |
+| RELEASE MAE (h) | 84.0 | 76.6 | −7.4 |
+| gen_to_gt_ratio_median | 1.18 | 2.80 | much worse |
+| gen_frac_terminal_first24h | 0.07 | 0.26 | much worse |
+
+Broad per-outcome collapse: KETOACIDOSIS 0.390 (−0.33), RETINOPATHY
+0.499 (−0.33), DISGLYCEMIA_Hypo 0.675 (−0.226), NERVOUS_SYSTEM 0.567
+(−0.21), CARDIO −0.158, KIDNEY −0.156. Only RELEASE AUROC (+0.075) and
+RELEASE MAE (−7.4 h) improved. Every falsifiable prong except RELEASE
+AUROC fails; AUROC regressed hard and gen_to_gt blew up to 2.80.
+
+**Verdict: DISCARD.** Mechanism: the cached generated *training*
+trajectories are produced by the Phase-2 LM, which over-generates
+(eval gen_to_gt 2.80, median 287 h, 26% premature terminals). Training a
+frozen-backbone outcome head on these heavily off-distribution, mostly-
+terminal-late roll-outs **corrupted** its discrimination across nearly
+all outcomes rather than making it robust. The distribution-gap-closure
+backfired: the generator isn't good enough to supply useful training
+inputs, so AR-FT taught the head to read degraded context. Reverting
+`dc91007`; running best stays I2b (0.732).
+
+**Update to the carry-forward pattern:** I5 was meant to beat the
+AUROC↔calibration tension by attacking the distribution gap directly. It
+lost on *both* axes (AUROC −0.066 AND honesty gen_to_gt 2.80), because
+AR-FT's quality is bounded by the generator's quality — and the current
+generator over-generates. A prerequisite for AR-FT to help is a generator
+whose gen_to_gt is already ≈1.0 (which I3/I4 achieve but at an AUROC cost).
+The frontier stands: I2/I2b (AUROC 0.732) remains the best recipe.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
