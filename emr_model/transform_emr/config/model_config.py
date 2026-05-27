@@ -112,18 +112,4 @@ TRAINING_SETTINGS = {
     # backbone_lr_factor=0.01, protecting the outcome head from patient-level
     # coarseness.
     "phase3_pool_fraction_cap": 0.05,   # I2 P4-tight: lowered 0.20 -> 0.05
-
-    # I5 / P-AR-FT — autoregressive fine-tuning of the outcome head on
-    # model-generated trajectories. Closes the train/eval distribution gap:
-    # the eval scores the outcome head over a trajectory the model GENERATES
-    # from a 2-day seed, but Phase 3 otherwise trains only on GT sequences.
-    # When on, the backbone is frozen (forced phase3_backbone_lr_factor=0.0)
-    # and each epoch trains on a mix of GT examples and model-generated
-    # examples; at generated positions the outcome labels are derived from the
-    # patient's GT outcome events via the same future-only soft kernel.
-    "phase3_ar_ft": True,
-    "phase3_ar_seed_hours": 48.0,         # seed window (hours) for roll-out
-    "phase3_ar_K": 1,                     # trajectories generated per patient
-    "phase3_ar_gen_fraction_start": 0.5,  # generated fraction at epoch 1
-    "phase3_ar_gen_fraction_end": 0.5,    # generated fraction at last epoch
 }
