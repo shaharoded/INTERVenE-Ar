@@ -27,11 +27,13 @@ OUTCOMES = [
     "NERVOUS_SYSTEM_DISORDER_EVENT",
     "NEUROVASCULAR_COMPLICATION_EVENT",
     "SKIN_ULCER_EVENT",
-    "OTHER_COMPLICATION_EVENT",
     "RETINOPATHY_EVENT",
-    "DIABETIC_COMA_EVENT",
     "KETOACIDOSIS_EVENT",
 ]
+# Note: OTHER_COMPLICATION_EVENT and DIABETIC_COMA_EVENT were also removed —
+# they are absent from the training-data vocabulary (always auto-dropped at
+# runtime), so listing them here was a no-op. Head targets = these 9 OUTCOMES
+# (those present in vocab) + the 2 TERMINAL_OUTCOMES = 11 (matches n_outcomes_used).
 
 ADMISSION_TOKEN = "ADMISSION_EVENT"
 DEATH_TOKEN = "DEATH_EVENT"
