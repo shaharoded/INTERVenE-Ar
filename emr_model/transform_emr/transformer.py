@@ -23,6 +23,13 @@ from transform_emr.config.model_config import *
 from transform_emr.utils import *
 from transform_emr.loss import MaskedFocalBCE, MaskedSetCE, pairwise_ranking_loss
 from transform_emr.schedulers import LambdaScheduleController, LRScheduleController
+from transform_emr.ar_ft import (
+    generate_and_cache_trajectories,
+    GeneratedTrajectoryDataset,
+    collate_generated,
+    get_outcome_targets_from_gt_times,
+    MixedPhase3Loader,
+)
 
 # ───────── components  ───────────────────────────────────────────────── #
 class CausalSelfAttention(nn.Module):
@@ -1438,7 +1445,15 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     pos_weights       = tok.outcome_weights[outcome_token_ids].to(device)
     OutcomeCriterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weights, reduction="none")
 
+    # I5 / P-AR-FT — autoregressive fine-tuning on model-generated trajectories.
+    ar_ft_on = training_settings.get("phase3_ar_ft", False)
+
     backbone_lr_factor = training_settings.get("phase3_backbone_lr_factor", 0.0)
+    if ar_ft_on:
+        # AR-FT freezes the backbone: the outcome head learns to read frozen
+        # features off model-generated context and predict GT labels. Letting
+        # the backbone drift on generated inputs would corrupt the P2 optimum.
+        backbone_lr_factor = 0.0
     p3_lr = training_settings["phase3_learning_rate"]
     p3_wd = training_settings.get("phase3_weight_decay", training_settings["weight_decay"])
 
@@ -1546,7 +1561,11 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
-                batch = {k: v.to(device) for k, v in batch.items()}
+                # AR-FT: generated batches carry a "__gen__" flag and GT-event
+                # tensors; pop the non-tensor flag before moving to device.
+                is_gen = bool(batch.pop("__gen__", False))
+                batch = {k: (v.to(device) if torch.is_tensor(v) else v)
+                         for k, v in batch.items()}
 
                 # BF16 autocast wraps the forward (and gradient-checkpointed recompute
                 # inside GPT.forward also re-enters autocast for backward). Matches
@@ -1568,14 +1587,28 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 outcome_pred = outcome_logits[:, :-1, :]  # [B, T-1, K]
                 pred_logits  = logits[:, :-1, :]          # [B, T-1, V]
 
-                outcome_targets = get_future_outcome_targets(
-                    target_ids=full_targets,
-                    outcome_ids=outcome_token_ids,
-                    all_abs_ts=batch["abs_ts"],
-                    query_abs_ts=batch["abs_ts"][:, :-1],
-                    tau=model.outcome_log_tau.exp(),
-                    horizon=_HORIZON,
-                )  # [B, T-1, K]
+                if is_gen:
+                    # Generated trajectory: tokens are model roll-outs (may not
+                    # contain outcome tokens), so labels MUST come from the
+                    # patient's GT outcome events, not from the generated tokens.
+                    # Same future-only soft kernel, tau and horizon as the GT path.
+                    outcome_targets = get_outcome_targets_from_gt_times(
+                        query_abs_ts=batch["abs_ts"][:, :-1],
+                        gt_outcome_idx=batch["gt_outcome_idx"],
+                        gt_outcome_times=batch["gt_outcome_time"],
+                        tau=model.outcome_log_tau.exp(),
+                        horizon=_HORIZON,
+                        K=len(outcome_token_ids),
+                    )  # [B, T-1, K]
+                else:
+                    outcome_targets = get_future_outcome_targets(
+                        target_ids=full_targets,
+                        outcome_ids=outcome_token_ids,
+                        all_abs_ts=batch["abs_ts"],
+                        query_abs_ts=batch["abs_ts"][:, :-1],
+                        tau=model.outcome_log_tau.exp(),
+                        horizon=_HORIZON,
+                    )  # [B, T-1, K]
 
                 nonpad    = (target_ids != model.embedder.padding_idx)  # [B, T-1]
                 valid_pos = nonpad.unsqueeze(-1)                        # [B, T-1, 1]
@@ -1598,10 +1631,15 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 _hidden = model._last_hidden.float()                   # [B, T, D]
                 _kpm    = (full_targets == pad_idx_p3)                 # [B, T] True at pad
                 pool_logit = model.pool_forward(_hidden, _kpm).float() # [B, K]
-                _ft_e = full_targets.unsqueeze(-1)                     # [B, T, 1]
-                _oid  = outcome_ids_p3.view(1, 1, -1)                  # [1, 1, K]
-                _nonpad_full = (full_targets != pad_idx_p3).unsqueeze(-1)  # [B, T, 1]
-                patient_label_p4 = ((_ft_e == _oid) & _nonpad_full).any(dim=1).float()  # [B, K]
+                if is_gen:
+                    # Generated tokens don't carry the outcomes; use the GT
+                    # patient-level multi-hot label collated alongside the batch.
+                    patient_label_p4 = batch["patient_label"]          # [B, K]
+                else:
+                    _ft_e = full_targets.unsqueeze(-1)                     # [B, T, 1]
+                    _oid  = outcome_ids_p3.view(1, 1, -1)                  # [1, 1, K]
+                    _nonpad_full = (full_targets != pad_idx_p3).unsqueeze(-1)  # [B, T, 1]
+                    patient_label_p4 = ((_ft_e == _oid) & _nonpad_full).any(dim=1).float()  # [B, K]
                 # Use the same per-outcome pos_weight tensor the per-position
                 # BCE uses, so rare outcomes carry comparable weight.
                 loss_pool_raw = nn.functional.binary_cross_entropy_with_logits(
@@ -1640,8 +1678,43 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     n_epochs = training_settings["phase3_n_epochs"]
     patience = training_settings["early-stop-patience"]
 
+    # I5 / P-AR-FT — generate + cache trajectories from a 2-day seed (once),
+    # build a generated-example dataset, and wrap GT + generated into a mixed
+    # training loader. The val loader stays GT-only so early-stopping/selection
+    # is on real data. When phase3_ar_ft is False, train_loader is just train_dl
+    # and behaviour is identical to before.
+    train_loader = train_dl
+    if ar_ft_on:
+        _bs = training_settings.get("batch_size", 16)
+        gen_traj, gt_outcomes = generate_and_cache_trajectories(
+            model, train_dl.dataset, training_settings, ckpt_path.parent
+        )
+        gen_ds = GeneratedTrajectoryDataset(
+            gen_traj=gen_traj,
+            context_df=train_dl.dataset.context_df,
+            tokenizer=train_dl.dataset.tokenizer,
+            gt_outcomes=gt_outcomes,
+            num_outcomes=len(outcome_token_ids),
+        )
+        frac_start = training_settings.get("phase3_ar_gen_fraction_start", 0.5)
+        frac_end   = training_settings.get("phase3_ar_gen_fraction_end", 0.5)
+        train_loader = MixedPhase3Loader(
+            gt_loader=train_dl,
+            gen_dataset=gen_ds,
+            batch_size=_bs,
+            collate_fn=collate_generated,
+            frac_start=frac_start,
+            frac_end=frac_end,
+            n_epochs=n_epochs,
+        )
+        print(f"[AR-FT]: Mixed Phase-3 loader ready "
+              f"({len(gen_ds)} generated examples, gen_fraction "
+              f"{frac_start:.2f}->{frac_end:.2f}).")
+
     for epoch in range(start_epoch, start_epoch + n_epochs):
-        tr = run_epoch(train_dl, train_flag=True)
+        if ar_ft_on:
+            train_loader.set_epoch(epoch)
+        tr = run_epoch(train_loader, train_flag=True)
         vl = run_epoch(val_dl,   train_flag=False)
 
         # One-shot λ_ranking calibration at the end of epoch 1 (mirrors P2).
