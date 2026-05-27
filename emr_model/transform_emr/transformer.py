@@ -683,7 +683,10 @@ class GPT(nn.Module):
         #    as predicted log1p(t_terminal_hrs − t_now_hrs); the MSE loss in
         #    pretrain_transformer compares this to log1p of the actual GT
         #    distance to the next terminal at each non-terminal position.
-        ttt_pred = self.ttt_head(x).squeeze(-1)        # [B, T]
+        #    softplus enforces ttt_pred ≥ 0 (I3 positivity bound) — log1p of a
+        #    non-negative distance is always ≥ 0 — mirroring the dt magnitude
+        #    head, which applies softplus to its raw scalar in forward.
+        ttt_pred = F.softplus(self.ttt_head(x).squeeze(-1))  # [B, T] ≥ 0
 
         return logits, abs_t_pred, outcome_logits, gate_logit, ttt_pred
 
@@ -779,10 +782,11 @@ class GPT(nn.Module):
         delta_pos  = torch.sigmoid(gate_logit) * mag_pos
         abs_t_pred = abs_ts + delta_pos
 
-        # TTT head (direction C). Returned for signature symmetry with forward(); the
-        # generation loop does not use it (a 'past terminal' prediction is irrelevant
-        # at inference where the model emits a real terminal token via lm_head).
-        ttt_pred = self.ttt_head(x).squeeze(-1)
+        # TTT head (direction C). softplus enforces ≥ 0 (I3 positivity bound),
+        # matching forward(). The generation loop DOES consume this at inference:
+        # the ttt-gated terminal emission in inference.generate() biases terminal
+        # tokens once expm1(ttt_pred) drops below its gate (I2b).
+        ttt_pred = F.softplus(self.ttt_head(x).squeeze(-1))
 
         return logits, abs_t_pred, outcome_logits, gate_logit, ttt_pred, new_kvs
 
@@ -1043,6 +1047,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
 
         total_loss = total_bce = total_ce = total_dt = total_ranking = total_ttt = 0.0
         total_ce_raw = total_dt_raw = total_ranking_raw = total_ttt_raw = 0.0
+        total_ttt_consist = total_ttt_consist_raw = 0.0
         accum_step = 0
         if train_flag:
             optimizer.zero_grad()
@@ -1252,6 +1257,27 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     loss_ttt_raw = ttt_pred.sum() * 0.0
                 loss_ttt = lambdas.get("ttt", 0.0) * loss_ttt_raw
 
+                # === Loss: ttt consistency (direction I3) ===
+                # Pin the ttt head's IMPLIED terminal time to the GT terminal time,
+                # in absolute hours:  | expm1(ttt_pred[t]) + T(t) − GT_terminal |.
+                # T(t) is the current absolute time; GT_terminal is the patient's
+                # terminal absolute time (their hospitalisation duration). This is the
+                # linear-hours L1 of the same quantity the log-space MSE penalises, so
+                # it sharpens ABSOLUTE-hour calibration (which log-MSE under-weights at
+                # large horizons) — exactly what the inference-time ttt gate (I2b)
+                # thresholds on. The raw value is the mean hours-consistency error, so
+                # it doubles as the I3 falsifiable metric. Same valid mask as the MSE.
+                if _ttt_valid.any():
+                    _pred_remain_hrs = torch.expm1(_ttt_pred_q.clamp(max=10.0))     # [B,T-1] hrs
+                    _cur_abs_hrs     = _query_abs * _ABS_TS_SCALE                   # [B,T-1] hrs
+                    _gt_term_hrs     = _future_term_q * _ABS_TS_SCALE              # [B,T-1] hrs
+                    _consist_abs = (_pred_remain_hrs + _cur_abs_hrs - _gt_term_hrs).abs()
+                    loss_ttt_consist_raw = (_consist_abs * _ttt_valid.float()).sum() \
+                                           / _ttt_valid.float().sum().clamp(min=1.0)
+                else:
+                    loss_ttt_consist_raw = ttt_pred.sum() * 0.0
+                loss_ttt_consist = lambdas.get("ttt_consistency", 0.0) * loss_ttt_consist_raw
+
                 # === Loss: Pairwise ranking (direct AUROC proxy on the outcome head) ===
                 # Positive positions: outcome_targets > 0 (outcome occurs within horizon).
                 # Negative positions: outcome_targets == 0 (no outcome within horizon).
@@ -1266,14 +1292,14 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 loss_ranking = lambdas.get("ranking", 0.0) * loss_ranking_raw
 
                 # === Loss: Total Loss ===
-                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + loss_ttt
+                loss = loss_bce + loss_ce + abs_t_loss + loss_ranking + loss_ttt + loss_ttt_consist
 
                 # === Backprop and Log ===
                 if train_flag:
                     # NaN guard: skip batch and log which component is bad.
                     # All-NaN collapse is typically caused by BF16 gradient overflow,
                     # not by gradual explosion (which clipping would catch).
-                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "ttt": loss_ttt, "total": loss}
+                    _losses = {"bce": loss_bce, "ce": loss_ce, "dt": abs_t_loss, "ranking": loss_ranking, "ttt": loss_ttt, "ttt_consistency": loss_ttt_consist, "total": loss}
                     _bad = {k: v.item() for k, v in _losses.items() if not torch.isfinite(v)}
                     if _bad:
                         print(f"[WARNING] Skipping batch (epoch {epoch}): non-finite losses={_bad}; zeroing grads.")
@@ -1306,10 +1332,12 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                 total_dt      += abs_t_loss.item()
                 total_ranking += loss_ranking.item()
                 total_ttt     += loss_ttt.item()
+                total_ttt_consist += loss_ttt_consist.item()
                 total_ce_raw      += loss_ce_raw.item()
                 total_dt_raw      += abs_t_loss_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
                 total_ttt_raw     += loss_ttt_raw.item()
+                total_ttt_consist_raw += loss_ttt_consist_raw.item()
 
         # Flush any remaining accumulated gradients at end of epoch
         if train_flag and accum_step % grad_accum_steps != 0:
@@ -1330,23 +1358,25 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             total_dt      / n_batches,
             total_ranking / n_batches,
             total_ttt     / n_batches,
+            total_ttt_consist / n_batches,
             total_ce_raw      / n_batches,
             total_dt_raw      / n_batches,
             total_ranking_raw / n_batches,
             total_ttt_raw     / n_batches,
+            total_ttt_consist_raw / n_batches,
         )
 
     for epoch in range(start_epoch, training_settings.get("phase2_n_epochs")):
-        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ttt, tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_ttt_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
-        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_ttt, _, _, _, _                                      = run_epoch(val_dl,   epoch=epoch, train_flag=False)
+        tr_loss, tr_bce, tr_ce, tr_dt, tr_ranking, tr_ttt, tr_ttt_consist, tr_ce_raw, tr_dt_raw, tr_ranking_raw, tr_ttt_raw, tr_ttt_consist_raw = run_epoch(train_dl, epoch=epoch, train_flag=True)
+        vl_loss, vl_bce, vl_ce, vl_dt, vl_ranking, vl_ttt, vl_ttt_consist, _, _, _, _, _                                                       = run_epoch(val_dl,   epoch=epoch, train_flag=False)
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
         print(f"""[Phase-2]: Epoch {epoch:02d}
-        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f}, TTT={tr_ttt:.4f})
-        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f}, TTT={vl_ttt:.4f})
-        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f} ttt={tr_ttt_raw:.7f}""")
+        --> Train={tr_loss:.4f} (BCE={tr_bce:.4f}, CE={tr_ce:.4f}, Δt={tr_dt:.4f}, Rank={tr_ranking:.4f}, TTT={tr_ttt:.4f}, TTTcons={tr_ttt_consist:.4f})
+        --> Val={vl_loss:.4f} (BCE={vl_bce:.4f}, CE={vl_ce:.4f}, Δt={vl_dt:.4f}, Rank={vl_ranking:.4f}, TTT={vl_ttt:.4f}, TTTcons={vl_ttt_consist:.4f})
+        --> RawTrain ce={tr_ce_raw:.7f} dt={tr_dt_raw:.7f} ranking={tr_ranking_raw:.7f} ttt={tr_ttt_raw:.7f} ttt_consistency={tr_ttt_consist_raw:.7f}""")
 
         schedule_events = schedule_controller.update(
             epoch=epoch,
@@ -1356,6 +1386,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
             dt=tr_dt_raw,
             ranking=tr_ranking_raw,
             ttt=tr_ttt_raw,
+            ttt_consistency=tr_ttt_consist_raw,
         )
         for msg in schedule_events:
             print(msg)

@@ -80,13 +80,15 @@ TRAINING_SETTINGS = {
             "dt":      0.50,    # Time regression cap
             "ranking": 0.20,    # Pairwise AUROC-proxy ranking loss on the outcome head
             "ttt":     0.30,    # Time-to-terminal regression cap (direction C)
+            "ttt_consistency": 0.10,  # I3: |expm1(ttt)+T(t)-GT_terminal| hours-L1; pins ttt-implied terminal time to GT duration, sharpening the absolute-hour calibration the inference ttt-gate uses
         },
-        "order": [["ce", "dt", "ttt"], ["ranking"]],
+        "order": [["ce", "dt", "ttt", "ttt_consistency"], ["ranking"]],
         "ramp_epochs": {
             "ce":      0,
             "dt":      0,
             "ranking": 3,  # Gradual ramp avoids destabilising the backbone when stage 1 unlocks
             "ttt":     0,
+            "ttt_consistency": 0,
         },
         "plateau_min_delta": 1e-3,
         "plateau_patience":  [2],  # Patience per transition: [0→1]
