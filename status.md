@@ -1454,6 +1454,44 @@ CBM-forbid-protected, and sampler-upweighted. Code `b6e99ed` reverted
 
 ---
 
+### Outcome-snip re-aggregation (11-outcome lens)
+
+Every existing experiment's headline AUROC re-aggregated under the NEW
+11-outcome target set, without re-running anything. The headline is the
+support-weighted mean of per-outcome AUROC, weighted_auroc_11 =
+Σ_o(auroc_o · n_pos_o) / Σ_o n_pos_o over exactly the 11 kept outcomes
+(fixed test-split n_pos: Hyperglycemia 619, Hypoglycemia 165, KIDNEY 685,
+CARDIO 860, NERVOUS_SYSTEM 77, NEUROVASCULAR 29, SKIN_ULCER 73,
+RETINOPATHY 51, KETOACIDOSIS 37, DEATH 192, RELEASE 1308; Σ = 4096).
+The 5 dropped outcomes (HYPEROSMOLALITY, INFECTION, ACIDOSIS,
+ATHEROSCLEROSIS, ACUTE_RESPIRATORY_DISORDER) are excluded from the new
+weighted mean. Per-outcome numbers reused as already recorded; for
+B0-C-ttt-full the run's own per-outcome AUROC/AUPRC are re-weighted with
+the fixed 11-outcome n_pos (this is the re-aggregation lens, not a re-eval).
+
+| Experiment | 16-outcome AUROC (old headline) | 11-outcome AUROC (new) | 11-outcome AUPRC (new) |
+|---|---|---|---|
+| B0-Z              | 0.667 | 0.681 | — (per-outcome AUPRC incomplete in journal) |
+| B0-C-ttt          | 0.683 | 0.704 | — (no per-outcome AUPRC in journal) |
+| B0-C-ttt-ablation | 0.640 | 0.655 | — (no per-outcome AUPRC in journal) |
+| B0-C-ttt-full     | 0.691 | 0.727 | 0.766 |
+| I2 — P4-tight     | 0.726 | 0.749 | 0.768 |
+| I2b               | 0.732 | 0.755 | 0.769 |
+
+New running best is the 11-outcome **I2b AUROC = 0.755** (AUPRC 0.769).
+The 11-outcome headlines are uniformly higher than their 16-outcome
+counterparts because the 5 dropped outcomes were near-chance (≈0.50–0.63
+AUROC), so removing them lifts the support-weighted mean (drag removed).
+
+Data sources per row: B0-Z, B0-C-ttt, B0-C-ttt-ablation, B0-C-ttt-full
+from their status.md per-outcome AUROC tables (ablation old headline
+0.6401 from `results/results-trajectory-fix.tsv`); I2 from the verified
+absolute per-outcome AUROC/AUPRC; I2b from `eval_i2b.log`
+`patient_per_outcome` table. B0-Z / B0-C-ttt / B0-C-ttt-ablation report
+no complete per-outcome AUPRC, so their 11-outcome AUPRC is left blank.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
