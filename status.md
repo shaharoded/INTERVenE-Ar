@@ -1250,6 +1250,74 @@ decouple the MAE win from the AUROC cost.
 
 ---
 
+### I4 — Phase-2 sub-trajectory augmentation
+
+**Code:** `09a24d6`. `EMRDataset.__getitem__` gains an `augment_views`
+mode returning a random coherent row-subset per access: **A** full /
+**B** drop a random 12 h window / **C** labs-only / **D** drop-labs.
+Outcomes + terminals + admission are protected (never dropped); labs are
+identified by the `_MEASURE` concept-name pattern (all TAK Measurements
+concepts). `pretrain_transformer` toggles the flag ON for Phase 2 only
+(Phase 1/3 + val see full trajectories; api.py untouched). Existing
+Phase-2 oversampling supplies multiple views per patient per epoch.
+
+**Hypothesis (falsifiable):** patient-level AUROC ≥ +0.010; auxes still
+descend cleanly under the larger effective training set; honesty preserved.
+
+**Per-aux training trace (Phase 2, under augmentation):**
+
+| Aux | Unlock ep | λ_max | Anchor raw | Final raw | Δ% | Learning? |
+|---|---|---|---|---|---|---|
+| ce | 3 | 0.0807 | 1.7165 | 0.0210 | −98.8% | yes |
+| dt | 3 | 0.1659 | 0.8350 | 0.0716 | −91.4% | yes |
+| ttt | 3 | 0.0039 | 21.3346 | 0.1134 | −99.5% | yes |
+| ranking | 38 | 0.0310 | 0.2908 | 0.1174 | −59.6% | yes |
+
+All auxes descend cleanly under augmentation (no stale loss) — the
+"auxes still descend" prong **passes**. Honesty prong **passes**
+(gen_to_gt 0.50). Both phase val losses *improved* vs I2
+(phase2 0.1845→0.1784, phase3 1.103→1.088) — augmentation helped the
+LM/backbone fit.
+
+**Result vs running best I2b (0.732):**
+
+| Metric | I2b | I4 | Δ |
+|---|---|---|---|
+| patient_auroc_weighted | 0.732 | **0.710 (−0.022)** | fail |
+| patient_auroc_simple | 0.724 | 0.690 | −0.034 |
+| patient_auprc_weighted | 0.673 | 0.677 | +0.004 |
+| cap=48h AUROC | 0.478 | 0.510 | +0.032 |
+| RELEASE MAE (h) | 84.0 | 70.5 | −13.5 |
+| DEATH MAE (h) | 162.2 | 160.4 | −1.8 |
+| gen_to_gt_ratio_median | 1.18 | 0.50 | more honest |
+
+**The AUROC prong fails** (−0.022, needed +0.010). The weighted −0.022 is
+buoyed by DISGLYCEMIA_Hyper (+0.065, prevalence 0.41) and INFECTION
+(+0.026), masking a **broad rare-outcome collapse**: NERVOUS_SYSTEM
+−0.107, NEUROVASCULAR −0.096, KETOACIDOSIS −0.078, ATHEROSCLEROSIS
+−0.069, RELEASE −0.060, RETINOPATHY −0.055, SKIN_ULCER −0.046. The
+simple (unweighted) AUROC −0.034 confirms rare outcomes are hit hardest —
+the filtered views cut exposure to rare-outcome contexts and shorten
+sequences, hurting rare-class ranking even as the LM val improves.
+
+**Verdict: DISCARD.** I4 was an AUROC play and it *regressed* AUROC
+(−0.022) with broad rare-outcome damage — fails its own falsifiable and
+its design intent. The cap=48h / RELEASE-MAE / honesty gains don't
+rescue an AUROC-targeted experiment that lost AUROC. Reverting `09a24d6`;
+running best stays I2b (0.732).
+
+**Pattern across I2/I3/I4 (carry forward):** a consistent **AUROC ↔
+calibration/honesty tension**. I2 (patient-level pool) bought +0.043
+weighted AUROC but over-generates (gen_to_gt 1.69), bad RELEASE timing,
+KETOACIDOSIS collapse. I3 (ttt-consistency) and I4 (sub-traj aug) both
+move the *other* way — better cap=48h, RELEASE MAE −13–18 h, gen_to_gt
+~0.5–0.6 — but cost weighted AUROC (−0.05 / −0.02), rare outcomes the
+casualty. The headline (patient_auroc_weighted) rewards the I2 end of the
+frontier. If the objective is later reweighted toward calibrated peak
+*timing*/honesty, I3/I4 become attractive and should be revisited.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
