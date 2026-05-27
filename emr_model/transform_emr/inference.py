@@ -129,6 +129,8 @@ def generate(model,
              temperature=1.0,
              top_k=None,
              rep_decay=0.6,
+             ttt_emit_gate_hours=48.0,
+             ttt_emit_bias=3.0,
              batch_size=16,
              collect_risk_scores=False,
              tqdm_position=0,
@@ -208,7 +210,7 @@ def generate(model,
             # ── single prefill: next-token logits + KV cache (+ input risk scores) ──
             # One pass supplies both the KV cache needed for autoregressive decoding
             # and (when collect_risk_scores=True) the outcome probs for input tokens.
-            logits_pre, abs_t_pre, input_outcome_logits, _, _, past_kvs = model.forward_with_cache(
+            logits_pre, abs_t_pre, input_outcome_logits, _, ttt_pre, past_kvs = model.forward_with_cache(
                 parent_raw_ids=parent_raw_ids,
                 concept_ids=concept_ids,
                 value_ids=value_ids,
@@ -257,6 +259,9 @@ def generate(model,
             current_abs_ts = abs_t_pre[torch.arange(B, device=device), last_valid_idx]
             last_seed_ts   = abs_ts[torch.arange(B, device=device), last_valid_idx]
             current_abs_ts = torch.maximum(current_abs_ts, last_seed_ts)
+            # Model's own time-to-terminal belief at the current head position,
+            # carried through the decode loop to gate terminal emission.
+            ttt_now = ttt_pre[torch.arange(B, device=device), last_valid_idx]  # [B] log1p(hrs)
 
             # Stop any patient whose seed already exceeds the training horizon.
             time_exceeded = current_abs_ts >= max_abs_ts_norm
@@ -280,6 +285,18 @@ def generate(model,
                     rep_vec = build_rep_penalty_batched(last_tokens_batch, V=next_logits.size(-1),
                                                         window=5, strength=rep_decay, device=device)
                     next_logits = next_logits - rep_vec
+
+                # ── ttt-gated terminal emission: cap over-generation ──────────
+                # The ttt head predicts log1p(hrs to next terminal). As that belief
+                # drops below ttt_emit_gate_hours, ramp a positive bias onto terminal
+                # tokens so the trajectory ends near the model's predicted terminal
+                # time instead of drifting to the 336 h horizon. Illegal terminals are
+                # already -inf and stay -inf (−inf + finite = −inf).
+                if ttt_emit_bias > 0.0:
+                    pred_hours = torch.expm1(ttt_now.float().clamp(min=0.0, max=20.0))
+                    ramp = ((ttt_emit_gate_hours - pred_hours) / ttt_emit_gate_hours).clamp(0.0, 1.0)
+                    term_bias = (ttt_emit_bias * ramp).to(next_logits.dtype)  # [B]
+                    next_logits[:, terminal_set] += term_bias.unsqueeze(1)
 
                 if finished.any():
                     next_logits[finished] = float("-inf")
@@ -352,7 +369,7 @@ def generate(model,
                 new_valid  = torch.ones(B, 1, dtype=torch.bool, device=device)
                 cache_mask = torch.cat([cache_mask, new_valid], dim=1)
 
-                logits_dec, abs_t_dec, outcome_logits_dec, _, _, past_kvs = model.forward_with_cache(
+                logits_dec, abs_t_dec, outcome_logits_dec, _, ttt_dec, past_kvs = model.forward_with_cache(
                     parent_raw_ids=par_new.unsqueeze(1),
                     concept_ids=c_ids_new.unsqueeze(1),
                     value_ids=v_ids_new.unsqueeze(1),
@@ -366,6 +383,7 @@ def generate(model,
                 next_logits    = logits_dec[:, 0, :]
                 new_abs_t      = abs_t_dec[:, 0]
                 current_abs_ts = torch.maximum(new_abs_t, current_abs_ts)
+                ttt_now        = ttt_dec[:, 0]
 
                 # Time-based stop: patients whose absolute time hits the horizon are done.
                 time_exceeded = current_abs_ts >= max_abs_ts_norm
