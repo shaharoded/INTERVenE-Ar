@@ -491,20 +491,28 @@ phase3_epochs = _ts.get("phase3_epochs",   len(p3_val_losses))
 
 print("---")
 # === HEADLINE — patient-level peak-detector framing (NEW) ===========
-print(f"patient_auroc_weighted: {eval_results['patient_auroc_weighted']:.6f}")
-print(f"patient_auprc_weighted: {eval_results['patient_auprc_weighted']:.6f}")
-print(f"patient_auroc_simple:   {eval_results['patient_auroc_simple']:.6f}")
-print(f"patient_auprc_simple:   {eval_results['patient_auprc_simple']:.6f}")
-print(f"n_outcomes_used:        {eval_results['n_outcomes_used']}")
+print(f"patient_auroc_weighted:    {eval_results['patient_auroc_weighted']:.6f}")
+print(f"patient_auprc_weighted:    {eval_results['patient_auprc_weighted']:.6f}")
+print(f"patient_auroc_simple:      {eval_results['patient_auroc_simple']:.6f}")
+print(f"patient_auprc_simple:      {eval_results['patient_auprc_simple']:.6f}")
+# F1 metrics (for direct comparability with F1-reporting EHR literature).
+print(f"patient_max_f1_weighted:   {eval_results['patient_max_f1_weighted']:.6f}")
+print(f"patient_max_f1_simple:     {eval_results['patient_max_f1_simple']:.6f}")
+print(f"patient_f1_at_0_5_weighted:{eval_results['patient_f1_at_0_5_weighted']:.6f}")
+print(f"patient_f1_at_0_5_simple:  {eval_results['patient_f1_at_0_5_simple']:.6f}")
+print(f"n_outcomes_used:           {eval_results['n_outcomes_used']}")
 
-# Per-outcome patient AUC + peak-MAE — grep-friendly TSV.
-print("patient_per_outcome\toutcome\tauroc\tauprc\tn_pos\tn_neg\tprevalence")
+# Per-outcome patient AUC + F1 + peak-MAE — grep-friendly TSV.
+print("patient_per_outcome\toutcome\tauroc\tauprc\tmax_f1\tmax_f1_threshold\tf1_at_0_5\tn_pos\tn_neg\tprevalence")
 _pat_tbl = eval_results.get("patient_auc_table")
 if _pat_tbl is not None:
     for _outcome, _row in _pat_tbl.iterrows():
         _auroc = f"{_row['auroc']:.6f}" if not pd.isna(_row['auroc']) else "nan"
         _auprc = f"{_row['auprc']:.6f}" if not pd.isna(_row['auprc']) else "nan"
-        print(f"patient_per_outcome\t{_outcome}\t{_auroc}\t{_auprc}\t"
+        _maxf1 = f"{_row['max_f1']:.6f}" if not pd.isna(_row.get('max_f1', np.nan)) else "nan"
+        _mthr  = f"{_row['max_f1_threshold']:.6f}" if not pd.isna(_row.get('max_f1_threshold', np.nan)) else "nan"
+        _f105  = f"{_row['f1_at_0_5']:.6f}" if not pd.isna(_row.get('f1_at_0_5', np.nan)) else "nan"
+        print(f"patient_per_outcome\t{_outcome}\t{_auroc}\t{_auprc}\t{_maxf1}\t{_mthr}\t{_f105}\t"
               f"{int(_row['n_pos'])}\t{int(_row['n_neg'])}\t{_row['prevalence']:.6f}")
 
 print("peak_mae_hrs\toutcome\tmae_hours\tn_patients")

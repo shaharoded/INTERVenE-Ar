@@ -31,7 +31,7 @@ import pandas as pd
 import torch
 from pathlib import Path
 from joblib import load as joblib_load
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
 
 PROJECT_ROOT  = os.path.dirname(os.path.abspath(__file__))
 EMR_MODEL_DIR = os.path.join(PROJECT_ROOT, "emr_model")
@@ -498,7 +498,7 @@ def per_patient_max_auc(risk_df, gt_episodes, outcome_names, min_positives=None)
 
     Returns:
         pd.DataFrame: indexed by outcome, columns:
-            auroc, auprc, n_pos, n_neg, prevalence
+            auroc, auprc, max_f1, max_f1_threshold, f1_at_0_5, n_pos, n_neg, prevalence
     """
     gen_df = risk_df[risk_df["IsInput"] == 0]
     p_cols = [f"P_{n}" for n in outcome_names]
@@ -530,16 +530,49 @@ def per_patient_max_auc(risk_df, gt_episodes, outcome_names, min_positives=None)
 
         if n_pos < min_positives or n_neg < min_positives:
             rows.append({"outcome": name, "auroc": np.nan, "auprc": np.nan,
+                         "max_f1": np.nan, "max_f1_threshold": np.nan,
+                         "f1_at_0_5": np.nan,
                          "n_pos": n_pos, "n_neg": n_neg, "prevalence": prevalence})
             continue
 
+        # Max-F1 by sweeping the precision-recall curve.
+        precisions, recalls, thresholds = precision_recall_curve(labels, scores)
+        # precisions/recalls have length len(thresholds)+1; last point is (recall=0, prec=1).
+        f1s = np.where(
+            (precisions + recalls) > 0,
+            2 * precisions * recalls / np.maximum(precisions + recalls, 1e-12),
+            0.0,
+        )
+        best_idx = int(np.argmax(f1s))
+        max_f1 = float(f1s[best_idx])
+        # thresholds has one fewer element than precisions/recalls; cap at last threshold.
+        if best_idx < len(thresholds):
+            max_f1_thr = float(thresholds[best_idx])
+        else:
+            max_f1_thr = float(thresholds[-1]) if len(thresholds) else 0.5
+
+        # F1 at threshold 0.5.
+        preds_05 = (scores >= 0.5).astype(int)
+        tp = int(((preds_05 == 1) & (labels == 1)).sum())
+        fp = int(((preds_05 == 1) & (labels == 0)).sum())
+        fn = int(((preds_05 == 0) & (labels == 1)).sum())
+        prec_05 = tp / max(tp + fp, 1)
+        rec_05  = tp / max(tp + fn, 1)
+        if prec_05 + rec_05 > 0:
+            f1_at_0_5 = 2 * prec_05 * rec_05 / (prec_05 + rec_05)
+        else:
+            f1_at_0_5 = 0.0
+
         rows.append({
-            "outcome":    name,
-            "auroc":      float(roc_auc_score(labels, scores)),
-            "auprc":      float(average_precision_score(labels, scores)),
-            "n_pos":      n_pos,
-            "n_neg":      n_neg,
-            "prevalence": prevalence,
+            "outcome":          name,
+            "auroc":            float(roc_auc_score(labels, scores)),
+            "auprc":            float(average_precision_score(labels, scores)),
+            "max_f1":           max_f1,
+            "max_f1_threshold": max_f1_thr,
+            "f1_at_0_5":        float(f1_at_0_5),
+            "n_pos":            n_pos,
+            "n_neg":            n_neg,
+            "prevalence":       prevalence,
         })
 
     return pd.DataFrame(rows).set_index("outcome").sort_values("auroc", ascending=False)
@@ -562,17 +595,27 @@ def weighted_mean_auc(auc_table, by="n_pos"):
     """
     tbl = auc_table.dropna(subset=["auroc"])
     if len(tbl) == 0:
-        return {"auroc_weighted": float("nan"), "auprc_weighted": float("nan"),
-                "auroc_simple":   float("nan"), "auprc_simple":   float("nan"),
+        nan = float("nan")
+        return {"auroc_weighted": nan, "auprc_weighted": nan,
+                "auroc_simple":   nan, "auprc_simple":   nan,
+                "max_f1_weighted": nan, "max_f1_simple": nan,
+                "f1_at_0_5_weighted": nan, "f1_at_0_5_simple": nan,
                 "n_outcomes_used": 0}
     w = tbl[by].astype(float).values
     w = w / w.sum() if w.sum() > 0 else np.ones_like(w) / len(w)
+    # F1 columns may not exist on legacy callers; default to nan-safe sums.
+    has_max_f1   = "max_f1"    in tbl.columns
+    has_f1_05    = "f1_at_0_5" in tbl.columns
     return {
-        "auroc_weighted":  float((tbl["auroc"].values * w).sum()),
-        "auprc_weighted":  float((tbl["auprc"].values * w).sum()),
-        "auroc_simple":    float(tbl["auroc"].mean()),
-        "auprc_simple":    float(tbl["auprc"].mean()),
-        "n_outcomes_used": int(len(tbl)),
+        "auroc_weighted":      float((tbl["auroc"].values * w).sum()),
+        "auprc_weighted":      float((tbl["auprc"].values * w).sum()),
+        "auroc_simple":        float(tbl["auroc"].mean()),
+        "auprc_simple":        float(tbl["auprc"].mean()),
+        "max_f1_weighted":     float((tbl["max_f1"].values    * w).sum()) if has_max_f1 else float("nan"),
+        "max_f1_simple":       float(tbl["max_f1"].mean())                 if has_max_f1 else float("nan"),
+        "f1_at_0_5_weighted":  float((tbl["f1_at_0_5"].values * w).sum()) if has_f1_05  else float("nan"),
+        "f1_at_0_5_simple":    float(tbl["f1_at_0_5"].mean())              if has_f1_05  else float("nan"),
+        "n_outcomes_used":     int(len(tbl)),
     }
 
 
@@ -676,14 +719,19 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
     mean_mae_hours = float(mae_table["mae_hours"].mean(skipna=True))
 
     # Summarise per-outcome for the log
-    print("[Eval] Per-patient AUC (new headline framing):")
+    print("[Eval] Per-patient AUC + F1 (new headline framing):")
     for outcome, row in patient_auc_table.iterrows():
         if not np.isnan(row["auroc"]):
             print(f"  {outcome:<45} AUROC={row['auroc']:.3f}  AUPRC={row['auprc']:.3f}  "
+                  f"maxF1={row['max_f1']:.3f}(τ={row['max_f1_threshold']:.3f})  "
+                  f"F1@0.5={row['f1_at_0_5']:.3f}  "
                   f"n_pos={int(row['n_pos'])}  prev={row['prevalence']:.3f}")
     print(f"[Eval] Patient-level mean (support-weighted): AUROC={patient_mean['auroc_weighted']:.3f}  "
-          f"AUPRC={patient_mean['auprc_weighted']:.3f}  (simple: {patient_mean['auroc_simple']:.3f} / "
-          f"{patient_mean['auprc_simple']:.3f}, n_outcomes={patient_mean['n_outcomes_used']})")
+          f"AUPRC={patient_mean['auprc_weighted']:.3f}  maxF1={patient_mean['max_f1_weighted']:.3f}  "
+          f"F1@0.5={patient_mean['f1_at_0_5_weighted']:.3f}  "
+          f"(simple AUROC={patient_mean['auroc_simple']:.3f} / AUPRC={patient_mean['auprc_simple']:.3f} / "
+          f"maxF1={patient_mean['max_f1_simple']:.3f} / F1@0.5={patient_mean['f1_at_0_5_simple']:.3f}, "
+          f"n_outcomes={patient_mean['n_outcomes_used']})")
     print("[Eval] Per-outcome AUROC (legacy horizon-extended window pooling):")
     for outcome, row in auc_table.iterrows():
         if not np.isnan(row["auroc"]):
@@ -706,6 +754,11 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
         patient_auprc_weighted=patient_mean["auprc_weighted"],
         patient_auroc_simple=patient_mean["auroc_simple"],
         patient_auprc_simple=patient_mean["auprc_simple"],
+        # F1 metrics (for direct comparability with F1-reporting EHR literature).
+        patient_max_f1_weighted=patient_mean["max_f1_weighted"],
+        patient_max_f1_simple=patient_mean["max_f1_simple"],
+        patient_f1_at_0_5_weighted=patient_mean["f1_at_0_5_weighted"],
+        patient_f1_at_0_5_simple=patient_mean["f1_at_0_5_simple"],
         n_outcomes_used=patient_mean["n_outcomes_used"],
         peak_mae_table=peak_mae_table,
         # Legacy per-window framing (kept for back-compat / supplementary).
