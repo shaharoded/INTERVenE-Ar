@@ -393,6 +393,34 @@ class GPT(nn.Module):
             nn.Linear(cfg["embed_dim"], self.num_outcomes)
         )
 
+        # P4 — Patient-level attention pool head (Phase-3 aux only).
+        # Per-outcome learnable query embeddings attend over the backbone's
+        # final hidden states to produce one pooled feature per (patient,
+        # outcome). A scalar projection turns each pooled feature into a
+        # patient-level logit. Loss is BCE(pool_logit, patient_label) where
+        # patient_label[b, k] = 1 iff outcome k appears anywhere in the
+        # non-pad GT trajectory.
+        #
+        # Why this might work where P1-MIL didn't: the gradient from this
+        # aux flows backward through `_last_hidden` into the backbone (at
+        # tiny phase3_backbone_lr_factor=0.01), NOT through outcome_head.
+        # The outcome head's per-position calibration is therefore protected
+        # from the patient-level coarseness that wrecked P1's outcome logits.
+        # The pool head's parameters are trained at head LR.
+        #
+        # Init: pool_out's weights are non-zero (small Xavier) so the head
+        # produces meaningful gradient on epoch 1; the head's BCE bias drift
+        # in the first few epochs is what calibrates λ_pool via the standard
+        # raw_outcome / raw_pool ratio scheme.
+        self._pool_query = nn.Embedding(self.num_outcomes, cfg["embed_dim"])
+        nn.init.normal_(self._pool_query.weight, mean=0.0, std=0.02)
+        self._pool_attn = nn.MultiheadAttention(
+            embed_dim=cfg["embed_dim"], num_heads=4, batch_first=True,
+            dropout=cfg["dropout"],
+        )
+        self._pool_out = nn.Linear(cfg["embed_dim"], 1)
+        nn.init.zeros_(self._pool_out.bias)
+
         # Vocab positions for ALL OUTCOMES+TERMINAL_OUTCOMES that exist in vocab.
         # Broader than outcome_names (includes outcomes filtered by rarity); used
         # for the 1-hot override in multi-hot BCE targets during phase-2 training.
@@ -628,6 +656,14 @@ class GPT(nn.Module):
 
         x = self.ln_f(x)                     # [B, T, D]
 
+        # P4 — stash final hidden state so the patient-level pool head can
+        # consume it from outside forward() without enlarging the return
+        # tuple (the existing 5-element signature has many call sites).
+        # The stash holds the autograd-tracked tensor, so gradients from
+        # downstream pool-head consumers flow back through the backbone
+        # exactly as if pool_head were called inline here.
+        self._last_hidden = x
+
         # 3. Main next-token prediction head
         logits = self.lm_head(x)             # [B, T, V]
 
@@ -650,6 +686,30 @@ class GPT(nn.Module):
         ttt_pred = self.ttt_head(x).squeeze(-1)        # [B, T]
 
         return logits, abs_t_pred, outcome_logits, gate_logit, ttt_pred
+
+
+    def pool_forward(self, hidden, key_pad_mask):
+        """P4 patient-level pool head.
+
+        Args
+        ----
+        hidden        : [B, T, D] — usually self._last_hidden after a forward.
+        key_pad_mask  : [B, T] bool — True at PADDED positions (matches
+                        nn.MultiheadAttention's key_padding_mask convention).
+
+        Returns
+        -------
+        pool_logit    : [B, K] — patient-level logit per outcome.
+        """
+        B, T, D = hidden.shape
+        K = self._pool_query.num_embeddings
+        q = self._pool_query.weight.unsqueeze(0).expand(B, K, D)  # [B, K, D]
+        pooled, _ = self._pool_attn(
+            query=q, key=hidden, value=hidden,
+            key_padding_mask=key_pad_mask, need_weights=False,
+        )                                                          # [B, K, D]
+        pool_logit = self._pool_out(pooled).squeeze(-1)            # [B, K]
+        return pool_logit
 
 
     @torch.no_grad()
@@ -813,6 +873,17 @@ class GPT(nn.Module):
                   f"({len(_ttt_keys_missing)} keys). This is expected when "
                   f"loading a pre-direction-C checkpoint.")
             missing = missing - _ttt_keys_missing
+
+        # P4 — pool head was added with the patient-level attention pool aux.
+        # Pre-P4 checkpoints don't carry these keys. Allow load with random
+        # init: the pool head is a Phase-3-only training aux; eval doesn't
+        # touch it, so random init is safe at inference.
+        _pool_keys_missing = {k for k in missing if k.startswith("_pool_")}
+        if _pool_keys_missing:
+            print(f"[GPT.load] pool head not in ckpt — keeping random init "
+                  f"({len(_pool_keys_missing)} keys). Expected when loading "
+                  f"a pre-P4 checkpoint; pool head is a Phase-3 aux only.")
+            missing = missing - _pool_keys_missing
 
         if missing:
             raise RuntimeError(f"[GPT.load] Missing required keys in checkpoint: {sorted(missing)}")
@@ -1385,15 +1456,23 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
         m.outcome_log_tau.requires_grad_(False)
 
     def _make_p3_optimizer(m):
-        head_names = {"outcome_head"}
-        backbone_params = [p for n, p in m.named_parameters()
-                           if not any(h in n for h in head_names)]
-        head_params = list(m.outcome_head.parameters())
+        # P4 — pool head (_pool_query / _pool_attn / _pool_out) trains at
+        # head LR. Gradient through pool_logit → hidden_state propagates
+        # to backbone params at p3_lr * backbone_lr_factor (default 0.01),
+        # so the backbone barely moves — protecting the joint P2 optimum.
+        head_pool = list(m._pool_query.parameters()) + \
+                    list(m._pool_attn.parameters()) + \
+                    list(m._pool_out.parameters())
+        head_outcome = list(m.outcome_head.parameters())
+        head_ids = {id(p) for p in head_outcome + head_pool}
+        backbone_params = [p for _, p in m.named_parameters() if id(p) not in head_ids]
         return torch.optim.AdamW(
             [
                 {"params": backbone_params, "lr": p3_lr * backbone_lr_factor,
                  "weight_decay": training_settings["weight_decay"]},
-                {"params": head_params,     "lr": p3_lr,
+                {"params": head_outcome,    "lr": p3_lr,
+                 "weight_decay": p3_wd},
+                {"params": head_pool,       "lr": p3_lr,
                  "weight_decay": p3_wd},
             ],
         )
@@ -1448,6 +1527,14 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                                      .get("ranking", 0.20))
     lambda_ranking: float | None = None  # set after epoch 1
 
+    # P4 — patient-level attention pool aux. λ_pool calibrated once at the
+    # end of Phase-3 epoch 1, capped at fraction phase3_pool_fraction_cap
+    # of raw outcome BCE (same regime as ranking, default 0.20).
+    pool_cap = training_settings.get("phase3_pool_fraction_cap", 0.20)
+    lambda_pool: float | None = None
+    pad_idx_p3 = model.embedder.padding_idx
+    outcome_ids_p3 = torch.tensor(outcome_token_ids, dtype=torch.long, device=device)
+
     def run_epoch(loader, train_flag):
         # Backbone stays in eval mode (no dropout updates, deterministic features).
         model.eval()
@@ -1455,7 +1542,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             model.outcome_head.train()
 
         total_loss = total_outcome = 0.0
-        total_outcome_raw = total_ranking_raw = 0.0
+        total_outcome_raw = total_ranking_raw = total_pool_raw = 0.0
         with torch.set_grad_enabled(train_flag):
             for batch in tqdm(loader, desc="[Phase-3] Train" if train_flag else "[Phase-3] Val",
                               leave=False, mininterval=5.0, miniters=10, dynamic_ncols=True):
@@ -1504,7 +1591,27 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 _lam = lambda_ranking if lambda_ranking is not None else 0.0
                 loss_ranking = _lam * loss_ranking_raw
 
-                loss = loss_outcome + loss_ranking
+                # P4 — patient-level attention pool aux.
+                # Hidden state already computed inside model.__call__ above
+                # and stashed at model._last_hidden. Build the patient label
+                # and key-padding mask, then call pool_forward.
+                _hidden = model._last_hidden.float()                   # [B, T, D]
+                _kpm    = (full_targets == pad_idx_p3)                 # [B, T] True at pad
+                pool_logit = model.pool_forward(_hidden, _kpm).float() # [B, K]
+                _ft_e = full_targets.unsqueeze(-1)                     # [B, T, 1]
+                _oid  = outcome_ids_p3.view(1, 1, -1)                  # [1, 1, K]
+                _nonpad_full = (full_targets != pad_idx_p3).unsqueeze(-1)  # [B, T, 1]
+                patient_label_p4 = ((_ft_e == _oid) & _nonpad_full).any(dim=1).float()  # [B, K]
+                # Use the same per-outcome pos_weight tensor the per-position
+                # BCE uses, so rare outcomes carry comparable weight.
+                loss_pool_raw = nn.functional.binary_cross_entropy_with_logits(
+                    pool_logit, patient_label_p4,
+                    pos_weight=pos_weights, reduction="mean",
+                )
+                _lam_pool = lambda_pool if lambda_pool is not None else 0.0
+                loss_pool = _lam_pool * loss_pool_raw
+
+                loss = loss_outcome + loss_ranking + loss_pool
 
                 if train_flag:
                     if not torch.isfinite(loss):
@@ -1519,6 +1626,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                 total_outcome     += loss_outcome.item()
                 total_outcome_raw += loss_outcome_raw.item()
                 total_ranking_raw += loss_ranking_raw.item()
+                total_pool_raw    += loss_pool_raw.item()
 
         n = max(len(loader), 1)
         return {
@@ -1526,6 +1634,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
             "outcome":     total_outcome     / n,
             "outcome_raw": total_outcome_raw / n,
             "ranking_raw": total_ranking_raw / n,
+            "pool_raw":    total_pool_raw    / n,
         }
 
     n_epochs = training_settings["phase3_n_epochs"]
@@ -1542,6 +1651,13 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
                   f"(cap={ranking_cap}, raw_outcome={tr['outcome_raw']:.6f}, "
                   f"raw_ranking={tr['ranking_raw']:.6f})")
 
+        # P4 — one-shot λ_pool calibration at the end of epoch 1.
+        if lambda_pool is None and tr["pool_raw"] > 0.0:
+            lambda_pool = pool_cap * (tr["outcome_raw"] / tr["pool_raw"])
+            print(f"[Phase-3]: λ_pool calibrated = {lambda_pool:.6f} "
+                  f"(cap={pool_cap}, raw_outcome={tr['outcome_raw']:.6f}, "
+                  f"raw_pool={tr['pool_raw']:.6f})")
+
         tr_loss, vl_loss = tr["loss"], vl["loss"]
         # Selection metric: pure outcome BCE (stable across the λ=0 → λ=λ_cal
         # transition). This is what the eval ultimately measures.
@@ -1551,7 +1667,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
 
         print(f"[Phase-3]: Epoch {epoch:02d}  train={tr_loss:.4f}  val={vl_loss:.4f}  "
               f"raw_out={tr['outcome_raw']:.7f}  raw_rank={tr['ranking_raw']:.7f}  "
-              f"vl_select={vl_select:.6f}")
+              f"raw_pool={tr['pool_raw']:.7f}  vl_select={vl_select:.6f}")
 
         model.save(ckpt_last, epoch=epoch, best_val=best_val, optimizer=optimizer,
                    training_settings=training_settings, bad_epochs=bad_epochs)
