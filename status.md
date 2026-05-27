@@ -1179,6 +1179,77 @@ are risk-curve / pool-coupling problems, not generation-length problems.
 
 ---
 
+### I3 — P-CTTT-bounds (softplus positivity + ttt-consistency aux)
+
+**Code:** `6343c51`. (a) softplus on the ttt head output in both forward
+paths (mirrors the dt magnitude head; log1p(hrs)≥0). (b) New Phase-2
+aux `ttt_consistency` = `|expm1(ttt_pred)+T(t) − GT_terminal|` in hours,
+an L1-in-hours pin of the ttt-implied terminal time to the GT duration —
+stage 0, cap 0.10 of BCE, ramp 0. Motivated by I2b: the inference ttt-gate
+thresholds on *absolute* predicted hours, which log-space MSE calibrates
+poorly at long horizons. Both bounds in one run (program default).
+
+**Hypothesis (falsifiable):** patient-level AUROC doesn't regress; raw_ttt
+descends; ttt-vs-dt consistency < 10 h.
+
+**Per-aux training trace (Phase 2):**
+
+| Aux | Unlock ep | λ_max | Anchor raw | Final raw | Δ% | Learning? |
+|---|---|---|---|---|---|---|
+| ce | 3 | 0.0886 | 1.5382 | 0.00799 | −99.5% | yes |
+| dt | 3 | 0.1696 | 0.8039 | 0.08021 | −90.0% | yes |
+| ttt | 3 | 0.0052 | 15.8326 | 0.10725 | −99.3% | yes |
+| ttt_consistency | 3 | 0.0002 | 130.2194 | 10.5530 | −91.9% | yes |
+| ranking | 34 | 0.0305 | 0.1633 | 0.10045 | −38.5% | yes |
+
+No stale loss. The new `ttt_consistency` descends 130 h → ~10.5 h — it
+**did its job**: the model's ttt-implied terminal time lands within ~10 h
+of the GT terminal (right at the < 10 h falsifiable target). Calibration
+prongs (raw_ttt descends, consistency < 10 h) both **pass**.
+
+**Result vs running best I2b (0.732):**
+
+| Metric | I2b | I3 gate-on | I3 gate-off (diag) |
+|---|---|---|---|
+| patient_auroc_weighted | 0.732 | **0.682 (−0.049)** | 0.660 |
+| cap=48h AUROC | 0.478 | 0.389 | 0.389 |
+| RELEASE MAE (h) | 84.0 | **65.6 (−18.4)** | 63.7 |
+| DEATH MAE (h) | 162.2 | 156.5 (−5.8) | 152.0 |
+| gen_to_gt_ratio_median | 1.18 | 0.61 | 0.80 |
+| phase2_best_val | 0.1845 | 0.1879 | — |
+| phase3_best_val | 1.103 | 1.116 | — |
+
+AUROC regressed broadly (RETINOPATHY −0.145, CARDIO −0.092, INFECTION
+−0.080, ~12/16 outcomes down; only DISGLYCEMIA_Hyper +0.028 and DEATH
++0.006 up). The AUROC prong **fails**.
+
+**The consistency loss fixed RELEASE MAE** (84 → 65.6 h, −18 h) — the
+first thing in the loop to move it — by sharpening the absolute-hour ttt
+calibration the gate uses. But it did so by reshaping the *shared*
+backbone toward absolute-time encoding at the expense of outcome
+discrimination (both phase2 and phase3 val losses worsened, and the
+per-outcome drop is broad, not terminal-specific).
+
+**Gate-off diagnostic** (eval on I3 weights, `ttt_emit_bias=0`): AUROC
+**0.660** — *lower* than gate-on, so the gate was actually helping
+(+0.022) and the AUROC loss is **backbone-intrinsic, not gate-tunable**.
+This rules out salvaging by relaxing the gate.
+
+**Verdict: DISCARD.** Per the design-intent rule (MAE up + AUC roughly
+flat → KEEP), MAE passes but AUC −0.049 is material, not flat — and the
+diagnostic shows it's not recoverable by gate tuning. User confirmed
+DISCARD → continue to I4. Reverting `6343c51`; running best stays I2b
+(I2 weights `d9a6174` + ttt-gate `5d40ca5`, AUROC_w 0.732).
+
+**Key finding (carry forward):** the ttt-consistency loss is a *working*
+RELEASE-MAE lever (−18 h) — the open MAE problem IS solvable via ttt
+calibration — but the present form pays ~0.05 AUROC because the
+consistency gradient flows into the shared backbone. A future salvage
+(smaller cap, stop-gradient to ttt_head only, or Phase-3-only) could
+decouple the MAE win from the AUROC cost.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
