@@ -1437,6 +1437,23 @@ weighted-AUROC headline rewards the patient-level-pooling end of the frontier.
 
 ---
 
+### I7 — PREEMPTED (superseded by outcome-list snip)
+
+I7 (rare-outcome exclusion from the Phase-3 pool BCE, code `b6e99ed`) was
+launched at 10k and killed mid-Phase-3 by a human-in-loop REFOCUS before
+its eval landed. **Not journaled as KEEP/DISCARD** — superseded by the
+**outcome-list snip** directive: rather than protect rare outcomes inside
+the pool aux, the project reduces the outcome-head target set from 16 → 11,
+dropping five outcomes that never achieved above-prevalence discrimination
+under any recipe across the P- and I-sequences (HYPEROSMOLALITY, INFECTION,
+ACIDOSIS, ATHEROSCLEROSIS, ACUTE_RESPIRATORY_DISORDER). Their tokens stay in
+the LM vocabulary (tokenizer is built from training data, not OUTCOMES), so
+they still shape backbone context — they simply stop being head targets,
+CBM-forbid-protected, and sampler-upweighted. Code `b6e99ed` reverted
+(`d2b077b`); the headline lens is re-defined over the kept 11 outcomes.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
