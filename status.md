@@ -1382,6 +1382,61 @@ The frontier stands: I2/I2b (AUROC 0.732) remains the best recipe.
 
 ---
 
+### I6 — CBM in Phase 3 (outcome-preserving input masking)
+
+**Code:** `f714165`. Apply `apply_cbm` (p=0.25) on Phase-3 **train** batches
+with an outcome-PRESERVING forbid list — outcomes + terminals + admission +
+pad/null/mask never masked; labs / interventions / meals / context all
+eligible (more aggressive than Phase-2's list, which also protects
+meals/intervals for LM-head coherence Phase 3 doesn't need). Labels come
+from the UNMASKED `position_ids` (`label_pos`), so the soft-kernel outcome
+targets and the P4 pool label are unaffected; only the head's *input
+context* is corrupted. Val is CBM-free.
+
+**Hypothesis (falsifiable):** patient AUROC ≥ +0.005; outcome head shows a
+robustness gain (smaller eval-time AUROC variance across seeds).
+
+**Per-aux trace (Phase 2 — unchanged by I6, Phase-3-only change):**
+
+| Aux | Unlock ep | λ_max | Anchor raw | Final raw | Δ% | Learning? |
+|---|---|---|---|---|---|---|
+| ce | 3 | 0.0911 | 1.5321 | 0.00099 | −99.9% | yes |
+| dt | 3 | 0.1711 | 0.8153 | 0.0217 | −97.3% | yes |
+| ttt | 3 | 0.0039 | 21.5463 | 0.0267 | −99.9% | yes |
+| ranking | 33 | 0.0310 | 0.1053 | 0.0324 | −69.2% | yes |
+
+**Result vs running best I2b (0.732):**
+
+| Metric | I2b | I6 | Δ |
+|---|---|---|---|
+| patient_auroc_weighted | 0.732 | **0.716** | **−0.016** |
+| patient_auroc_simple | 0.724 | 0.705 | −0.019 |
+| patient_auprc_weighted | 0.673 | 0.672 | −0.001 |
+| cap=48h AUROC | 0.478 | 0.491 | +0.013 |
+| DEATH AUROC | 0.730 | 0.757 | +0.037 |
+| RELEASE MAE (h) | 84.0 | 81.6 | −2.4 |
+| gen_to_gt_ratio_median | 1.18 | 0.564 | more honest |
+
+Mixed per-outcome — up: DEATH +0.037, DISGLYCEMIA_Hyper +0.043; down:
+KETOACIDOSIS −0.122, CARDIO −0.067, RETINOPATHY −0.053, DISGLYCEMIA_Hypo
+−0.052. The AUROC prong **fails** (−0.016, needed +0.005); the
+"lower-variance" prong is untested (single seed), and irrelevant given the
+mean already regressed.
+
+**Verdict: DISCARD.** I6 is the **4th confirmation** of the AUROC↔calibration
+tension: CBM input-robustness improved cap=48h (+0.013), DEATH AUROC, RELEASE
+MAE and honesty (gen_to_gt 0.56), but cost net weighted AUROC and collapsed
+rare outcomes (KETOACIDOSIS −0.122). Reverting `f714165`; running best stays
+I2b (0.732).
+
+**I-sequence outcome:** of I1–I6, only **I2 (+I2b)** is a KEEP — patient-level
+pooling at cap 0.05 + the ttt-gate, AUROC_w **0.732**. Every
+calibration/robustness/distribution lever (I3/I4/I5/I6) lifted timing/honesty
+but lost weighted AUROC, with rare outcomes the consistent casualty. The
+weighted-AUROC headline rewards the patient-level-pooling end of the frontier.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
