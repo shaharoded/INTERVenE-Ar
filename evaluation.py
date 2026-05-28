@@ -61,10 +61,73 @@ EVAL_FULL_HORIZON_HOURS = 336.0  # cap per-patient eval horizon at 14 days (matc
 # from headline means.
 EVAL_PREVALENCE_THRESHOLD = OUTCOME_RARE_THRESHOLD_PCT / 100.0  # fraction (0.01)
 
+# Outcomes excluded from the AUROC/AUPRC/F1 evaluation entirely.
+# RELEASE_EVENT is the negation of DEATH_EVENT in this cohort (essentially no
+# censoring — every patient has either DEATH or RELEASE). Including both in
+# the discrimination headline double-counts the same terminal-event ranking
+# task. RELEASE stays in the LM vocab (so the model emits it and we get
+# trajectory-length signal) and is reported via length_of_stay_mae instead.
+AUC_EXCLUDE = ("RELEASE_EVENT",)
+
 
 def _min_positives(n_patients, threshold=EVAL_PREVALENCE_THRESHOLD):
     """Minimum positive count for an outcome's AUC to be emitted (≥1)."""
     return max(1, int(round(threshold * n_patients)))
+
+
+def length_of_stay_mae(risk_df, gt_episodes, release_token="RELEASE_EVENT"):
+    """
+    Purpose: Length-of-stay regression MAE — replaces RELEASE peak-MAE.
+    Method:  For each patient that was released in GT:
+               GT_LoS  = earliest GT RELEASE timepoint (admission anchor = 0).
+               Pred_LoS = last timestamp in patient's full sequence
+                         (input + generated). Captures admission → end of
+                         model-emitted trajectory.
+             MAE = mean |Pred_LoS − GT_LoS| over released patients.
+
+             Distinct from peak-MAE on RELEASE: peak-MAE asks "when does the
+             model's risk-curve peak vs the nearest GT RELEASE token?" — a
+             risk-curve-shape metric. LoS asks "did the model predict the
+             right discharge timing?" — a trajectory-length regression.
+
+    Args:
+        risk_df (pd.DataFrame): generate() output with collect_risk_scores=True.
+        gt_episodes (dict): {pid: {outcome: [t1, ...]}} from extract_ground_truth_episodes.
+        release_token (str): token marking discharge.
+
+    Returns:
+        dict: mae_hours, median_hours, p90_hours, n_patients, gt_mean_hours, pred_mean_hours.
+    """
+    errors = []
+    gt_vals = []
+    pred_vals = []
+    for pid, sub in risk_df.groupby("PatientId"):
+        gt_releases = gt_episodes.get(pid, {}).get(release_token, [])
+        if not gt_releases:
+            continue
+        gt_los = float(min(gt_releases))  # earliest GT release
+        pred_los = float(sub["TimePoint"].max())  # admission→end of (input+generated)
+        errors.append(abs(pred_los - gt_los))
+        gt_vals.append(gt_los)
+        pred_vals.append(pred_los)
+    if not errors:
+        return {
+            "mae_hours":      float("nan"),
+            "median_hours":   float("nan"),
+            "p90_hours":      float("nan"),
+            "n_patients":     0,
+            "gt_mean_hours":  float("nan"),
+            "pred_mean_hours": float("nan"),
+        }
+    errs = np.asarray(errors)
+    return {
+        "mae_hours":      float(errs.mean()),
+        "median_hours":   float(np.median(errs)),
+        "p90_hours":      float(np.percentile(errs, 90)),
+        "n_patients":     int(len(errs)),
+        "gt_mean_hours":  float(np.mean(gt_vals)),
+        "pred_mean_hours": float(np.mean(pred_vals)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -695,13 +758,27 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
 
     # -- Compute metrics --
     print("[Eval] Computing patient-level AUC, episode-level AUC, time accuracy...")
+    # AUC/F1 outcomes EXCLUDE RELEASE_EVENT (it's the negation of DEATH; double-
+    # counts the same ranking task). RELEASE is reported via length_of_stay_mae
+    # below and stays in the LM vocab so the model still emits it.
+    auc_outcome_names = [n for n in outcome_names if n not in AUC_EXCLUDE]
+    print(f"[Eval] AUC/F1 computed over {len(auc_outcome_names)} outcomes "
+          f"(excluded from AUROC headline: {list(AUC_EXCLUDE)}).")
     # NEW HEADLINE — per-patient peak-detector AUC. Each (patient, outcome)
     # contributes one (max_P, label) pair; far more stable than per-window.
-    patient_auc_table = per_patient_max_auc(risk_df, gt_episodes, outcome_names)
+    patient_auc_table = per_patient_max_auc(risk_df, gt_episodes, auc_outcome_names)
     patient_mean      = weighted_mean_auc(patient_auc_table, by="n_pos")
     # Nearest-GT MAE — fair when complications recur (argmax may catch the
-    # second occurrence and still be a correct hit).
-    peak_mae_table    = time_accuracy_nearest(risk_df, gt_episodes, outcome_names)
+    # second occurrence and still be a correct hit). RELEASE excluded — its
+    # discharge timing is captured by length_of_stay_mae instead (cleaner
+    # length-of-stay regression than a risk-curve-peak MAE).
+    peak_mae_table    = time_accuracy_nearest(risk_df, gt_episodes, auc_outcome_names)
+    # Length-of-stay MAE — replaces RELEASE peak-MAE.
+    los_stats         = length_of_stay_mae(risk_df, gt_episodes)
+    print(f"[Eval] Length-of-stay MAE: {los_stats['mae_hours']:.2f}h "
+          f"(median {los_stats['median_hours']:.1f}h, p90 {los_stats['p90_hours']:.1f}h, "
+          f"n={los_stats['n_patients']}, GT mean {los_stats['gt_mean_hours']:.1f}h, "
+          f"pred mean {los_stats['pred_mean_hours']:.1f}h)")
 
     # Legacy per-window AUC table kept for back-compat and supplementary
     # reporting; no longer the headline.
@@ -761,6 +838,11 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
         patient_f1_at_0_5_simple=patient_mean["f1_at_0_5_simple"],
         n_outcomes_used=patient_mean["n_outcomes_used"],
         peak_mae_table=peak_mae_table,
+        # Length-of-stay regression (replaces RELEASE peak-MAE).
+        length_of_stay_mae_hours=los_stats["mae_hours"],
+        length_of_stay_median_hours=los_stats["median_hours"],
+        length_of_stay_p90_hours=los_stats["p90_hours"],
+        length_of_stay_n_patients=los_stats["n_patients"],
         # Legacy per-window framing (kept for back-compat / supplementary).
         mean_auroc=mean_auroc,
         mean_auprc=mean_auprc,

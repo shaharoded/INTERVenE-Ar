@@ -501,6 +501,11 @@ print(f"patient_max_f1_simple:     {eval_results['patient_max_f1_simple']:.6f}")
 print(f"patient_f1_at_0_5_weighted:{eval_results['patient_f1_at_0_5_weighted']:.6f}")
 print(f"patient_f1_at_0_5_simple:  {eval_results['patient_f1_at_0_5_simple']:.6f}")
 print(f"n_outcomes_used:           {eval_results['n_outcomes_used']}")
+# Length-of-stay regression (replaces RELEASE peak-MAE; RELEASE excluded from AUC headline).
+print(f"length_of_stay_mae_hours:  {eval_results['length_of_stay_mae_hours']:.4f}")
+print(f"length_of_stay_median_hrs: {eval_results['length_of_stay_median_hours']:.4f}")
+print(f"length_of_stay_p90_hours:  {eval_results['length_of_stay_p90_hours']:.4f}")
+print(f"length_of_stay_n_patients: {eval_results['length_of_stay_n_patients']}")
 
 # Per-outcome patient AUC + F1 + peak-MAE — grep-friendly TSV.
 print("patient_per_outcome\toutcome\tauroc\tauprc\tmax_f1\tmax_f1_threshold\tf1_at_0_5\tn_pos\tn_neg\tprevalence")
