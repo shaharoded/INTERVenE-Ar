@@ -11,29 +11,21 @@ TEST_TEMPORAL_DATA_FILE  = os.path.join(PROJECT_ROOT, 'data', 'test', 'temporal_
 TEST_CTX_DATA_FILE       = os.path.join(PROJECT_ROOT, 'data', 'test', 'context_data.csv')
 QA_DATA_FILE             = os.path.join(PROJECT_ROOT, 'data', 'source', 'qa_data.csv')
 
-# Define the prediction targets, <bot>, <eot> tokens to terminate the inference.
-# Outcome-snip (16 -> 11 head targets): five outcomes that never achieved
-# above-prevalence discrimination under any recipe across the P-/I-sequences
-# were removed as outcome-head targets — HYPEROSMOLALITY_EVENT, INFECTION_EVENT,
-# ACIDOSIS_EVENT, ATHEROSCLEROSIS_EVENT, ACUTE_RESPIRATORY_DISORDER_EVENT. Their
-# tokens REMAIN in the LM vocabulary (the tokenizer is built from training data,
-# not from this list), so their occurrences still shape backbone context; they
-# simply stop being head-BCE targets, CBM-forbid-protected, and sampler-upweighted.
+# Head-training outcome targets. The LM vocabulary is built from the training
+# data (EMRTokenizer.from_processed_df), so any token present in the dataset
+# appears in input sequences regardless of this list. OUTCOMES controls only:
+#   - outcome head's K (per-position outcome BCE targets)
+#   - CBM forbid list (these tokens are never masked during Phase-2 input noise)
+#   - patient sampler upweighting (patients with these outcomes get higher weight)
+#   - inference outcome_ids set (outcome-aware decoding logic)
 OUTCOMES = [
     "DISGLYCEMIA_EVENT_Hyperglycemia",
     "DISGLYCEMIA_EVENT_Hypoglycemia",
-    "KIDNEY_COMPLICATION_EVENT",
+    "HYPEROSMOLALITY_EVENT",
     "CARDIO-VASCULAR_DISORDER_EVENT",
-    "NERVOUS_SYSTEM_DISORDER_EVENT",
-    "NEUROVASCULAR_COMPLICATION_EVENT",
-    "SKIN_ULCER_EVENT",
-    "RETINOPATHY_EVENT",
+    "KIDNEY_COMPLICATION_EVENT",
     "KETOACIDOSIS_EVENT",
 ]
-# Note: OTHER_COMPLICATION_EVENT and DIABETIC_COMA_EVENT were also removed —
-# they are absent from the training-data vocabulary (always auto-dropped at
-# runtime), so listing them here was a no-op. Head targets = these 9 OUTCOMES
-# (those present in vocab) + the 2 TERMINAL_OUTCOMES = 11 (matches n_outcomes_used).
 
 ADMISSION_TOKEN = "ADMISSION_EVENT"
 DEATH_TOKEN = "DEATH_EVENT"
@@ -47,7 +39,7 @@ MEAL_TOKENS = ["MEAL_CONTEXT_Breakfast", "MEAL_CONTEXT_Lunch", "MEAL_CONTEXT_Din
 # Outcomes below this threshold are dropped — they have too few positive examples to learn from.
 OUTCOME_RARE_THRESHOLD_PCT = 1.0
 
-USE_QA_DATA = False  # Phase D/E done; best model is M-256 non-QA
+USE_QA_DATA = False  # Toggled to True only in P7 final step (full-pipeline rebuild required)
 # History window (hours from admission) used when aggregating QA ComplianceScore into
 # context features. At eval time DataProcessor overrides this with max_input_days * 24
 # so QA features match the k-day seed actually given to the model.
