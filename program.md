@@ -3,7 +3,7 @@
 ## Where we are
 
 The architecture has been discovered, iterated, and locked through a long
-iteration loop (see `status-iteration-loop.md` for the full journal). The
+iteration loop (see prior commits for the full journal). The
 recipe transfers to any dataset with the temporal-event token structure this
 codebase ingests — only the outcome head's K changes when the OUTCOMES list
 changes.
@@ -87,16 +87,18 @@ Headline keys in `api.py` summary block:
    - Pre-flight: delete tokenizer.pt, scaler.pkl, processed_datasets.pt, phase1/.
    - Phase 1 retrains. Smoke first; verify len(tokenizer.token2id) > non-QA value.
 
-5. FINAL REPORT
+5. Confidence:
+   - At this point we'll have the most final architecture.
+   - We need to rerun it with 3 different seeds, to report confident results KDD style.
+
+6. FINAL REPORT
    - P6 winner full-data headline numbers (per-outcome AUROC/AUPRC/max-F1/F1@0.5/peak-MAE + LoS MAE + trajectory honesty)
    - P6 sweep table (all sizes tested)
    - F1/F2 and P7 deltas
    - The AUROC↔calibration Pareto observation as a methodological finding
 ```
 
-External: STRaTS comparison on the same dataset (separate project, not in this loop).
-
-## Loop discipline (unchanged)
+## Loop discipline
 
 ```
 1. Read program.md. Check git log + last rows of results/results-trajectory-fix.tsv.
@@ -149,7 +151,7 @@ Verify the cache key matches, then optionally only retrain Phase 3.
 
 ## Lessons learned (carry forward)
 
-From the iteration loop, abridged (full details in `status-iteration-loop.md`):
+From the iteration loop, abridged (full details in prior commits):
 
 - **Trajectory honesty fixable via narrow + frozen terminal `log_tau_lm` + C-ttt aux.** Z's freeze hook + C-ttt aux head together produced multi-day trajectories with `gen_to_gt_ratio_median ≈ 0.6` and `gen_frac_terminal_first24h ≈ 0.05`.
 - **Patient-level pool aux (cap=0.05) is the largest single win.** Single config knob, +0.04 AUROC on the iteration-loop dataset.
@@ -163,5 +165,5 @@ From the iteration loop, abridged (full details in `status-iteration-loop.md`):
 - Ledger: `results/results-trajectory-fix.tsv`. Benchmarking rows append; iteration-loop rows preserved.
 - Canonical baseline: `emr_model/checkpoints.bak_originals/` (read-only).
 - Running-best backups: `emr_model/checkpoints.bak_keep_<tag>/`.
-- Iteration-loop journal: `status-iteration-loop.md` (archived, do not modify).
+- Iteration-loop history lives in prior git commits (not on disk).
 - Benchmarking journal: `status.md` (fresh, agent appends `### <tag>` blocks here).

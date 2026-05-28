@@ -1061,6 +1061,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
                     batch = apply_cbm(batch=batch,
                                       tokenizer=model.embedder.tokenizer,
                                       forbid_ids=luts["forbid_mask_ids"],
+                                      luts=luts,
                                       p=p)
 
                 # === Original logits from Model ===

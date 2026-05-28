@@ -282,69 +282,185 @@ def set_embedder_frozen(model, freeze: bool):
     model.embedder.eval() if freeze else model.embedder.train()
 
 
-def apply_cbm(batch, tokenizer, forbid_ids, p=0.25):
+def _build_interval_partner_pos(pos_ids, is_s_lut, is_e_lut, base_lut):
     """
-    Transformer CBM (Curriculum by Masking) Helper.
-    Logic: Mask tokens that won't hurt the general timeline or conflict with penalties.
-        This list adds to the MLM forbidden list, as now we can't mask meals / intervals, 
-        as we'll teach the model the contradicting them is OK.
-    Randomly masks ratio% of *input* tokens (excluding forbid_ids list),
-    replacing them with [MASK] token id and corresponding sub-ids.
+    For every interval-endpoint position in the batch, compute its partner-
+    endpoint position (same batch row, same base id, opposite role, k-th
+    occurrence paired with k-th occurrence in temporal order).
 
-    batch: dict of tensors
-    tokenizer: EMRTokenizer
-    forbid_ids: LongTensor of ids that must never be masked (PAD, CTX, ADMISSION, TERMINALS...)
-    p: float, masking ratio of the input
+    Fully vectorised — no Python loop over batch or bases. Two argsorts +
+    one cummax over the flattened interval positions of the whole batch.
 
-    NOTE: This basically means that masked tokens are marked as acceptable noise. 
-    """    
-    pos_ids = batch["position_ids"]
-    device = pos_ids.device
+    Args:
+        pos_ids   : LongTensor [B, T]   — per-position token ids.
+        is_s_lut  : BoolTensor [V]      — luts["is_start"].
+        is_e_lut  : BoolTensor [V]      — luts["is_end"].
+        base_lut  : LongTensor [V]      — luts["base_id"]; -1 for non-interval tokens.
+
+    Returns:
+        partner_pos : LongTensor [B, T] — for each interval endpoint, the
+            time-index of its matching partner in the same batch row. -1 for
+            non-interval positions or unmatched endpoints.
+    """
     B, T = pos_ids.shape
+    device = pos_ids.device
+
+    is_s_at = is_s_lut[pos_ids]        # [B, T]
+    is_e_at = is_e_lut[pos_ids]
+    base_at = base_lut[pos_ids]        # [B, T], -1 if non-interval
+    is_int  = (is_s_at | is_e_at) & (base_at >= 0)
+
+    partner_pos = torch.full((B, T), -1, dtype=torch.long, device=device)
+    if not is_int.any():
+        return partner_pos
+
+    # Flatten interval positions only.
+    flat_b = torch.arange(B, device=device).unsqueeze(1).expand(B, T).reshape(-1)
+    flat_t = torch.arange(T, device=device).unsqueeze(0).expand(B, T).reshape(-1)
+    is_int_flat = is_int.reshape(-1)
+
+    int_b    = flat_b[is_int_flat]                        # [N_int]
+    int_t    = flat_t[is_int_flat]
+    int_base = base_at.reshape(-1)[is_int_flat]
+    int_is_s = is_s_at.reshape(-1)[is_int_flat]
+
+    NB = int(int_base.max().item()) + 1                   # number of base slots
+
+    # ---- Pass 1: assign a temporal rank within each (b, base, is_start) group ----
+    # Sort the interval positions by (b, base, is_start, t) using a single
+    # composite key. After this sort, positions sharing (b, base, is_start) are
+    # consecutive in temporal order.
+    sort_key1 = (((int_b * NB + int_base) * 2) + int_is_s.long()) * T + int_t
+    order1 = torch.argsort(sort_key1)
+    s_b    = int_b[order1]
+    s_t    = int_t[order1]
+    s_base = int_base[order1]
+    s_is_s = int_is_s[order1]
+
+    # cumcount within each (b, base, is_start) group via cummax of boundary positions
+    group_id   = (s_b * NB + s_base) * 2 + s_is_s.long()
+    positions  = torch.arange(group_id.numel(), device=device)
+    boundary   = torch.cat([
+        torch.ones(1, dtype=torch.bool, device=device),
+        group_id[1:] != group_id[:-1],
+    ])
+    last_bnd   = torch.cummax(positions * boundary.long(), dim=0)[0]
+    rank_in_group = positions - last_bnd                  # 0, 1, 2, … within each group
+
+    # ---- Pass 2: re-sort by (b, base, rank) so START_k and END_k of the same
+    # (b, base) become adjacent; with a stable argsort they keep is_start order
+    # within ties. Adjacent items that share (b, base, rank) and differ in
+    # is_start are a pair.
+    sort_key2 = (s_b * NB + s_base) * (T + 1) + rank_in_group
+    order2    = torch.argsort(sort_key2, stable=True)
+    r_b    = s_b[order2]
+    r_t    = s_t[order2]
+    r_base = s_base[order2]
+    r_rank = rank_in_group[order2]
+    r_is_s = s_is_s[order2]
+
+    if r_b.numel() < 2:
+        return partner_pos
+
+    same_b    = r_b[1:]    == r_b[:-1]
+    same_base = r_base[1:] == r_base[:-1]
+    same_rank = r_rank[1:] == r_rank[:-1]
+    diff_role = r_is_s[1:] != r_is_s[:-1]
+    is_pair_lo = same_b & same_base & same_rank & diff_role   # [N_int - 1]
+
+    if is_pair_lo.any():
+        lo = is_pair_lo.nonzero(as_tuple=True)[0]
+        hi = lo + 1
+        partner_pos[r_b[lo], r_t[lo]] = r_t[hi]
+        partner_pos[r_b[hi], r_t[hi]] = r_t[lo]
+
+    return partner_pos
+
+
+def apply_cbm(batch, tokenizer, forbid_ids, luts, p=0.25):
+    """
+    Curriculum by Masking — atomic-interval variant.
+
+    For interval tokens (those with `*_START` / `*_END` suffixes), the START and
+    matching END carry the state in their name (e.g.
+    GLUCOSE_STATE_High_START / _END). If only one endpoint of an interval is
+    masked the interval is half-broken; masking both leaves the model with a
+    clean "this measurement is missing" signal. We sample p% of eligible
+    positions and, when a sampled position is an interval endpoint, mask its
+    matching partner in the same batch row atomically. Standalone (non-
+    interval) eligible tokens are masked individually as before.
+
+    Args:
+        batch       : dict of [B, T] tensors (position_ids, parent_raw_ids,
+                       concept_ids, value_ids, …).
+        tokenizer   : EMRTokenizer.
+        forbid_ids  : LongTensor of token ids that must never be masked
+                       (PAD/MASK/CTX/ADMISSION/TERMINALS/OUTCOMES/MEALS).
+                       NOTE: must NOT include START/END ids since the fix —
+                       those are handled atomically.
+        luts        : dict from `_compute_token_lookups`; must contain
+                       `is_start`, `is_end`, `base_id`.
+        p           : masking ratio of eligible positions.
+
+    Returns:
+        batch (modified in place at the same keys).
+
+    Cost: two argsorts and one cummax over the flattened interval positions;
+    no Python loop over the batch dimension.
+    """
+    pos_ids = batch["position_ids"]
+    device  = pos_ids.device
+    B, T    = pos_ids.shape
 
     mask_tok = tokenizer.mask_token_id
     pad_id   = tokenizer.pad_token_id
 
-    # Eligible positions: not in forbid list and not PAD
+    # Eligible positions: not in forbid list and not PAD.
     forbid = torch.zeros(tokenizer.token_weights.numel(), dtype=torch.bool, device=device)
-    forbid[pad_id] = True
+    forbid[pad_id]  = True
     forbid[mask_tok] = True
     forbid[forbid_ids] = True
+    eligible = ~forbid[pos_ids]                            # [B, T]
 
-    eligible = ~forbid[pos_ids]
-    # Sample exactly p * (#eligible) positions ---
-    # total eligible count
+    # Sample exactly p * (#eligible) positions.
     E = int(eligible.sum().item())
-    # how many to mask
     N = int(round(p * E))
-    if N > 0:
-        # Flattened indices of all eligible slots
-        # idx is shape [E, 2] of (batch_idx, time_idx)
-        idx = eligible.nonzero(as_tuple=False)
-        # shuffle and pick first N
-        perm = torch.randperm(E, device=device)[:N]
-        pick = idx[perm]              # shape [N,2]
-        to_mask = torch.zeros_like(eligible)
-        to_mask[pick[:,0], pick[:,1]] = True
-    else:
-        to_mask = torch.zeros_like(eligible)
+    if N == 0:
+        return batch
 
-    # random 80/10/10 (like BERT)?
-    # Keep it simple: replace all with [MASK]
-    pos_ids = pos_ids.clone()
-    raw_ids = batch["parent_raw_ids"].clone()
-    con_ids = batch["concept_ids"].clone()
-    val_ids = batch["value_ids"].clone()
+    idx  = eligible.nonzero(as_tuple=False)                # [E, 2]
+    perm = torch.randperm(E, device=device)[:N]
+    pick = idx[perm]                                       # [N, 2]
+    to_mask = torch.zeros_like(eligible)
+    to_mask[pick[:, 0], pick[:, 1]] = True
 
-    pos_ids[to_mask] = mask_tok
-    raw_ids[to_mask, :] = mask_tok
-    con_ids[to_mask] = mask_tok
-    val_ids[to_mask] = mask_tok
+    # Atomic-interval pair completion. Precompute partner-position table
+    # once (vectorised), then a single gather to flip the partners of all
+    # picked endpoints.
+    partner_pos = _build_interval_partner_pos(
+        pos_ids,
+        luts["is_start"].to(device),
+        luts["is_end"].to(device),
+        luts["base_id"].to(device),
+    )
+    partner_t = partner_pos[pick[:, 0], pick[:, 1]]        # [N], -1 if no partner
+    has_partner = partner_t >= 0
+    to_mask[pick[has_partner, 0], partner_t[has_partner]] = True
 
-    batch["position_ids"]    = pos_ids
-    batch["parent_raw_ids"]  = raw_ids
-    batch["concept_ids"]     = con_ids
-    batch["value_ids"]       = val_ids
+    # Apply the mask.
+    pos_ids_out = pos_ids.clone()
+    raw_ids     = batch["parent_raw_ids"].clone()
+    con_ids     = batch["concept_ids"].clone()
+    val_ids     = batch["value_ids"].clone()
+    pos_ids_out[to_mask]    = mask_tok
+    raw_ids[to_mask, :]     = mask_tok
+    con_ids[to_mask]        = mask_tok
+    val_ids[to_mask]        = mask_tok
+
+    batch["position_ids"]   = pos_ids_out
+    batch["parent_raw_ids"] = raw_ids
+    batch["concept_ids"]    = con_ids
+    batch["value_ids"]      = val_ids
     return batch
 
 
@@ -513,6 +629,12 @@ def build_luts(tokenizer):
         meal_pred_rank[meal_mask] = (meal_rank[meal_mask] - 1) % K
 
     # ---- forbid list for CBM ----
+    # NOTE: START/END interval markers are NOT forbidden. Both endpoints carry
+    # the state in their token name (e.g. GLUCOSE_STATE_High_START / _END), so
+    # protecting both leaves CBM with almost nothing to mask on this data. The
+    # apply_cbm function pair-masks intervals atomically — when one endpoint is
+    # sampled, its matching endpoint in the same sample is also masked, so the
+    # interval is either fully present or fully absent, never half-broken.
     forbid = {
         tokenizer.pad_token_id,
         tokenizer.null_token_id,
@@ -520,8 +642,6 @@ def build_luts(tokenizer):
         *[tokenizer.token2id.get(t) for t in TERMINAL_OUTCOMES],
         *[tokenizer.token2id.get(t) for t in OUTCOMES],
         *[tokenizer.token2id.get(t) for t in MEAL_TOKENS],
-        *start_ids.tolist(),
-        *end_ids.tolist(),
     }
     forbid_mask_ids = torch.tensor([tid for tid in forbid if tid is not None],
                                    dtype=torch.long)

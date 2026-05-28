@@ -1,7 +1,7 @@
 # EMR Event-Prediction Transformer — Benchmarking Phase
 
-Fresh journal for the benchmarking phase. Iteration-loop journal archived at
-`status-iteration-loop.md`.
+Fresh journal for the benchmarking phase. The iteration-loop journal is in
+prior git commits if anyone needs the history.
 
 ## Inherited from the iteration loop
 
@@ -24,14 +24,14 @@ backbone with `lr_factor=0.01`.
 Head-targeted outcomes are set in
 `emr_model/transform_emr/config/dataset_config.py`:
 
-- 6 complications (in `OUTCOMES`)
+- 7 complications (in `OUTCOMES`) (but in data only 5 will pass the min. support threshold)
 - 2 terminals (in `TERMINAL_OUTCOMES`): DEATH, RELEASE
 - `AUC_EXCLUDE = ("RELEASE_EVENT",)` in `evaluation.py` — RELEASE stays in head
   training (so the model emits it correctly) but is excluded from the AUROC /
   AUPRC / F1 headline (it's `¬DEATH` in this cohort, redundant ranking task).
   Reported as length-of-stay MAE instead.
 
-**7 evaluated outcomes for the headline**: 6 complications + DEATH.
+**6 evaluated outcomes for the headline**: 5 complications + DEATH.
 
 LM vocab is built from the training data, so any token present in the dataset
 appears in input sequences regardless of `OUTCOMES` — `OUTCOMES` controls only
@@ -56,4 +56,4 @@ Agent appends `### <tag>` blocks below as experiments run. Each block records:
 - Ledger: `results/results-trajectory-fix.tsv` (iteration-loop rows preserved; benchmarking rows appended).
 - Canonical baseline: `emr_model/checkpoints.bak_originals/` (read-only).
 - Running-best backups: `emr_model/checkpoints.bak_keep_<tag>/`.
-- Iteration-loop archive: `status-iteration-loop.md`.
+- Iteration-loop history: prior git commits (not on disk).
