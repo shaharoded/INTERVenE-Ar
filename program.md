@@ -14,7 +14,7 @@ QA-data ablations, report.
 
 ## Locked architecture
 
-- **M-256** transformer: `embed_dim=256, n_layer=4, n_head=4, time2vec_dim=32, dropout=0.10`
+- **4-layer transformer** with `time2vec_dim=32, dropout=0.10, head_dim=64` (heads scale with `embed_dim`). Size is selected in P6 (sweep below); start M-128 and grow.
 - **AdaLN-Zero** patient-context conditioning
 - **Temporal RoPE** + Time2Vec for absolute timestamps
 - **Per-token learnable `log_tau_lm`** soft-kernel BCE, **terminal entries frozen** at
@@ -66,31 +66,30 @@ Headline keys in `api.py` summary block:
 ## Roadmap — what's left
 
 ```
-1. RECIPE-TRANSFER SMOKE  (10k, full pipeline)
-   - Verify auxes descend cleanly on the dataset.
+1. RECIPE-TRANSFER SMOKE  (10k, full pipeline, M-128 to start)
+   - Verify auxes descend cleanly on the dataset under the locked recipe.
    - Smoke gates A–D + post-train T1–T3 + per-aux trace in journal.
    - If clean → proceed. If anything regresses, investigate before scaling.
 
-2. FULL-DATA HEADLINE  (sample=None)
-   - Locked recipe, M-256.
-   - This is the publishable headline #1.
+2. P6 ARCHITECTURE SWEEP  (full data, locked recipe; produces the headline)
+   - Grid in order: M-128, M-256, M-384, M-512, M-768
+     (each: embed_dim → head_dim=64; n_head = embed_dim/64; n_layer=4 fixed).
+   - Each variant a full-data run (sample=None), ~hours per run.
+   - OOM → halve batch + double grad-accum; if still OOM, that's the size ceiling.
+   - Decision: smallest variant within ~0.005 weighted AUROC of best (prefer smaller).
+   - The winning variant is the publishable headline #1.
 
-3. P6 ARCHITECTURE SCALE-UP  (full data, locked recipe)
-   - Grid: M-128, M-384, M-512, M-768 (M-256 already covered by step 2).
-   - Decision: smallest variant within ~0.005 of best.
-   - Cross-validates whether M-256 is the sweet spot for this dataset.
-
-4. F1 + F2 INFERENCE-SIDE  (eval-only on the P6 winner)
+3. F1 + F2 INFERENCE-SIDE  (eval-only on the P6 winner)
    - F1: beam search with length-normalised scoring.
    - F2: temperature schedule to escape immediate-terminal local minimum.
 
-5. P7 USE_QA_DATA TOGGLE  (full data, on P6 winner)
+4. P7 USE_QA_DATA TOGGLE  (full data, on P6 winner)
    - Pre-flight: delete tokenizer.pt, scaler.pkl, processed_datasets.pt, phase1/.
    - Phase 1 retrains. Smoke first; verify len(tokenizer.token2id) > non-QA value.
 
-6. FINAL REPORT
-   - Locked-recipe full-data headline numbers (per-outcome AUROC/AUPRC/max-F1/F1@0.5/peak-MAE + LoS MAE + trajectory honesty)
-   - P6 scale-up table
+5. FINAL REPORT
+   - P6 winner full-data headline numbers (per-outcome AUROC/AUPRC/max-F1/F1@0.5/peak-MAE + LoS MAE + trajectory honesty)
+   - P6 sweep table (all sizes tested)
    - F1/F2 and P7 deltas
    - The AUROC↔calibration Pareto observation as a methodological finding
 ```
