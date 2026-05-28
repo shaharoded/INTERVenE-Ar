@@ -1492,6 +1492,77 @@ no complete per-outcome AUPRC, so their 11-outcome AUPRC is left blank.
 
 ---
 
+### I2b-full-snip @ FULL DATA — PUBLISHABLE END-OF-ITERATION HEADLINE
+
+**Code:** locked recipe (`a1f3d58`): M-256 + Z frozen-narrow terminal
+`log_tau_lm` + C-ttt + Phase-2 curriculum + Phase-3 BCE coef 1.0 +
+ranking + P4 pool aux cap 0.05 + I2b inference ttt-gate, under the
+11-outcome snip. **Full data** (39,954 train / 8,562 val / 8,562 test),
+embedder **retrained on full data** (not the 10k cache).
+
+**Result (11-outcome headline):**
+
+| Metric | 10k I2b (11-outcome re-agg) | I2b-full-snip (full data) |
+|---|---|---|
+| patient_auroc_weighted | 0.755 | **0.759** |
+| patient_auprc_weighted | 0.769 | 0.781 |
+| patient_auroc_simple | — | 0.694 |
+| cap=48h AUROC | 0.478 | 0.523 |
+| RELEASE MAE (h) | 84.0 | 68.4 |
+| DEATH MAE (h) | 162 | 167.6 |
+| gen_to_gt_ratio_median | ~1.18 | 0.544 |
+| gen_frac_terminal_first24h | — | 0.051 |
+| phase2_best_val | 0.185 | 0.150 |
+| phase3_best_val | 1.10 | 0.930 |
+
+**Confirms the 10k screen** (0.755 → 0.759, +0.004 within noise) with
+*better* short-horizon calibration (cap=48h 0.478→0.523), RELEASE timing
+(84→68 h) and honesty (gen_to_gt 0.544). Full-data embedder + data drove
+both phase val losses down sharply (phase2 0.185→0.150, phase3 1.10→0.93).
+
+**Per-outcome AUROC (full data, the real picture):**
+
+| Outcome | AUROC | n_pos | discrimination |
+|---|---|---|---|
+| DISGLYCEMIA_Hyper | 0.920 | 3550 | strong |
+| DISGLYCEMIA_Hypo | 0.901 | 875 | strong |
+| KIDNEY | 0.833 | 3839 | strong |
+| DEATH | 0.788 | 1115 | good |
+| CARDIO | 0.744 | 5078 | good |
+| RELEASE | 0.678 | 7447 | moderate |
+| NEUROVASCULAR | 0.565 | 170 | ~chance |
+| SKIN_ULCER | 0.565 | 391 | ~chance |
+| RETINOPATHY | 0.552 | 284 | ~chance |
+| KETOACIDOSIS | 0.546 | 200 | ~chance |
+| NERVOUS_SYSTEM | 0.536 | 517 | ~chance |
+
+**Important full-data finding:** only **6 of the 11 kept outcomes show
+real discrimination**; the 5 rarest regress to ~0.55 on full data. Their
+elevated 10k AUROCs (e.g. KETOACIDOSIS 0.72, NERVOUS_SYSTEM 0.78) were
+**small-sample inflation** (10k test n_pos 29–77); at full-data n_pos
+170–517 they are near chance. The 0.759 headline is carried by the 6
+high-n outcomes (which dominate the n_pos-weighted mean). This mirrors —
+and extends — the outcome-snip rationale: the prevalence/discrimination
+floor is real, and even some kept outcomes sit near it.
+
+**Per-aux training trace (Phase 2, full data):**
+
+| Aux | Unlock ep | λ_max | Anchor raw | Final raw | Δ% | Learning? |
+|---|---|---|---|---|---|---|
+| ce | 3 | 0.0832 | 0.9276 | 0.00099 | −99.9% | yes |
+| dt | 3 | 0.0969 | 0.7968 | 0.01633 | −98.0% | yes |
+| ttt | 3 | 0.0021 | 21.5493 | 0.02346 | −99.9% | yes |
+| ranking | 12 | 0.0329 | 0.0321 | 0.02214 | −31.0% | yes |
+
+All auxes descend cleanly on full data. Stage-1 unlocked at epoch 13
+(earlier than the 10k runs — full data plateaus stage-0 faster).
+
+**Status:** new running best under the 11-outcome lens, **AUROC_w 0.759**.
+Recipe locked; proceeding to P6 (architecture scale-up) on this recipe +
+outcome set. Checkpoints backed up as `checkpoints.bak_keep_I2b-full-snip`.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
