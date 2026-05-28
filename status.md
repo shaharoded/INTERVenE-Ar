@@ -1576,6 +1576,79 @@ outcome set. Checkpoints backed up as `checkpoints.bak_keep_I2b-full-snip`.
 
 ---
 
+### P6 / M-128 @ FULL DATA — DISCARD (capacity-bounded)
+
+**Code:** `f524b67` (locked recipe + 11-outcome snip + `MODEL_CONFIG`
+embed_dim=128, n_head=2; head_dim=64 kept, n_layer=4). 1.75 M params
+(M-256 baseline = 6.4 M). Full data; embedder retrained on full data.
+
+**Hypothesis (P6 decision rule):** smallest variant within 0.005 AUROC_w
+of the best.
+
+**Aggregated headline (11 outcomes):**
+
+| Metric | M-256 (I2b-full-snip) | **M-128** | Δ |
+|---|---|---|---|
+| patient_auroc_weighted | 0.759 | **0.686** | **−0.073** |
+| patient_auprc_weighted | 0.781 | 0.744 | −0.037 |
+| patient_auroc_simple | 0.694 | 0.695 | +0.001 |
+| patient_auprc_simple | 0.432 | 0.422 | −0.010 |
+| patient_maxF1_weighted | 0.763 | 0.754 | −0.009 |
+| patient_F1@0.5_weighted | 0.128 | 0.127 | ≈flat |
+| patient_maxF1_simple | 0.453 | 0.463 | +0.010 |
+| patient_F1@0.5_simple | 0.134 | 0.133 | ≈flat |
+| cap=48h AUROC | 0.523 | 0.551 | +0.028 |
+| RELEASE MAE (h) | 68.4 | 85.2 | +16.8 |
+| DEATH MAE (h) | 167.6 | 156.5 | −11.1 |
+| gen_to_gt_ratio_median | 0.544 | 1.275 | over-gen |
+| gen_frac_terminal_first24h | 0.051 | 0.050 | ≈flat |
+| forced-terminal fraction | low | **29.2%** | over-gen badly |
+| phase2_best_val | 0.150 | 0.157 | +0.007 |
+| phase3_best_val | 0.930 | 0.952 | +0.022 |
+
+**Per-outcome AUROC / AUPRC / F1:**
+
+| Outcome | AUROC | AUPRC | maxF1 (τ*) | F1@0.5 | n_pos | prev |
+|---|---|---|---|---|---|---|
+| DISGLYCEMIA_Hyper | 0.907 | 0.887 | 0.809 (τ=0.051) | 0.381 | 3550 | 0.415 |
+| DISGLYCEMIA_Hypo  | 0.902 | 0.692 | 0.654 (τ=0.300) | 0.552 | 875  | 0.102 |
+| KIDNEY            | 0.759 | 0.718 | 0.695 (τ=0.037) | 0.205 | 3839 | 0.448 |
+| CARDIO            | 0.747 | 0.798 | 0.781 (τ=0.000) | 0.000 | 5078 | 0.593 |
+| DEATH             | 0.711 | 0.264 | 0.341 (τ=0.439) | 0.330 | 1115 | 0.130 |
+| RETINOPATHY       | 0.655 | 0.111 | 0.211 (τ=0.000) | 0.000 | 284  | 0.033 |
+| SKIN_ULCER        | 0.645 | 0.096 | 0.221 (τ=0.000) | 0.000 | 391  | 0.046 |
+| KETOACIDOSIS      | 0.620 | 0.052 | 0.134 (τ=0.000) | 0.000 | 200  | 0.023 |
+| NERVOUS_SYSTEM    | 0.614 | 0.116 | 0.220 (τ=0.000) | 0.000 | 517  | 0.060 |
+| NEUROVASCULAR     | 0.596 | 0.038 | 0.097 (τ=0.000) | 0.000 | 170  | 0.020 |
+| **RELEASE**       | **0.486** | 0.867 | 0.930 (τ=0.002) | 0.000 | 7447 | 0.870 |
+
+**Per-aux trace (Phase 2, full data):**
+
+| Aux | Unlock ep | λ_max | Anchor raw | Final raw | Δ% | Learning? |
+|---|---|---|---|---|---|---|
+| ce | 3 | 0.0730 | 1.2818 | 0.00391 | −99.7% | yes |
+| dt | 3 | 0.1172 | 0.7985 | 0.0651 | −91.8% | yes |
+| ttt | 3 | 0.0027 | 21.1321 | 0.0789 | −99.6% | yes |
+| ranking | 16 | 0.0282 | 0.1285 | 0.0709 | −44.8% | yes |
+
+**Verdict: DISCARD — capacity-bounded.** Two clean signals: (1) headline
+AUROC_w collapsed −0.073 vs M-256 (>14× the 0.005 decision threshold);
+(2) RELEASE AUROC fell to **0.486 (below chance)** because the smaller
+backbone couldn't learn discharge timing — 29.2% of generated trajectories
+hit `max_len=500` without a natural terminal and got forced-terminal
+injected, dragging RELEASE generation badly off. Surprisingly the
+short-horizon cap=48h calibration *improved* (+0.028) and DEATH MAE got
+better (−11 h), but those are dwarfed by the broader collapse. Counter-
+intuitively `auroc_simple` is ≈flat (rare outcomes are near-chance for
+both M-128 and M-256 on full data — the unweighted mean isn't the
+discriminator); the n_pos-weighted mean is where M-256 wins, driven by
+RELEASE (huge n_pos=7447) and the better mid-prevalence discrimination
+on KIDNEY/DEATH. M-128 is too small for the task. Note: M-128 ran with
+the original 50-epoch cap (early-stopped at ep~40, so cap wasn't
+limiting); subsequent P6 variants use 100.
+
+---
+
 ## Reproducibility
 
 | Artefact | Location |
