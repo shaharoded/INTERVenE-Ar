@@ -11,18 +11,18 @@ PHASE3_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase3', 'ckpt_best.pt')
 
 MODEL_CONFIG = {
       "time2vec_dim": 32,
-      "embed_dim": 128,   # P6 scan: M-128 (head_dim=64 kept, n_head=2)
-      "n_head": 2,
+      "embed_dim": 384,   # P6 scan: M-384 (head_dim=64 kept, n_head=6)
+      "n_head": 6,
       "n_layer": 4,
       "dropout": 0.1,
       "bias": True,
     }
 
 TRAINING_SETTINGS = {
-    "phase1_n_epochs": 100,   # bumped 50->100 so P6 variants converge (M-128 didn't early-stop within 50)
+    "phase1_n_epochs": 100,
     "phase2_n_epochs": 100,
     "phase3_n_epochs": 100,
-    "sample": None,  # P6 full-data run. Smoke: set 50 + epochs 1.
+    "sample": None,  # P6 M-384 full-data run. Smoke: set 50 + epochs 1.
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
