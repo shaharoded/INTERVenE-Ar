@@ -11,7 +11,7 @@ PHASE3_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase3', 'ckpt_best.pt')
 
 MODEL_CONFIG = {
       "time2vec_dim": 32,
-      "embed_dim": 128,   # P6 scan: M-128 (head_dim=64 kept, n_head=2) — recipe-transfer smoke start
+      "embed_dim": 128,   # P6 scan: M-128 (head_dim=64 kept, n_head=2) — FULL-DATA sweep step 1
       "n_head": 2,
       "n_layer": 4,
       "dropout": 0.1,
@@ -22,7 +22,7 @@ TRAINING_SETTINGS = {
     "phase1_n_epochs": 100,
     "phase2_n_epochs": 100,
     "phase3_n_epochs": 100,
-    "sample": 10000,  # P6 M-128 10k recipe-transfer probe. Smoke: 50 + epochs 1. Full: None.
+    "sample": None,  # P6 M-128 FULL-DATA sweep (57078 patients). Smoke: 50 + epochs 1. 10k probe: 10000.
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
