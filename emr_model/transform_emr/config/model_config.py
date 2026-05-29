@@ -11,8 +11,8 @@ PHASE3_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase3', 'ckpt_best.pt')
 
 MODEL_CONFIG = {
       "time2vec_dim": 32,
-      "embed_dim": 128,   # P6 scan: M-128 (head_dim=64 kept, n_head=2) — FULL-DATA sweep step 1
-      "n_head": 2,
+      "embed_dim": 256,   # P6 scan: M-256 (head_dim=64 kept, n_head=4) — FULL-DATA sweep step 2/5
+      "n_head": 4,
       "n_layer": 4,
       "dropout": 0.1,
       "bias": True,
