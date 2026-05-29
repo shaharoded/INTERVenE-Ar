@@ -161,6 +161,61 @@ all 6 outcomes well above chance, honest trajectories. Sets the bar for
 M-256/384/512/768. NOTE: used patience 5; if M-128 ends competitive for the winner,
 re-run at patience 15 for clean comparison. Proceed to M-256.
 
+### P6-M-256-full — full-data sweep point 2/5
+
+**What:** M-256 (embed_dim=256, n_head=4, n_layer=4; 6.71M params) full data,
+locked recipe, **patience=15** (first run with the raised patience). Config commit `17366ab`.
+
+**Gates:** Smoke A–D pass. T1 (all auxes descend), T2 (ranking unlock ep12 <
+warmup ep15 < P2 stop ep50; P3 ran 100), T3 (all 6 outcomes 0.794–0.975) — PASS.
+
+**Headline (held-out 8562 test):**
+- `patient_auroc_weighted` **0.891** (+0.008 vs M-128 0.883),
+  `patient_auprc_weighted` 0.801, `patient_max_f1_weighted` 0.722,
+  `patient_f1_at_0_5_weighted` 0.492, simple AUROC 0.891.
+- Per-outcome AUROC / AUPRC / peak-MAE(h):
+  - CARDIO 0.975 / 0.788 / 33.4  (−0.007 vs M-128)
+  - DISGLYCEMIA_Hyper 0.909 / 0.875 / 24.2  (flat)
+  - KIDNEY 0.900 / 0.864 / 26.9  (−0.005)
+  - HYPEROSMOLALITY 0.890 / 0.873 / 25.8  (+0.030)
+  - DISGLYCEMIA_Hypo 0.877 / 0.534 / 45.4  (−0.007)
+  - DEATH 0.794 / 0.408 / 176.3  (+0.010)
+- Length-of-stay MAE 74.9h (worse than M-128's 59.1h).
+- Multi-horizon AUROC: cap48 0.516, cap168 0.562, cap336 0.535.
+
+**Trajectory honesty — REGRESSED vs M-128:** `gen_to_gt_ratio_median` **0.407**
+(M-128 0.606; now at the 0.4 honesty floor), `gen_frac_terminal_first24h` **0.198**
+(M-128 0.052), gen_median 41.9h vs gt_median 102.8h. The model under-generates and
+emits terminals early ~4× more than M-128. Classic AUROC↔calibration Pareto tension;
+the longer Phase-2 LM training (50 ep vs M-128's 26, from patience=15) is the likely driver.
+
+**Two flags for the sweep decision:**
+1. **Phase-3 hit the 100-epoch CAP** (ran all 100, still marginally improving — did
+   NOT plateau-stop). Per plan: if M-256 ends up the winner, it's a candidate for an
+   extended-epoch re-run before final reporting.
+2. The +0.008 AUROC over M-128 came **with** a real honesty regression — capacity is
+   buying ranking at the cost of trajectory calibration, exactly the documented Pareto.
+
+**Per-aux training trace table:**
+
+| Phase | Aux | Unlock/calib ep | λ_max | anchor raw | final raw | Δ% |
+|---|---|---|---|---|---|---|
+| 1 | dt | calib ep3 | — | 1.534 (ep1) | 0.744 (ep40) | −51.5% |
+| 2 | ce | calib ep3 | 0.0826 | 0.930 | 0.0016 | −99.8% |
+| 2 | dt | calib ep3 | 0.0935 | 0.821 | 0.034 | −95.9% |
+| 2 | ttt | calib ep3 | 0.0021 | 21.628 | 0.038 | −99.8% |
+| 2 | ranking | unlock ep12 (calib ep11) | 0.0325 | 0.091 (ep11) | 0.032 (ep50) | −65.1% |
+| 3 | outcome BCE | ep1 | — | 2.204 | 1.422 (ep100) | −35.5% |
+| 3 | ranking | calib ep1 | ~0.93 | 0.472 | 0.233 (ep100) | −50.6% |
+| 3 | pool | calib ep1 | 0.1166 | 0.945 | 0.0003 (ep100) | −99.97% |
+
+All |Δ| ≥ 35% — every aux learning.
+
+**Verdict: P6-SWEEP point 2/5 — running best (AUROC 0.891).** M-128 (0.883) is 0.008
+below — outside the 0.005 equivalence window, so M-256 currently leads. BUT the honesty
+regression is a strike against M-256 as the deployable model. Sweep continues to
+M-384/512/768. Decision deferred until the full grid + honesty are weighed together.
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
