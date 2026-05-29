@@ -112,6 +112,55 @@ all 6 outcomes well above chance. This is a verification probe, not a KEEP/DISCA
 phase2_val 0.191 (70 ep), phase3_val 2.117 (48 ep), 1.75M params, peak_vram 196MB.
 **Proceed to Step 2 — P6 full-data architecture sweep (M-128 → M-256 → M-384 → M-512 → M-768).**
 
+### P6-M-128-full — full-data sweep point 1/5
+
+**What:** M-128 (embed_dim=128, n_head=2, n_layer=4; 1.75M params) at FULL data
+(39954 train / 8562 val / 8562 test), locked I2b recipe, full-data
+tokenizer/scaler/embedder. Config commit `b8c7095`. **early-stop-patience=5**
+(this run launched before the user raised patience→15 for M-256+).
+
+**Gates:** Smoke A–D pass (live-confirmed). Post-train T1 (all auxes descend),
+T2 (ranking unlock ep17 < warmup ep20 < P2 stop ep26; P3 ran 49 ep), T3 (all 6
+outcomes 0.785–0.982) — all PASS.
+
+**Headline (held-out 8562 test patients):**
+- `patient_auroc_weighted` **0.883** (+0.070 vs 10k probe 0.813),
+  `patient_auprc_weighted` 0.798, `patient_max_f1_weighted` 0.721,
+  `patient_f1_at_0_5_weighted` 0.536, simple AUROC 0.887. n_outcomes=6.
+- Per-outcome AUROC / AUPRC / maxF1 / F1@0.5 / peak-MAE(h):
+  - CARDIO-VASCULAR 0.982 / 0.909 / 0.853 / 0.786 / 34.3
+  - DISGLYCEMIA_Hyper 0.908 / 0.881 / 0.774 / 0.442 / 23.2
+  - KIDNEY 0.905 / 0.877 / 0.773 / 0.708 / 29.2
+  - DISGLYCEMIA_Hypo 0.884 / 0.634 / 0.626 / 0.563 / 43.4
+  - HYPEROSMOLALITY 0.859 / 0.831 / 0.733 / 0.577 / 29.6
+  - DEATH 0.785 / 0.329 / 0.413 / 0.115 / 169.7
+- Length-of-stay MAE 59.1h (median 41.4, p90 142.7, n=7446).
+- Multi-horizon AUROC: cap48 0.533, cap168 0.610, cap336 0.572.
+
+**Trajectory honesty:** `gen_to_gt_ratio_median` 0.606 (honest, >0.4 floor;
+under-generates a touch more than the 10k probe's 1.02), `gen_frac_terminal_first24h`
+0.052, gen_median 61.8h vs gt_median 102.1h, 8561/8562 natural terminals.
+
+**Per-aux training trace table:**
+
+| Phase | Aux | Unlock/calib ep | λ_max | anchor raw | final raw | Δ% |
+|---|---|---|---|---|---|---|
+| 1 | dt | calib ep3 | 0.0261 | 1.354 (ep1) | 0.748 (ep23) | −44.8% |
+| 2 | ce | calib ep3 | 0.0724 | 1.283 | 0.0023 | −99.8% |
+| 2 | dt | calib ep3 | 0.1152 | 0.807 | 0.053 | −93.4% |
+| 2 | ttt | calib ep3 | 0.0026 | 21.254 | 0.057 | −99.7% |
+| 2 | ranking | unlock ep17 (calib ep16) | 0.0266 | 0.110 (ep16) | 0.066 (ep26) | −39.8% |
+| 3 | outcome BCE | ep1 | — | 2.484 | 1.567 (ep49) | −36.9% |
+| 3 | ranking | calib ep1 | 0.8077 | 0.615 | 0.275 (ep49) | −55.2% |
+| 3 | pool | calib ep1 | 0.1318 | 0.942 | 0.0001 (ep49) | −99.99% |
+
+All |Δ| ≥ 37% — every aux learning.
+
+**Verdict: P6-SWEEP BASELINE (sweep point 1/5).** Strong full-data headline 0.883;
+all 6 outcomes well above chance, honest trajectories. Sets the bar for
+M-256/384/512/768. NOTE: used patience 5; if M-128 ends competitive for the winner,
+re-run at patience 15 for clean comparison. Proceed to M-256.
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
