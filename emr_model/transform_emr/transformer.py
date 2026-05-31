@@ -324,6 +324,7 @@ class GPT(nn.Module):
 
     def __init__(self, cfg: dict, embedder: EMREmbedding, use_checkpoint: bool=True):
         super().__init__()
+        set_seed(SEED)  # reproducible backbone/head weight init
 
         assert cfg["embed_dim"] == embedder.output_dim, (
             "Config embed_dim must equal EMREmbedding.output_dim"
@@ -948,6 +949,7 @@ def pretrain_transformer(model, train_dl, val_dl, resume=True, checkpoint_path=P
     if train_flag -> mix_with_predictions() from utils.py -> rebuild raw/concept/value from predicted position (define LUT?) ->
     apply mix_mask to all modalities -> Second forward pass on mixed inputs.
     """
+    set_seed(SEED)  # reproducible Phase-2 dataloader shuffle / oversampler draws / dropout / CBM masking
     # Create global training lookup Tensors once the tokenizer is available and move to device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     luts = build_luts(model.embedder.tokenizer)
@@ -1427,6 +1429,7 @@ def finetune_transformer(model, train_dl, val_dl, resume=True,
     -------
     model, train_losses, val_losses
     """
+    set_seed(SEED)  # reproducible Phase-3 dataloader shuffle / dropout
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt_path = Path(checkpoint_path).resolve()

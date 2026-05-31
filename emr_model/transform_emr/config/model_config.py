@@ -9,9 +9,14 @@ PHASE1_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase1', 'ckpt_best.pt')
 PHASE2_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase2', 'ckpt_best.pt')
 PHASE3_CHECKPOINT = os.path.join(CHECKPOINT_PATH, 'phase3', 'ckpt_best.pt')
 
+# Global RNG seed — applied via utils.set_seed() in every model constructor and
+# training-phase entry point so runs are reproducible (removes the init/training-
+# stochasticity confound). Vary this for the multi-seed confidence study (Step 5).
+SEED = 42
+
 MODEL_CONFIG = {
       "time2vec_dim": 32,
-      "embed_dim": 128,   # WINNER M-128 (head_dim=64, n_head=2) — re-run @ patience 15 as inference/QA platform
+      "embed_dim": 128,   # WINNER M-128 (head_dim=64, n_head=2) — SEEDED re-run @ patience 5 = inference/QA platform
       "n_head": 2,
       "n_layer": 4,
       "dropout": 0.1,
@@ -27,7 +32,7 @@ TRAINING_SETTINGS = {
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
     "lr_warmup_epochs": 5,
-    "early-stop-patience": 15,  # raised 5->15 (user req): let good/still-improving models keep training before plateau-stop; val-best ckpt is always saved so longer patience never hurts final quality. n_epochs cap stays 100/stage.
+    "early-stop-patience": 5,  # reverted 15->5 (original locked). patience=15 ablation (M-128-rerun-p15) gave WORSE AUROC+honesty (Phase-3 overtrained to cap) though confounded by unseeded init; 5 is the locked default + best-observed. Now reproducible via SEED.
     "early-stop-min-delta-rel": 1e-3,  # relative improvement threshold (0.1%)
 
     "phase1_learning_rate": 3e-4,

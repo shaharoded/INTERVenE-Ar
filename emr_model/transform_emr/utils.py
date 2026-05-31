@@ -22,6 +22,27 @@ from transform_emr.config.dataset_config import (
 from transform_emr.schedulers import linear_schedule
 
 
+def set_seed(seed: int):
+    """Seed all RNGs (python/numpy/torch/cuda) for reproducible runs.
+
+    Called at the start of every model constructor and every training-phase
+    entry point so that a fixed config `SEED` makes init + dataloader shuffle +
+    sampler draws + dropout reproducible across runs, and varying `SEED`
+    produces independent runs (used by the multi-seed confidence study).
+    Not bitwise-deterministic on GPU (we do not force deterministic kernels, to
+    avoid erroring on ops without deterministic impls) — but removes the
+    init/training-stochasticity confound that otherwise dominates run-to-run
+    variance.
+    """
+    import random as _random
+    import numpy as _np
+    _random.seed(seed)
+    _np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 class _TeeStream:
     """Wraps sys.stdout so every write goes to both the terminal and a log file."""
 

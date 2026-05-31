@@ -10,6 +10,8 @@ from tqdm.auto import tqdm
 
 # ───────── local code ─────────────────────────────────────────────────── #
 from transform_emr.dataset import EMRTokenizer
+from transform_emr.utils import set_seed
+from transform_emr.config.model_config import SEED
 from transform_emr.config.model_config import *
 from transform_emr.config.dataset_config import OUTCOMES, TERMINAL_OUTCOMES
 from transform_emr.utils import compute_legality_masks_tf, get_temporal_multi_hot_targets, plot_losses, build_luts, logger
@@ -124,6 +126,7 @@ class EMREmbedding(nn.Module):
 
     def __init__(self, tokenizer, ctx_dim, time2vec_dim=8, embed_dim=128, dropout=0.1):
         super().__init__()
+        set_seed(SEED)  # reproducible weight init (constructed in immutable api.py before train fns run)
 
         # Public attributes consumed by GPT, training loops, inference and diagnose.
         self.tokenizer = tokenizer
@@ -462,6 +465,7 @@ def train_embedder(embedder, train_loader, val_loader, resume=True, checkpoint_p
     Returns:
         Tuple: (trained model, train_losses, val_losses)
     """
+    set_seed(SEED)  # reproducible Phase-1 dataloader shuffle / sampler draws / dropout
     # Create global training lookup Tensors once the tokenizer is available and move to device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     luts = build_luts(embedder.tokenizer)
