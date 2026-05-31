@@ -188,7 +188,7 @@ def test_forward_with_cache_prefill_shape(mini_model, mini_tokenizer):
     parent_raw, concept, value, pos, abs_ts, context = _make_inputs(mini_tokenizer, B, T)
 
     with torch.no_grad():
-        logits, abs_t, out_log, gate, new_kvs = model.forward_with_cache(
+        logits, abs_t, out_log, gate, ttt_pred, new_kvs = model.forward_with_cache(
             parent_raw_ids=parent_raw, concept_ids=concept, value_ids=value,
             position_ids=pos, abs_ts=abs_ts, context_vec=context,
         )
@@ -211,11 +211,11 @@ def test_forward_with_cache_matches_regular_forward(mini_model, mini_tokenizer):
     parent_raw, concept, value, pos, abs_ts, context = _make_inputs(mini_tokenizer, B, T)
 
     with torch.no_grad():
-        logits_reg, abs_t_reg, out_reg, gate_reg = model(
+        logits_reg, abs_t_reg, out_reg, gate_reg, _ = model(
             parent_raw_ids=parent_raw, concept_ids=concept, value_ids=value,
             position_ids=pos, abs_ts=abs_ts, context_vec=context,
         )
-        logits_fwc, abs_t_fwc, out_fwc, gate_fwc, _ = model.forward_with_cache(
+        logits_fwc, abs_t_fwc, out_fwc, gate_fwc, _, _ = model.forward_with_cache(
             parent_raw_ids=parent_raw, concept_ids=concept, value_ids=value,
             position_ids=pos, abs_ts=abs_ts, context_vec=context,
         )
@@ -242,7 +242,7 @@ def test_forward_with_cache_decode_shape(mini_model, mini_tokenizer):
 
     with torch.no_grad():
         # Prefill T-1 tokens
-        _, _, _, _, past_kvs = model.forward_with_cache(
+        _, _, _, _, _, past_kvs = model.forward_with_cache(
             parent_raw_ids=parent_raw[:, :T-1, :], concept_ids=concept[:, :T-1],
             value_ids=value[:, :T-1], position_ids=pos[:, :T-1],
             abs_ts=abs_ts[:, :T-1], context_vec=context,
@@ -250,7 +250,7 @@ def test_forward_with_cache_decode_shape(mini_model, mini_tokenizer):
 
         # Decode the T-th token
         cache_mask = torch.ones(B, T, dtype=torch.bool)
-        logits, abs_t, out_log, gate, new_kvs = model.forward_with_cache(
+        logits, abs_t, out_log, gate, ttt_pred, new_kvs = model.forward_with_cache(
             parent_raw_ids=parent_raw[:, T-1:, :], concept_ids=concept[:, T-1:],
             value_ids=value[:, T-1:], position_ids=pos[:, T-1:],
             abs_ts=abs_ts[:, T-1:], context_vec=context,
@@ -281,20 +281,20 @@ def test_kv_cache_consistency_with_full_forward(mini_model, mini_tokenizer):
 
     with torch.no_grad():
         # (a) full forward
-        logits_full, _, _, _, _ = model.forward_with_cache(
+        logits_full, _, _, _, _, _ = model.forward_with_cache(
             parent_raw_ids=parent_raw, concept_ids=concept, value_ids=value,
             position_ids=pos, abs_ts=abs_ts, context_vec=context,
         )
         expected = logits_full[:, T-1, :]   # [B, V]
 
         # (b) prefill T-1 tokens, then decode token T-1
-        _, _, _, _, past_kvs = model.forward_with_cache(
+        _, _, _, _, _, past_kvs = model.forward_with_cache(
             parent_raw_ids=parent_raw[:, :T-1, :], concept_ids=concept[:, :T-1],
             value_ids=value[:, :T-1], position_ids=pos[:, :T-1],
             abs_ts=abs_ts[:, :T-1], context_vec=context,
         )
         cache_mask = torch.ones(B, T, dtype=torch.bool)   # no padding
-        logits_dec, _, _, _, _ = model.forward_with_cache(
+        logits_dec, _, _, _, _, _ = model.forward_with_cache(
             parent_raw_ids=parent_raw[:, T-1:, :], concept_ids=concept[:, T-1:],
             value_ids=value[:, T-1:], position_ids=pos[:, T-1:],
             abs_ts=abs_ts[:, T-1:], context_vec=context,

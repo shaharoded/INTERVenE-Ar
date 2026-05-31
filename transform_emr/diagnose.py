@@ -140,7 +140,7 @@ def _vocab_health_report(model, val_dl, tokenizer, pad_idx, device, max_batches:
             if b_idx >= max_batches:
                 break
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            logits, _, _, _ = model(
+            logits, _, _, _, _ = model(
                 parent_raw_ids=batch["parent_raw_ids"],
                 concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"],
@@ -245,13 +245,12 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     val_dl, tokenizer = _load_validation_data(sample=sample, batch_size=batch_size)
 
     print("[Diag] Loading checkpoints...")
+    # Need Phase 1 (embedder) and at least one of Phase 2 / Phase 3.
     missing = []
     if not Path(PHASE1_CHECKPOINT).exists():
         missing.append(PHASE1_CHECKPOINT)
-    if not Path(PHASE2_CHECKPOINT).exists():
-        missing.append(PHASE2_CHECKPOINT)
-    if not Path(PHASE3_CHECKPOINT).exists():
-        missing.append(PHASE3_CHECKPOINT)
+    if not Path(PHASE2_CHECKPOINT).exists() and not Path(PHASE3_CHECKPOINT).exists():
+        missing.append(f"{PHASE2_CHECKPOINT} OR {PHASE3_CHECKPOINT}")
     if missing:
         print("[Diag] Missing checkpoint(s). Run training first to generate them:")
         for ckpt in missing:
@@ -260,7 +259,14 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
         return
 
     embedder, *_ = EMREmbedding.load(PHASE1_CHECKPOINT, tokenizer=tokenizer)
-    model, *_ = GPT.load(PHASE2_CHECKPOINT, embedder=embedder)
+    # Prefer Phase-3 (outcome head fine-tuned) — it matches the model evaluated in evaluation.py.
+    # Fall back to Phase-2 if Phase-3 has not been trained yet.
+    if Path(PHASE3_CHECKPOINT).exists():
+        model, *_ = GPT.load(PHASE3_CHECKPOINT, embedder=embedder)
+        print("[Diag] Using Phase-3 checkpoint (outcome head fine-tuned — matches evaluation.py).")
+    else:
+        model, *_ = GPT.load(PHASE2_CHECKPOINT, embedder=embedder)
+        print("[Diag] Phase-3 not found — falling back to Phase-2 checkpoint.")
     model = model.to(device).eval()
 
     outcome_list = _get_outcome_token_ids(tokenizer)
@@ -270,8 +276,11 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     labels_by_outcome = {tid: [] for _, tid in outcome_list}
     head_scores_by_outcome = {tid: [] for _, tid in outcome_list}
 
-    bce_win_h = float(training_settings.get("phase2_bce_window_hours", 12.0))
-    eval_win_h = float(training_settings.get("outcome_window_hi_hours", 48.0))
+    # Diagnostic comparison windows. The Phase-2 LM-head BCE is now driven by a
+    # learnable per-class soft kernel (no single global window), but a fixed 12 h
+    # comparison window remains a useful probe of the model's short-horizon signal.
+    bce_win_h  = 12.0
+    eval_win_h = float(training_settings.get("outcome_horizon_hours", 48.0))
     scale = 336.0
     bce_norm = bce_win_h / scale
     eval_norm = eval_win_h / scale
@@ -287,7 +296,7 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     with torch.no_grad():
         for n_batches, batch in enumerate(val_dl):
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            logits, _, outcome_pred, _ = model(
+            logits, _, outcome_pred, _, _ = model(
                 parent_raw_ids=batch["parent_raw_ids"],
                 concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"],
@@ -342,7 +351,7 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
 
             if ctx_batches < 3:
                 def _fwd_bce(ctx):
-                    lg, _, _, _ = model(
+                    lg, _, _, _, _ = model(
                         parent_raw_ids=batch["parent_raw_ids"],
                         concept_ids=batch["concept_ids"],
                         value_ids=batch["value_ids"],
@@ -365,8 +374,11 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
                 ctx_batches += 1
 
     print("\n" + "=" * 90)
-    print("REPORT 1 - PER-OUTCOME AUROC BREAKDOWN (48h eval window)")
+    print("REPORT 1 - PER-OUTCOME AUROC BREAKDOWN (48h eval window, teacher-forced LM logits)")
     print("=" * 90)
+    print("  NOTE: Uses teacher-forced LM logits — scores are systematically higher than")
+    print("  evaluation.py's generation-based AUROC. Use for within-run ranking and trend")
+    print("  analysis, not as a direct comparison to the summary outcome_auroc.")
     print(f"{'Outcome':<38} {'AUROC':>6}  {'PosRate%':>8}  {'nPos':>6}  {'Sep':>7}")
     print("-" * 75)
 
@@ -438,15 +450,54 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
         print(f"Eval window ({eval_win_h:.0f}h): {eval_pct:5.1f}% with >=1 positive (mean {eval_mean:.2f})")
 
     print("\n" + "=" * 90)
-    print("REPORT 4 - AUX LOSS LAMBDA CALIBRATION GUIDE")
+    print("REPORT 4 - AUX LOSS LAMBDA CALIBRATION (actual trained values from checkpoint)")
     print("=" * 90)
     sched = training_settings.get("phase2_scheduler", {})
     caps = sched.get("aux_fraction_caps", {})
-    if caps:
-        print("aux_fraction_caps from train.py:")
+
+    # lambda_schedule_state is stored in the Phase-2 ckpt_last (most recent training state).
+    # lambda_max = cap × (anchor_main_loss / anchor_aux_loss), computed once at calibration epoch.
+    _lambda_state = None
+    for _ckpt_candidate in [
+        str(Path(PHASE2_CHECKPOINT).parent / "ckpt_last.pt"),
+        PHASE2_CHECKPOINT,
+    ]:
+        if Path(_ckpt_candidate).exists():
+            try:
+                _raw = torch.load(_ckpt_candidate, map_location="cpu", weights_only=True)
+                _lambda_state = _raw.get("lambda_schedule_state")
+                if _lambda_state:
+                    break
+            except Exception as _e:
+                print(f"  [Could not read lambda state from {_ckpt_candidate}: {_e}]")
+
+    if _lambda_state and "auxiliaries" in _lambda_state:
+        print(f"  {'aux':<12}  {'lambda_max':>12}  {'anchor_bce':>12}  {'anchor_aux':>12}  {'bce/aux':>8}  {'cap':>6}")
+        print("  " + "-" * 72)
+        for name, spec in _lambda_state["auxiliaries"].items():
+            lm  = spec.get("lambda_max")
+            am  = spec.get("anchor_main_loss")
+            aa  = spec.get("anchor_aux_loss")
+            cap = caps.get(name, "?")
+            ratio_str = f"{am / aa:.4f}" if (am and aa and aa > 1e-9) else "N/A"
+            lm_str = f"{lm:.6f}" if lm is not None else "pending"
+            am_str = f"{am:.6f}" if am is not None else "N/A"
+            aa_str = f"{aa:.6f}" if aa is not None else "N/A"
+            print(f"  {name:<12}  {lm_str:>12}  {am_str:>12}  {aa_str:>12}  {ratio_str:>8}  {str(cap):>6}")
+            if lm is not None and lm < 1e-3:
+                print(f"  *** WARNING: {name} lambda_max={lm:.6f} — near-silent (<0.001).")
+                print(f"      Gradient from {name} loss is negligible. Increase its cap in phase2_scheduler.")
+        warmup = _lambda_state.get("warmup_complete_epoch")
+        if warmup is not None:
+            print(f"\n  Warmup completed at epoch: {warmup}")
+        stage = _lambda_state.get("current_stage")
+        if stage is not None:
+            print(f"  Current curriculum stage: {stage}")
+    else:
+        print("  No calibrated lambda state in checkpoint — training not yet run or checkpoint missing.")
+        print("  Showing configured caps from model_config.py (formula: lambda_max = cap × bce / aux):")
         for key, value in caps.items():
-            print(f"  {key:<12}: cap={value}")
-        print("Interpretation: lambda = cap x (BCE_at_calibration / aux_raw_at_calibration)")
+            print(f"    {key:<12}: cap={value}")
         if caps.get("outcome", 0) < 2.0:
             print("  WARNING: outcome cap looks low for temporal BCE scale; consider 10-20.")
         if caps.get("ce", 0) < 0.5:
@@ -485,7 +536,7 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
         if i >= 3:
             break
         batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-        logits, _, _, _ = model(
+        logits, _, _, _, _ = model(
             parent_raw_ids=batch["parent_raw_ids"],
             concept_ids=batch["concept_ids"],
             value_ids=batch["value_ids"],
@@ -587,6 +638,10 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
 
     _vocab_health_report(model, val_dl, tokenizer, pad_idx, device=device, max_batches=3, k_window=12)
 
+    probe_dt_head(model, val_dl, n_batches=2)
+    probe_outcome_label_alignment(model, val_dl, tokenizer, n_batches=2)
+    probe_outcome_logit_distribution(model, val_dl, n_batches=2)
+
     print("\n[Diag] Done.")
 
 
@@ -669,7 +724,7 @@ def probe_dt_components(model, val_dl, n_batches: int = 1):
         for i, batch in enumerate(val_dl):
             if i >= n_batches: break
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            _, _, _, gate_logit = model(
+            _, _, _, gate_logit, _ = model(
                 parent_raw_ids=batch["parent_raw_ids"], concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"], position_ids=batch["position_ids"],
                 abs_ts=batch["abs_ts"], context_vec=batch["context_vec"],
@@ -703,7 +758,7 @@ def _collect_val_batches(model, val_dl, n_batches: int = 1):
             if i >= n_batches:
                 break
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-            logits, abs_t_pred, outcome_logits, _ = model(
+            logits, abs_t_pred, outcome_logits, _, _ = model(
                 parent_raw_ids=batch["parent_raw_ids"],
                 concept_ids=batch["concept_ids"],
                 value_ids=batch["value_ids"],
@@ -1139,100 +1194,6 @@ def probe_outcome_logit_distribution(model, val_dl, n_batches: int = 1) -> pd.Da
     print("=" * 90)
     print(df.round(3).to_string(index=False))
     return df
-
-
-def probe_outcome_lm_coupling(model, val_dl, n_batches: int = 3) -> dict:
-    """
-    Purpose: Verify that the outcome_to_lm coupling is non-trivial after phase-3
-        training and that it correctly lifts LM logits at outcome positions when
-        the outcome head predicts elevated risk.
-    Method: For each outcome, (a) check weight norms of outcome_to_lm, (b) collect
-        positions where that outcome is the GT next token, (c) compare the raw
-        lm_head(x) logit vs the final logit (with coupling bias) at that vocab
-        position, (d) report the mean bias added and the Pearson correlation between
-        outcome_head logit and the coupling contribution.
-
-    Args:
-        model: GPT (outcome_to_lm should be trained — run after phase-3).
-        val_dl (DataLoader): Validation dataloader.
-        n_batches (int): Batches to consume.
-
-    Returns:
-        dict: per-outcome stats — weight_norm, mean_bias, bias_std, r_head_vs_bias.
-    """
-    device = next(model.parameters()).device
-    model.eval()
-
-    # Weight norms of outcome_to_lm rows (one per outcome)
-    w = model.outcome_to_lm.weight.detach().cpu()  # [num_outcomes, num_outcomes]
-    row_norms = w.norm(dim=1).tolist()
-
-    # Per-outcome accumulators: lists of (outcome_logit, bias_added) pairs
-    accum: dict = {name: {"head_logits": [], "biases": []} for name in model.outcome_names}
-
-    with torch.no_grad():
-        for i, batch in enumerate(val_dl):
-            if i >= n_batches:
-                break
-            batch = {k: v.to(device) for k, v in batch.items()}
-
-            x_out, cond_emb, pad_mask = model.embedder(
-                batch["parent_raw_ids"], batch["concept_ids"], batch["value_ids"],
-                batch["position_ids"], batch["abs_ts"], batch["context_vec"],
-                return_mask=True,
-            )
-            for blk in model.blocks:
-                x_out = blk(x_out, cond_emb, key_pad_mask=pad_mask, abs_ts=batch["abs_ts"])
-            x_out = model.ln_f(x_out)
-
-            outcome_logits = model.outcome_head(x_out).float()     # [B, T, K]
-            bias           = model.outcome_to_lm(outcome_logits.detach())  # [B, T, K]
-
-            # For each outcome, find GT positions where next token == that outcome
-            target_ids   = batch["position_ids"][:, 1:]            # [B, T-1]
-            oh_shifted   = outcome_logits[:, :-1, :]               # [B, T-1, K]
-            bias_shifted = bias[:, :-1, :]                         # [B, T-1, K]
-
-            for k, name in enumerate(model.outcome_names):
-                vocab_id = model._outcome_lm_ids[k].item()
-                is_pos = (target_ids == vocab_id)                   # [B, T-1]
-                if not is_pos.any():
-                    continue
-                head_logit_vals = oh_shifted[..., k][is_pos].cpu().tolist()
-                bias_vals       = bias_shifted[..., k][is_pos].cpu().tolist()
-                accum[name]["head_logits"].extend(head_logit_vals)
-                accum[name]["biases"].extend(bias_vals)
-
-    rows = []
-    for k, name in enumerate(model.outcome_names):
-        hl = np.array(accum[name]["head_logits"])
-        bv = np.array(accum[name]["biases"])
-        n  = len(hl)
-        if n < 2:
-            r = float("nan")
-        else:
-            r = float(np.corrcoef(hl, bv)[0, 1]) if bv.std() > 1e-9 else float("nan")
-        rows.append({
-            "outcome":      name,
-            "weight_norm":  float(row_norms[k]),
-            "n_positions":  n,
-            "mean_bias":    float(bv.mean()) if n else float("nan"),
-            "bias_std":     float(bv.std())  if n else float("nan"),
-            "r_head_bias":  r,
-        })
-
-    df = pd.DataFrame(rows).sort_values("weight_norm", ascending=False)
-    print("\n" + "=" * 90)
-    print("PROBE - OUTCOME→LM COUPLING (outcome_to_lm weights + bias at GT outcome positions)")
-    print("=" * 90)
-    print(df.round(4).to_string(index=False))
-
-    near_zero = (df["weight_norm"] < 1e-3).all()
-    if near_zero:
-        print("\n  WARNING: outcome_to_lm weights are near zero — coupling has not activated.")
-        print("  Possible causes: (a) phase-3 not yet run, (b) CE loss at outcome positions")
-        print("  produced no gradient (check that outcome tokens appear in val batches).")
-    return df.to_dict(orient="records")
 
 
 def main() -> None:

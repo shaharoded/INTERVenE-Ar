@@ -130,8 +130,8 @@ def test_forward_with_decoder_logits(mini_tokenizer):
      "context_vec":     dummy['patient_contexts'],
     }
     
-    # This calls internal forward ->unpack (seq, cond) -> decoder(seq)
-    logits = model.forward_with_decoder(batch)
+    # forward_with_decoder returns (logits, seq_embeddings)
+    logits, seq_emb = model.forward_with_decoder(batch)
     
     # forward_with_decoder predicts next-token logits: [B, T, vocab_size]
     # No [CTX] prepended, so T remains T.

@@ -6,19 +6,13 @@ import transform_emr.utils as utils_module
 from transform_emr.utils import (
     get_temporal_multi_hot_targets,
     get_future_outcome_targets,
-    build_mlm,
     linear_schedule,
     apply_cbm,
     mix_with_predictions,
-    penalty_interval_structure,
-    penalty_meal_order,
-    soft_interval_penalty,
-    soft_meal_order_penalty,
     build_luts,
     compute_legality_masks_tf,
     apply_masks_to_logits,
     build_rep_penalty,
-    soft_unclosed_interval_penalty,
     build_illegal_mask_batched,
     update_legality_state_batched,
 )
@@ -51,8 +45,8 @@ def test_unified_lambda_schedule_controller_phase1_alias_and_immediate_activatio
     }
     controller = LambdaScheduleController(schedule_config=cfg, start_epoch=0)
     assert controller.has_dynamic is False
-    # Warmup gate == start_epoch (1), not start_epoch+1
-    assert controller.current_warmup_end_epoch() == 1
+    # Warmup gate = ramp_end + 1 calibration-delay offset (=> 2).
+    assert controller.current_warmup_end_epoch() == 2
 
     # Pre-calibration fires at last BCE-only epoch (epoch 0 = start_epoch-1).
     events = controller.update(epoch=0, vl_total=2.5, tr_main=2.0, mlm=1.0, dt=0.5)
@@ -98,8 +92,8 @@ def test_precalibration_warmup_gate_at_start_epoch_not_plus_one():
         "ramp_epochs": {"mlm": 0, "dt": 0},
     }
     controller = LambdaScheduleController(schedule_config=cfg, start_epoch=1)
-    # aux start_epoch = 1 + 3 = 4; warmup gate = 4
-    assert controller.current_warmup_end_epoch() == 4
+    # aux start_epoch = 1 + 3 = 4; warmup gate = ramp_end + 1 = 5 (calibration-delay offset).
+    assert controller.current_warmup_end_epoch() == 5
 
     # Epochs 1-2: too early for pre-calibration (need epoch >= 3 = start_epoch-1)
     controller.update(epoch=1, vl_total=2.0, tr_main=1.0, mlm=0.8, dt=0.3)
@@ -123,8 +117,8 @@ def test_precalibration_warmup_gate_at_start_epoch_not_plus_one():
     assert l4["mlm"] == pytest.approx(0.40)
     assert l4["dt"] == pytest.approx(0.80)
 
-    # Warmup gate is 4, not 5 — checkpointing valid from first aux-active epoch.
-    assert controller.current_warmup_end_epoch() == 4
+    # Warmup gate = ramp_end + 1 calibration-delay offset = 5.
+    assert controller.current_warmup_end_epoch() == 5
 
 
 def test_unified_lambda_schedule_controller_phase2_ramp_progression():
@@ -465,58 +459,6 @@ def test_linear_schedule_visual_and_assert():
         assert val == pytest.approx(expected)
 
 
-def test_build_mlm_masking_visual_and_assert(mini_tokenizer):
-    """
-    Print each position’s token, mask flag, and new ID,
-    then assert forbidden tokens stay unchanged and eligible positions are flagged.
-    """
-    tk = mini_tokenizer
-
-    # One-row batch covering forbidden & eligible IDs
-    seq_ids = [
-        tk.pad_token_id,                      # forbidden
-        tk.null_token_id,                     # forbidden
-        tk.token2id["ADMISSION_EVENT"],       # forbidden
-        tk.token2id["DEATH_EVENT"],           # forbidden
-        tk.token2id["RELEASE_EVENT"],         # forbidden
-        tk.token2id["A_STATE_High_START"],    # eligible
-        tk.token2id["A_TREND_inc_START"],     # eligible
-        tk.token2id["MEAL_CONTEXT_Breakfast"],# eligible
-        tk.token2id["A_TREND_inc_END"],       # eligible
-        tk.token2id["A_STATE_High_END"],      # eligible
-    ]
-    ids = torch.tensor([seq_ids], dtype=torch.long)
-
-    masked, mask = build_mlm(ids, tokenizer=tk, p=1.0)
-
-    forbidden = {
-        tk.pad_token_id,
-        tk.null_token_id,
-        tk.token2id["ADMISSION_EVENT"],
-        tk.token2id["DEATH_EVENT"],
-        tk.token2id["RELEASE_EVENT"],
-    }
-
-    for pos, orig in enumerate(seq_ids):
-        token    = tk.id2token[orig]
-        was_mask = bool(mask[0, pos].item())
-        new_id   = masked[0, pos].item()
-
-        print(f"pos={pos:<2} token={token:<24}"
-              f"orig={orig:<2} masked={was_mask:<5} new={new_id}")
-
-        if orig in forbidden:
-            # these must never be masked or changed
-            assert not was_mask, f"❌ Forbidden {token} was masked"
-            assert new_id == orig, f"❌ Forbidden {token} changed to {new_id}"
-        else:
-            # eligible positions must have mask flag True
-            assert was_mask, f"❌ Expected {token} to be masked"
-
-    # (We no longer assert new_id != orig, since 10% of the time BERT-style
-    # keeps the original even when flagged masked.)
-
-
 def test_apply_cbm_visual_and_assert(mini_tokenizer):
     """
     With p=1.0 (epoch == warmup_epochs), verify that:
@@ -547,6 +489,7 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
             batch.copy(),
             tokenizer=tk,
             forbid_ids=torch.tensor(sorted(luts["forbid_mask_ids"].tolist()), dtype=torch.long),
+            luts=luts,
             p=1.0
         )
         out_seq = out["position_ids"][0]
@@ -569,6 +512,7 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
             batch.copy(),
             tokenizer=tk,
             forbid_ids=torch.tensor(sorted(luts["forbid_mask_ids"].tolist()), dtype=torch.long),
+            luts=luts,
             p=1.0
         )
         out_seq = out["position_ids"][0]
@@ -597,7 +541,7 @@ def test_apply_cbm_visual_and_assert(mini_tokenizer):
         }
         out3 = apply_cbm(
             batch3.copy(),
-            tokenizer=tk, forbid_ids=minimal_forbid, p=1.0
+            tokenizer=tk, forbid_ids=minimal_forbid, luts=luts, p=1.0
         )
         out3_seq = out3["position_ids"][0]
         print(f"test_apply_cbm (minimal forbid): input ={in_seq3[0].tolist()}, output={out3_seq.tolist()}")
@@ -799,319 +743,6 @@ def test_build_luts_and_legality_visual_and_assert(mini_tokenizer):
     assert not illegal_mix2[0, 2, d], (
         "Meal order should not be broken by unrelated interval token in between")
     
-
-def test_penalty_interval_structure_and_meal_order(mini_tokenizer):
-    tk = mini_tokenizer
-    l  = build_luts(tk)
-    
-    # --- Define tokens ---
-    b    = tk.token2id['MEAL_CONTEXT_Breakfast']
-    lu = tk.token2id['MEAL_CONTEXT_Lunch']
-    d    = tk.token2id['MEAL_CONTEXT_Dinner']
-    n    = tk.token2id['MEAL_CONTEXT_Night-Snack']
-    low_s  = tk.token2id['A_STATE_Low_START']
-    low_e  = tk.token2id['A_STATE_Low_END']
-    pad    = tk.pad_token_id
-
-    # --- Penalty: interval structure with forgiveness ---
-    window=1
-    # GT and pred share same FSM violation at t=0 => forgiven (penalty=0)
-    gt = torch.tensor([[low_e, low_s, pad]])
-    pred = gt.clone()
-    p_forgiven = penalty_interval_structure(
-        pred, gt,
-        l['is_start'], l['is_end'], l['base_id'],
-        l['start_ids_per_base'], l['end_ids_per_base'],
-        l['meal_rank'], l['meal_pred_rank'],
-        l['K_meals'], l['conflict_mat'], l['predict_block'], window=1
-    )
-    assert p_forgiven == 0, f"Violation should be forgiven, got {p_forgiven}"
-
-    # Pred has an extra FSM violation at t=1 not in GT => penalty > 0
-    # GT has a low_e violation at t=0
-    gt2   = torch.tensor([[ b, low_e, pad, pad, pad, pad]])
-    # Put your new bad END at t=3, which is >1 step away
-    pred2 = torch.tensor([[ b, lu, d, n, b, low_e]])
-
-    p_new = penalty_interval_structure(
-        pred2, gt2,
-        l['is_start'], l['is_end'], l['base_id'],
-        l['start_ids_per_base'], l['end_ids_per_base'],
-        l['meal_rank'], l['meal_pred_rank'],
-        l['K_meals'], l['conflict_mat'], l['predict_block'],
-        window=1
-    )
-    illegal_pred = compute_legality_masks_tf(pred2, l['is_start'], l['is_end'], l['base_id'],
-        l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block'])
-    pred_illegal = illegal_pred.gather(2, pred2.unsqueeze(-1)).squeeze(-1)
-    print("pred_illegal:", pred_illegal)          # e.g. tensor([[False, False,  True]])
-    gt_illegal = compute_legality_masks_tf(gt2, l['is_start'], l['is_end'], l['base_id'],
-        l['start_ids_per_base'], l['end_ids_per_base'], l['meal_rank'],
-        l['meal_pred_rank'], l['K_meals'], l['conflict_mat'], l['predict_block']) \
-                    .gather(2, gt2.unsqueeze(-1)).squeeze(-1)
-    print("gt_illegal:  ", gt_illegal)            # e.g. tensor([[ True, False, False]])
-    gt_win = F.max_pool1d(
-        gt_illegal.float().unsqueeze(1),
-        kernel_size=2*window+1,  # e.g. 3
-        stride=1,
-        padding=window           # e.g. 1
-    ).squeeze(1).bool()          # → [B, T]
-    print("gt_win:      ", gt_win)                # e.g. tensor([[ True,  True, False]])
-    new_ts_viol = pred_illegal & (~gt_win)
-    print("new_ts_viol: ", new_ts_viol)           # → must be [False,False,True]
-    print("p_new:       ", p_new)
-    assert p_new > 0, "Violation more than 1 step away should not be forgiven"
-
-    # --- Penalty: meal order ---
-    # Legal transitions: L→D→N→B => 0 penalty
-    seq_ok = torch.tensor([[lu, low_s, d, n, low_e, b]])
-    p_meal_ok = penalty_meal_order(seq_ok, l['meal_rank'])
-    print('legal transition: L→D→N→B => penalty=', p_meal_ok)
-    assert p_meal_ok == 0, f"No penalty for legal cycle, got {p_meal_ok}"
-
-    # Illegal transition: B→L→N→D→L => penalty > 0
-    seq_bad = torch.tensor([[b, lu, low_s, low_e, n, d, lu]])
-    p_meal_bad = penalty_meal_order(seq_bad, l['meal_rank'])
-    print('Illegal transition: B→L→N→D→L => penalty=', p_meal_bad)
-    assert p_meal_bad > 0, f"Penalty should be positive for incorrect meal cycle, got {p_meal_bad}"
-
-    # Illegal transition: B→B→L→D => penalty > 0
-    seq_bad = torch.tensor([[b, low_e, low_s, b, low_e, lu, d]])
-    p_meal_bad = penalty_meal_order(seq_bad, l['meal_rank'])
-    print('Illegal transition: B→B→L→D => penalty=', p_meal_bad)
-    assert p_meal_bad > 0, f"Penalty should be positive for repeating meal, got {p_meal_bad}"
-
-
-def test_soft_interval_penalty_legal_vs_violation_and_grad(mini_tokenizer):
-    tk = mini_tokenizer
-    l  = build_luts(tk)
-
-    V = len(tk.token2id)
-    pad = tk.pad_token_id
-    low_s = tk.token2id['A_STATE_Low_START']
-    low_e = tk.token2id['A_STATE_Low_END']
-    high_s = tk.token2id['A_STATE_High_START']  # conflicting base to 'low'
-
-    # Helper: make allowed mask (block PAD/MASK/CTX/NULL like in training)
-    allowed = torch.ones(1, 2, V, dtype=torch.bool)
-    for bid in [tk.pad_token_id, tk.mask_token_id, tk.ctx_token_id, tk.null_token_id]:
-        allowed[:, :, bid] = False
-
-    # Case A (legal): START then END → small/near-zero penalty
-    logits_A = torch.full((1,2,V), -8.0)
-    with torch.no_grad():
-        logits_A[0,0,low_s] = 8.0
-        logits_A[0,1,low_e] = 8.0
-    logits_A.requires_grad_()                      # enable grad AFTER edits
-    pen_A = soft_interval_penalty(
-        logits_A, allowed,
-        l['start_ids_per_base'], l['end_ids_per_base'],
-        l['conflict_mat'],
-        alpha=10.0
-    )
-    pen_A.backward()
-    # penalty should be (very) small; exact zero is not required
-    assert pen_A.item() < 1e-3, f"Legal START→END should not be penalized, got {pen_A.item():.6f}"
-    # Grad should exist on both steps (differentiable path)
-    assert logits_A.grad.abs().sum().item() > 0, "Expected non-zero gradients for soft penalty (legal case)"
-
-    # Case B (FSM): END without prior START at t=0 → positive penalty
-    logits_B = torch.full((1,2,V), -8.0)
-    with torch.no_grad():
-        logits_B[0,0,low_e] = 8.0     # illegal END first
-        logits_B[0,1,low_s] = 8.0     # then legal START
-    logits_B.requires_grad_()                      # enable grad AFTER edits
-    pen_B = soft_interval_penalty(
-        logits_B, allowed,
-        l['start_ids_per_base'], l['end_ids_per_base'],
-        l['conflict_mat'],
-        alpha=10.0
-    )
-    pen_B.backward()
-    assert pen_B.item() > 1e-3, "END without open must be penalized"
-
-    # Case C (CNF): conflict START while first base open
-    logits_C = torch.full((1,2,V), -8.0)
-    with torch.no_grad():
-        logits_C[0,0,low_s] = 8.0    # open Low
-        logits_C[0,1,high_s] = 8.0   # conflicting START while Low still open  <-- CHANGED
-    logits_C.requires_grad_()
-    pen_C = soft_interval_penalty(
-        logits_C, allowed,
-        l['start_ids_per_base'], l['end_ids_per_base'],
-        l['conflict_mat'],
-        alpha=10.0
-    )
-    pen_C.backward()
-    assert pen_C.item() > 1e-3, "Conflicting START while open must be penalized"
-
-    # Grad must flow back to the *previous* step via the prefix (open_before)
-    # Check that the gradient on the first step logits is non-zero in the violating cases
-    assert logits_B.grad[0,0].abs().sum().item() > 0, "Grad should reach prior step (FSM case)"
-    assert logits_C.grad[0,0].abs().sum().item() > 0, "Grad should reach prior step (CNF case)"
-
-
-def test_soft_meal_penalty_recency_and_successor(mini_tokenizer):
-    tk = mini_tokenizer
-    l  = build_luts(tk)
-
-    V = len(tk.token2id)
-    b = tk.token2id['MEAL_CONTEXT_Breakfast']
-    lu = tk.token2id['MEAL_CONTEXT_Lunch']
-    d = tk.token2id['MEAL_CONTEXT_Dinner']
-    n = tk.token2id['MEAL_CONTEXT_Night-Snack']
-
-    allowed = torch.ones(1, 3, V, dtype=torch.bool)
-    for bid in [tk.pad_token_id, tk.mask_token_id, tk.ctx_token_id, tk.null_token_id]:
-        allowed[:, :, bid] = False
-
-    # A) First meal at t=0: free (no prior seen)
-    logits_A = torch.full((1,1,V), -8.0)
-    with torch.no_grad():
-        logits_A[0,0,b] = 8.0
-    logits_A.requires_grad_()  # enable grad AFTER edits
-    penA = soft_meal_order_penalty(logits_A, allowed[:, :1, :], l['meal_rank'], decay=0.9, beta=6.0)
-    penA.backward()
-    assert penA.item() < 1e-4, f"First meal should be free; got {penA.item():.6f}"
-
-    # B) Legal successor: Lunch→Dinner (successor of Lunch is Dinner)
-    logits_B = torch.full((1,2,V), -8.0)
-    with torch.no_grad():
-        logits_B[0,0,lu] = 8.0
-        logits_B[0,1,d]  = 8.0
-    logits_B.requires_grad_()  # enable grad AFTER edits
-    penB = soft_meal_order_penalty(logits_B, allowed[:, :2, :], l['meal_rank'], decay=0.9, beta=6.0)
-    penB.backward()
-    assert penB.item() < 1e-3, f"Legal successor L→D should be near zero penalty; got {penB.item():.6f}"
-
-    # C) Illegal order: Lunch→Breakfast (Breakfast is not successor of Lunch)
-    logits_C = torch.full((1,2,V), -8.0)
-    with torch.no_grad():
-        logits_C[0,0,lu] = 8.0
-        logits_C[0,1,b]  = 8.0
-    logits_C.requires_grad_()  # enable grad AFTER edits
-    penC = soft_meal_order_penalty(logits_C, allowed[:, :2, :], l['meal_rank'], decay=0.9, beta=6.0)
-    penC.backward()
-    assert penC.item() > 1e-3, "Illegal successor L→B should be penalized"
-
-    # D) Recency: Lunch then Night; right after Lunch, successor mass favors Dinner.
-    # If we put mass on Night immediately, penalty should be higher than Dinner.
-    logits_Dd = torch.full((1,2,V), -8.0)  # L→D
-    with torch.no_grad():
-        logits_Dd[0,0,lu] = 8.0 
-        logits_Dd[0,1,d] = 8.0
-    logits_Dd.requires_grad_()  # enable grad AFTER edits
-    pen_Dd = soft_meal_order_penalty(logits_Dd, allowed[:, :2, :], l['meal_rank'], decay=0.9, beta=6.0)
-
-    logits_Dn = torch.full((1,2,V), -8.0)  # L→N (skip Dinner)
-    with torch.no_grad():
-        logits_Dn[0,0,lu] = 8.0
-        logits_Dn[0,1,n] = 8.0
-    logits_Dn.requires_grad_()  # enable grad AFTER edits
-    pen_Dn = soft_meal_order_penalty(logits_Dn, allowed[:, :2, :], l['meal_rank'], decay=0.9, beta=6.0)
-
-    assert pen_Dn.item() > pen_Dd.item(), "Recency should prefer Dinner over Night immediately after Lunch"
-
-def test_soft_unclosed_interval_penalty(mini_tokenizer):
-    """
-    Test that soft_unclosed_interval_penalty:
-      - Returns 0 for perfectly paired START/END.
-      - Returns >0 for START without END.
-      - Ignores masked/illegal logits (relies on P).
-    """
-    tk = mini_tokenizer
-    l = build_luts(tk)
-    
-    # Pick a valid base (e.g. A_STATE_Low)
-    base_idx = 0
-    s_id = l["start_ids_per_base"][base_idx].item()
-    e_id = l["end_ids_per_base"][base_idx].item()
-    
-    # 1 Batch, 5 Timesteps, V vocab
-    B, T, V = 1, 5, len(tk.token2id)
-    allowed = torch.ones(B, T, V, dtype=torch.bool)
-    
-    # --- Scenario 1: Closed Interval (Start t=0, End t=4) ---
-    logits_closed = torch.full((B, T, V), -100.0)
-    logits_closed[0, 0, s_id] = 100.0
-    logits_closed[0, 4, e_id] = 100.0
-    
-    pen_closed = soft_unclosed_interval_penalty(
-        logits_closed, allowed, 
-        l["start_ids_per_base"], l["end_ids_per_base"]
-    )
-    # Mass(Start) ≈ 1, Mass(End) ≈ 1 => Diff ≈ 0
-    assert pen_closed.item() < 1e-4, f"Closed sequence should have ~0 penalty, got {pen_closed.item()}"
-
-    # --- Scenario 2: Unclosed Interval (Start t=0, No End) ---
-    logits_open = torch.full((B, T, V), -100.0)
-    logits_open[0, 0, s_id] = 100.0
-    
-    pen_open = soft_unclosed_interval_penalty(
-        logits_open, allowed, 
-        l["start_ids_per_base"], l["end_ids_per_base"]
-    )
-    
-    # Mass(Start) ≈ 1, Mass(End) ≈ 0 => Diff ≈ 1
-    # Normalized by (Batch * Num_Bases)
-    nbv = (l["start_ids_per_base"] >= 0).sum().item()
-    expected = 1.0 / nbv
-    
-    assert pen_open.item() > 0
-    assert abs(pen_open.item() - expected) < 1e-2, f"Expected ~{expected}, got {pen_open.item()}"
-    
-    print("test_soft_unclosed_interval_penalty: passed.")
-    
-
-def test_soft_penalties_agree_with_hard_in_peaked_limit(mini_tokenizer):
-    tk = mini_tokenizer
-    l  = build_luts(tk)
-
-    V = len(tk.token2id)
-    pad = tk.pad_token_id
-    low_s = tk.token2id['A_STATE_Low_START']
-    low_e = tk.token2id['A_STATE_Low_END']
-    lu = tk.token2id['MEAL_CONTEXT_Lunch']
-    b = tk.token2id['MEAL_CONTEXT_Breakfast']
-
-    allowed = torch.ones(1, 2, V, dtype=torch.bool)
-    for bid in [tk.pad_token_id, tk.mask_token_id, tk.ctx_token_id, tk.null_token_id]:
-        allowed[:, :, bid] = False
-
-    scale = 30.0  # make distributions ~one-hot
-
-    # Interval: END→START (hard violation) vs START→END (legal)
-    seq_bad = torch.tensor([[low_e, low_s]])      # argmax sequence
-    logits_bad = torch.full((1,2,V), -scale)
-    logits_bad[0,0,low_e] = scale; logits_bad[0,1,low_s] = scale
-
-    seq_ok = torch.tensor([[low_s, low_e]])
-    logits_ok = torch.full((1,2,V), -scale)
-    logits_ok[0,0,low_s] = scale; logits_ok[0,1,low_e] = scale
-
-    # Hard penalties on argmax sequences (for direction)
-    hard_bad = penalty_interval_structure(seq_bad, seq_ok, l['is_start'], l['is_end'], l['base_id'],
-                                          l['start_ids_per_base'], l['end_ids_per_base'],
-                                          l['meal_rank'], l['meal_pred_rank'], l['K_meals'],
-                                          l['conflict_mat'], l['predict_block'], window=1)
-    hard_ok = penalty_interval_structure(seq_ok, seq_ok, l['is_start'], l['is_end'], l['base_id'],
-                                         l['start_ids_per_base'], l['end_ids_per_base'],
-                                         l['meal_rank'], l['meal_pred_rank'], l['K_meals'],
-                                         l['conflict_mat'], l['predict_block'], window=1)
-    soft_bad = soft_interval_penalty(logits_bad, allowed, l['start_ids_per_base'], l['end_ids_per_base'], l['conflict_mat'], alpha=12.0)
-    soft_ok  = soft_interval_penalty(logits_ok,  allowed, l['start_ids_per_base'], l['end_ids_per_base'], l['conflict_mat'], alpha=12.0)
-
-    assert hard_ok == 0 and soft_ok.item() < 1e-4, "Legal case should be (near) zero in both"
-    assert hard_bad > 0 and soft_bad.item() > soft_ok.item(), "Violation should increase soft penalty vs legal"
-
-    # Meals: L→B (bad) vs L→D (ok)
-    logits_mb = torch.full((1,2,V), -scale); logits_mb[0,0,lu]=scale; logits_mb[0,1,b]=scale
-    logits_md = torch.full((1,2,V), -scale); logits_md[0,0,lu]=scale; logits_md[0,1,tk.token2id['MEAL_CONTEXT_Dinner']]=scale
-    soft_mb = soft_meal_order_penalty(logits_mb, allowed, l['meal_rank'], decay=0.9, beta=8.0)
-    soft_md = soft_meal_order_penalty(logits_md, allowed, l['meal_rank'], decay=0.9, beta=8.0)
-    assert soft_mb.item() > soft_md.item(), "Illegal L→B should be penalized more than legal L→D"
-
 
 def test_apply_masks_to_logits():
     """

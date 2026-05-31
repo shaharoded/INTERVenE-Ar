@@ -107,7 +107,7 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
     context = torch.zeros(B, 2)
 
     with torch.no_grad():
-        logits, abs_t, outcomes, dt_gate = model(
+        logits, abs_t, outcomes, dt_gate, ttt_pred = model(
             parent_raw_ids=parent_raw,
             concept_ids=concept,
             value_ids=value,
@@ -120,6 +120,7 @@ def test_transformer_forward_cpu(mini_transformer, mini_tokenizer):
     assert abs_t.shape == (B, T), f"Expected abs_t shape {(B, T)}, got {abs_t.shape}"
     assert outcomes.shape == (B, T, model.num_outcomes), f"Expected outcomes shape {(B, T, model.num_outcomes)}, got {outcomes.shape}"
     assert dt_gate.shape == (B, T), f"Expected dt_gate shape {(B, T)}, got {dt_gate.shape}"
+    assert ttt_pred.shape == (B, T), f"Expected ttt_pred shape {(B, T)}, got {ttt_pred.shape}"
 
 
 def test_transformer_checkpoint_persists_configs(mini_transformer, mini_embedder, tmp_path):

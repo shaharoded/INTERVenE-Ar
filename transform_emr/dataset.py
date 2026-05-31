@@ -87,6 +87,8 @@ class DataProcessor:
         # Process on context_df
         if 'index' in self.context_df.columns:
             self.context_df = self.context_df.drop(columns=['index'])
+        # QA features must be merged BEFORE indexing/scaling so the scaler picks them up.
+        self._add_qa_features()
         self.context_df = self.context_df.set_index("PatientId").drop(columns=["PatientId"], errors="ignore").astype("float32")
         self._fit_scaler()
         return self.df, self.context_df
@@ -165,6 +167,98 @@ class DataProcessor:
             print(f"[DataProcessor] Applied {source_name} filter: {cond} | rows {before_n} -> {after_n}")
 
         return out_df
+
+    def _add_qa_features(self):
+        """
+        Purpose: Augment context_df with per-patient, per-PatternName mean ComplianceScore
+                 over the first `qa_history_hours` after admission.
+        Method:  Load qa_data.csv (path from config); compute elapsed hours from each
+                 patient's earliest StartDateTime in self.df; filter QA rows to
+                 [0, qa_history_hours]; group by (PatientId, PatternName) and mean
+                 the score; pivot to wide; reindex to the canonical PatternName set
+                 read from the FULL qa file (stable schema across train/val); reindex
+                 to all PatientIds in context_df with zero-fill; merge as new columns.
+
+                 No-op when USE_QA_DATA is False so the gate is a single config flag.
+
+        Args:    None (uses self.df, self.context_df, self.max_input_days).
+
+        Returns: None. Mutates self.context_df in place.
+        """
+        if not USE_QA_DATA:
+            return
+
+        if not os.path.exists(QA_DATA_FILE):
+            raise FileNotFoundError(
+                f"USE_QA_DATA=True but QA file missing: {QA_DATA_FILE}"
+            )
+
+        qa = pd.read_csv(QA_DATA_FILE, low_memory=False)
+        required = ["PatientId", "PatternName", "StartDateTime", "ComplianceScore"]
+        for col in required:
+            if col not in qa.columns:
+                raise ValueError(f"qa_data.csv missing required column: {col}")
+
+        qa["StartDateTime"] = pd.to_datetime(
+            qa["StartDateTime"], format="ISO8601", utc=True, errors="raise"
+        ).dt.tz_convert(None)
+
+        # Canonical pattern column set comes from the FULL qa file so train and val
+        # splits always produce the same column layout. Sorted for determinism.
+        canonical_patterns = sorted(qa["PatternName"].unique())
+        qa_cols = [f"QA_{p}" for p in canonical_patterns]
+
+        # Per-patient admission time = earliest StartDateTime cached in _normalize_time
+        # (self.df no longer has StartDateTime after _expand_tokens replaced it with TimePoint).
+        # Patients that were dropped (e.g. by _cut_after_k_days) still appear here, which
+        # is fine — the reindex/zero-fill at the end aligns to context_df's patient set.
+        if not hasattr(self, "_patient_admission_time"):
+            raise RuntimeError(
+                "_add_qa_features called before _normalize_time — admission timestamps unavailable."
+            )
+        admission = self._patient_admission_time.rename("AdmissionTime").reset_index()
+
+        qa_history_hours = (
+            float(self.max_input_days) * 24.0 if self.max_input_days else float(QA_HISTORY_HOURS_DEFAULT)
+        )
+
+        qa = qa.merge(admission, on="PatientId", how="inner")
+        qa["elapsed_h"] = (qa["StartDateTime"] - qa["AdmissionTime"]).dt.total_seconds() / 3600.0
+        qa = qa[(qa["elapsed_h"] >= 0.0) & (qa["elapsed_h"] <= qa_history_hours)]
+
+        if len(qa) == 0:
+            # No QA rows fell in the window for any patient — still emit zero-filled
+            # columns so the schema is stable across runs.
+            wide = pd.DataFrame(
+                0.0,
+                index=self.context_df["PatientId"].unique(),
+                columns=qa_cols,
+            )
+        else:
+            agg = qa.groupby(["PatientId", "PatternName"])["ComplianceScore"].mean().reset_index()
+            wide = agg.pivot(index="PatientId", columns="PatternName", values="ComplianceScore")
+            wide = wide.reindex(columns=canonical_patterns, fill_value=0.0)
+            wide.columns = qa_cols
+
+        all_pids = self.context_df["PatientId"].unique()
+        wide = wide.reindex(all_pids, fill_value=0.0)
+        wide.index.name = "PatientId"
+        wide = wide.reset_index()
+
+        # Drop any pre-existing QA columns so re-running DataProcessor stays idempotent.
+        stale = [c for c in qa_cols if c in self.context_df.columns]
+        if stale:
+            self.context_df = self.context_df.drop(columns=stale)
+
+        self.context_df = self.context_df.merge(wide, on="PatientId", how="left")
+        for c in qa_cols:
+            self.context_df[c] = self.context_df[c].fillna(0.0)
+
+        print(
+            f"[DataProcessor] QA features added: {len(qa_cols)} columns, "
+            f"window=[0, {qa_history_hours:.1f}h], {len(qa)} qa rows in window."
+        )
+
 
     def _fit_scaler(self):
         """
@@ -304,6 +398,9 @@ class DataProcessor:
     def _normalize_time(self):
         """
         Normalizes time to be relative to the start of each visit. Also adds VisitID and VisitStart columns.
+        Caches the per-patient earliest StartDateTime on the instance so downstream
+        steps (e.g. _add_qa_features) can recover absolute admission timestamps
+        after _expand_tokens drops the raw datetime columns.
         """
         df = self.df.copy()
         df["IsAdmission"] = df["ConceptName"] == ADMISSION_TOKEN
@@ -312,6 +409,7 @@ class DataProcessor:
         df["VisitStart"] = df.groupby("VisitID")["StartDateTime"].transform('min')
         df["RelStartTime"] = (df["StartDateTime"] - df["VisitStart"]).dt.total_seconds() / 3600.0 # In hours
         df["RelEndTime"] = (df["EndDateTime"] - df["VisitStart"]).dt.total_seconds() / 3600.0 # In hours
+        self._patient_admission_time = df.groupby("PatientId")["StartDateTime"].min()
         self.df = df
 
 
@@ -831,10 +929,12 @@ class EMRDataset(Dataset):
             mapped = self.tokens_df[column].map(vocab)
             unknown = self.tokens_df.loc[mapped.isna(), column].unique()
             if len(unknown) > 0:
-                print(f"[Warning][EMRDataset] Unknown {label} values found (count={len(unknown)}):")
-                for tok in unknown[:10]:  # only print a sample
+                print(f"[Warning][EMRDataset] Unknown {label} values found (count={len(unknown)}) — mapping to [MASK]:")
+                for tok in unknown[:10]:
                     print(f"  - {tok}")
-                raise ValueError(f"[Dataset Error] Found unknown {label} entries. Tokenizer or parsing may be out of sync.")
+                # Map unknowns to [MASK] so they are treated as masked/unknown without crashing.
+                # This gracefully handles val-only concepts when the tokenizer was built from train only.
+                mapped = mapped.fillna(self.tokenizer.mask_token_id)
             return mapped.astype(int)
 
         # --- Map with validation ---
@@ -847,14 +947,36 @@ class EMRDataset(Dataset):
         )
 
         self.patient_ids = self.tokens_df['PatientId'].unique()
-        self.patient_groups = {pid: self.tokens_df[self.tokens_df['PatientId'] == pid] for pid in self.patient_ids}
+        # Group once via pandas groupby (O(N), uses pandas' internal C-level
+        # grouping) instead of the previous O(N²) dict-of-boolean-filters,
+        # which on the full 16.9M-row training split materialised 40k slice
+        # DataFrames and overran the 46.6 GB cgroup during torch.save.
+        self.patient_groups = dict(tuple(self.tokens_df.groupby("PatientId", sort=False)))
+
+    def __getstate__(self):
+        # patient_groups is a redundant view over tokens_df: pickling 40k slice
+        # DataFrames OOMs the cgroup during torch.save (api.py processed_datasets
+        # cache write). We persist only tokens_df + light attrs and rebuild
+        # patient_groups in __setstate__ via the same groupby used in __init__.
+        state = self.__dict__.copy()
+        state["patient_groups"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.patient_groups is None and self.tokens_df is not None:
+            self.patient_groups = dict(
+                tuple(self.tokens_df.groupby("PatientId", sort=False))
+            )
 
     def __encode_parent_list(self, parents: List[str]) -> List[int]:
         ids = []
         for p in parents:
             if p not in self.tokenizer.rawconcept2id:
-                raise ValueError(f"Raw parent concept '{p}' missing from tokenizer vocabulary.")
-            ids.append(self.tokenizer.rawconcept2id[p])
+                # Unknown raw concept — map to [MASK] id so it is ignored by the embedder.
+                ids.append(self.tokenizer.mask_token_id)
+            else:
+                ids.append(self.tokenizer.rawconcept2id[p])
         return ids
 
 
@@ -1121,14 +1243,32 @@ def get_dataloader(
     Build a DataLoader for an EMRDataset.
     If `oversample=True`, uses a WeightedRandomSampler to balance terminal outcomes.
     """
-    # Set sensible default for num_workers
+    # Set sensible default for num_workers.
+    # Capped at 2 (not 4): api.py builds three persistent dataloaders
+    # (transformer_train, phase3_train, val), each forking num_workers copies
+    # of the dataset. With cpu_count=8 the previous default was 4 → 12 fork
+    # children. Copy-on-write keeps them cheap in raw bytes, but Python
+    # refcounting touches every PyObject on every access, gradually breaking
+    # COW and tripping the 46.6 GB cgroup oom-killer mid-Phase-3 (observed
+    # at epoch 37 of the X-traj-length run). Two workers per loader ⇒ 6
+    # forks total, ~½ the COW pressure with a small throughput hit.
     if num_workers is None:
-        num_workers = min(os.cpu_count(), 4) if torch.cuda.is_available() else 0
+        num_workers = min(os.cpu_count(), 2) if torch.cuda.is_available() else 0
 
     # Keep workers alive across epochs to avoid Python 3.11 multiprocessing teardown
     # crashes (AssertionError: can only test a child process) and tqdm rendering errors
     # that fire when DataLoader iterators are garbage-collected between epochs.
     persistent = num_workers > 0
+
+    # Use fork (Linux default) with pin_memory disabled.
+    # pin_memory=True triggers CUDA init when the first DataLoader iterator is
+    # created (via the pin-memory thread), after which forked workers inherit
+    # broken PyTorch thread state and die silently. Keeping pin_memory=False
+    # avoids that init; fork workers survive and run cleanly. The parallel-
+    # loading gain far exceeds the non-pinned H2D transfer cost on this model.
+    # api.py has no __main__ guard so spawn and forkserver both fail.
+    pin_memory = False
+    dl_extra = {}
 
     # ---------- no oversampling ----------
     if not oversample:
@@ -1139,14 +1279,16 @@ def get_dataloader(
                               collate_fn=collate_fn,
                               num_workers=num_workers,
                               persistent_workers=persistent,
-                              pin_memory=torch.cuda.is_available())
+                              pin_memory=pin_memory,
+                              **dl_extra)
         return DataLoader(dataset,
                           batch_size=batch_size,
                           shuffle=True,
                           collate_fn=collate_fn,
                           num_workers=num_workers,
                           persistent_workers=persistent,
-                          pin_memory=torch.cuda.is_available())
+                          pin_memory=pin_memory,
+                          **dl_extra)
 
     # ---------- build sample weights ----------
     # Each patient weight = sum of (n_patients / outcome_count) for each outcome
@@ -1179,7 +1321,8 @@ def get_dataloader(
                           collate_fn=collate_fn,
                           num_workers=num_workers,
                           persistent_workers=persistent,
-                          pin_memory=torch.cuda.is_available())
+                          pin_memory=pin_memory,
+                          **dl_extra)
 
     sampler = WeightedRandomSampler(sample_w,
                                     num_samples=len(sample_w),
@@ -1191,4 +1334,5 @@ def get_dataloader(
                       collate_fn=collate_fn,
                       num_workers=num_workers,
                       persistent_workers=persistent,
-                      pin_memory=torch.cuda.is_available())
+                      pin_memory=pin_memory,
+                      **dl_extra)

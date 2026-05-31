@@ -2,212 +2,281 @@
 train.py
 =====================
 Three-phase transformer training pipeline:
-Phase-1 : train_embedder()        →  checkpoints/phase1/ckpt_best.pt
-Phase-2 : pretrain_transformer()  →  checkpoints/phase2/ckpt_best.pt
-Phase-3 : finetune_transformer()  →  checkpoints/phase3/ckpt_best.pt
 
-Responsibilities:
-  prepare_data()  — loads CSVs, runs DataProcessor, builds/loads tokenizer,
-                    performs stratified patient split, returns (train_ds, val_ds, tokenizer).
-  run_training()  — owns all DataLoader creation (one per phase with correct oversample
-                    settings), then calls phase_one / phase_two / phase_three in sequence.
+    Phase-1 : train_embedder()        →  checkpoints/phase1/ckpt_best.pt
+    Phase-2 : pretrain_transformer()  →  checkpoints/phase2/ckpt_best.pt
+    Phase-3 : finetune_transformer()  →  checkpoints/phase3/ckpt_best.pt
 
-Phase-2 uses oversample=True (WeightedRandomSampler) for balanced rare-outcome batches.
-Phase-3 uses oversample=False (natural distribution) so pos_weight in BCEWithLogitsLoss
-correctly compensates for class imbalance without double-counting.
+Contract:
+  • Three-way patient split: train / val / test. Test is held out for
+    evaluation.ipynb and NEVER seen during training or early-stop selection.
+  • DataProcessor fits the scaler on train and reuses it on val.
+  • Tokenizer is built once from train and cached at checkpoints/tokenizer.pt.
+  • Phase-2 uses oversample=True; Phase-1 and Phase-3 use natural distribution.
+  • Phase-1 embedder is reused across runs when (embed_dim, time2vec_dim,
+    ctx_dim) match the cached checkpoint.
 """
 import os
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import train_test_split
+import gc
+import shutil
 from pathlib import Path
 
-# ───────── local code ─────────────────────────────────────────────────── #
-from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr, get_dataloader
+import numpy as np
+import pandas as pd
+import torch
+from joblib import load as joblib_load
+from sklearn.model_selection import train_test_split
+
+from transform_emr.dataset import (
+    DataProcessor, EMRTokenizer, EMRDataset, collate_emr, get_dataloader,
+)
 from transform_emr.embedder import EMREmbedding, train_embedder
 from transform_emr.transformer import GPT, pretrain_transformer, finetune_transformer
-from transform_emr.utils import *
-from transform_emr.config.model_config import *
+from transform_emr.config.model_config import (
+    MODEL_CONFIG, TRAINING_SETTINGS,
+    CHECKPOINT_PATH, PHASE1_CHECKPOINT, PHASE2_CHECKPOINT, PHASE3_CHECKPOINT,
+)
 from transform_emr.config.dataset_config import (
-    TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE, TAK_REPO_PATH, OUTCOMES, OUTCOME_RARE_THRESHOLD_PCT
+    TRAIN_TEMPORAL_DATA_FILE, TRAIN_CTX_DATA_FILE, TAK_REPO_PATH,
 )
 
-def summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer):
+TOKENIZER_PATH = os.path.join(CHECKPOINT_PATH, "tokenizer.pt")
+TEST_SPLIT     = 0.15
+VAL_SPLIT      = 0.15
+RANDOM_SEED    = 42
+
+
+def summarize_split(train_ds, val_ds, n_train, n_val, n_test, tokenizer):
     """
-    Prints summary statistics about your train/val split:
-    - Patient counts
-    - Record counts
-    - Context shapes
-    - Event count per patient (min/max/avg)
-    - Token coverage (raw, concept, value, position)
+    Purpose: Print train/val/test sizes and tokenizer vocab stats.
+    Method: Aggregate counts from the EMRDataset.tokens_df + tokenizer dicts.
+
+    Args:
+        train_ds (EMRDataset): training split.
+        val_ds (EMRDataset): validation split.
+        n_train (int), n_val (int), n_test (int): patient counts.
+        tokenizer (EMRTokenizer): fitted tokenizer.
     """
+    print("Data Split Summary")
+    print(f"  - Train patients: {n_train}   ({len(train_ds.tokens_df):,} records)")
+    print(f"  - Val   patients: {n_val}    ({len(val_ds.tokens_df):,} records)")
+    print(f"  - Test  patients: {n_test}   (held out for evaluation.py)")
 
-    print("✅ Data Split Summary")
-    print(f"  - Train patients: {len(train_ids)}")
-    print(f"  - Val patients:   {len(val_ids)}")
+    train_counts = train_ds.tokens_df.groupby("PatientId").size()
+    print(f"\nTrain per-patient record count: "
+          f"min={train_counts.min()}, max={train_counts.max()}, "
+          f"mean={train_counts.mean():.1f}, median={train_counts.median()}")
 
-    print(f"  - Train records:  {len(train_ds.tokens_df):,}")
-    print(f"  - Val records:    {len(val_ds.tokens_df):,}")
-
-    # Per-patient record count stats
-    train_counts = train_ds.tokens_df.groupby('PatientID').size()
-    val_counts = val_ds.tokens_df.groupby('PatientID').size()
-
-    print(f"\n📊 Train patient records:")
-    print(f"  - Min:     {train_counts.min()}")
-    print(f"  - Max:     {train_counts.max()}")
-    print(f"  - Mean:    {train_counts.mean():.1f}")
-    print(f"  - Median:  {train_counts.median()}")
-
-    print(f"\n📊 Val patient records:")
-    print(f"  - Min:     {val_counts.min()}")
-    print(f"  - Max:     {val_counts.max()}")
-    print(f"  - Mean:    {val_counts.mean():.1f}")
-    print(f"  - Median:  {val_counts.median()}")
-
-    # Token vocab sizes (from tokenizer)
-    print(f"\n🧠 Vocabulary sizes:")
-    print(f"  - Raw concepts:     {len(tokenizer.rawconcept2id):,}")
-    print(f"  - Concepts:         {len(tokenizer.concept2id):,}")
-    print(f"  - Concept+Value:    {len(tokenizer.value2id):,}")
-    print(f"  - Full Tokens:      {len(tokenizer.token2id):,}")
+    print(f"\nVocabulary sizes:")
+    print(f"  - Raw concepts:   {len(tokenizer.rawconcept2id):,}")
+    print(f"  - Concepts:       {len(tokenizer.concept2id):,}")
+    print(f"  - Concept+Value:  {len(tokenizer.value2id):,}")
+    print(f"  - Full Tokens:    {len(tokenizer.token2id):,}")
 
 
-def prepare_data(sample=False):
-    print(f"[Pre-processing]: Reading dataset...")
-    temporal_df = pd.read_csv(TRAIN_TEMPORAL_DATA_FILE, low_memory=False)
-    ctx_df = pd.read_csv(TRAIN_CTX_DATA_FILE)
+def prepare_data(sample=None, batch_size=None):
+    """
+    Purpose: Load source CSVs, split patients three ways, run DataProcessor on
+             train/val (test stays raw for evaluation.py), build tokenizer.
+    Method: Mirrors api.load_data — train_test_split twice with the same seed
+            for reproducibility, fit scaler on train and apply to val.
 
-    # --- SAMPLE RANDOM PATIENTS ---
-    if sample:
-        unique_pids = temporal_df["PatientID"].unique()
-        rng = np.random.RandomState(42)  # for reproducibility
-        sampled_pids = rng.choice(unique_pids, size=sample, replace=False)
+    Args:
+        sample (int or None): optional patient subset for smoke tests.
+        batch_size (int): passed through to the dataloaders.
 
-        temporal_df = temporal_df[temporal_df["PatientID"].isin(sampled_pids)]
-        ctx_df      = ctx_df[ctx_df["PatientID"].isin(sampled_pids)]
+    Returns:
+        train_dl, oversampled_train_dl, val_dl : DataLoaders.
+        tokenizer (EMRTokenizer).
+        test_raw (tuple): (test_temporal_df, test_ctx_df) raw, unprocessed.
+    """
+    batch_size = batch_size or TRAINING_SETTINGS["batch_size"]
 
-    if os.path.exists(os.path.join(CHECKPOINT_PATH, 'tokenizer.pt')):
-        print(f"[Pre-processing]: Loading tokenizer from checkpoint...")
-        tokenizer = EMRTokenizer.load()
+    print("[Data]: Reading source CSVs...")
+    temporal_raw = pd.read_csv(TRAIN_TEMPORAL_DATA_FILE, low_memory=False)
+    ctx_raw      = pd.read_csv(TRAIN_CTX_DATA_FILE)
 
-        processor = DataProcessor(temporal_df, ctx_df, scaler=None, tak_repo_path=TAK_REPO_PATH)
-        temporal_df, ctx_df = processor.run()
+    if sample is not None:
+        pids = temporal_raw["PatientId"].unique()
+        rng  = np.random.RandomState(RANDOM_SEED)
+        chosen = rng.choice(pids, size=min(sample, len(pids)), replace=False)
+        temporal_raw = temporal_raw[temporal_raw["PatientId"].isin(chosen)]
+        ctx_raw      = ctx_raw[ctx_raw["PatientId"].isin(chosen)]
 
-    else:
-        print(f"[Pre-processing]: Building tokenizer...")
-        processor = DataProcessor(temporal_df, ctx_df, scaler=None, tak_repo_path=TAK_REPO_PATH)
-        temporal_df, ctx_df = processor.run()
-        tokenizer = EMRTokenizer.from_processed_df(temporal_df)
-        tokenizer.save()
-
-    print(f"[Pre-processing]: Building dataset...")
-    pids = temporal_df["PatientID"].unique()
-
-    # Stratified split: each patient's stratum = their rarest outcome by prevalence.
-    # Guarantees at least 1 representative of each kept outcome in both train and val.
-    patient_tokens = temporal_df.groupby("PatientID")["PositionToken"].apply(set)
-    strat_labels = []
-    for pid in pids:
-        patient_outcomes = [n for n in OUTCOMES if n in patient_tokens.get(pid, set())]
-        if patient_outcomes and tokenizer.outcome_patient_ratios:
-            rarest = min(patient_outcomes,
-                         key=lambda n: tokenizer.outcome_patient_ratios.get(n, 1.0))
-            strat_labels.append(rarest)
-        else:
-            strat_labels.append("__common__")
-    train_ids, val_ids = train_test_split(pids, test_size=0.2, random_state=42, stratify=strat_labels)
-
-    train_df  = temporal_df[temporal_df.PatientID.isin(train_ids)].copy()
-    val_df    = temporal_df[temporal_df.PatientID.isin(val_ids)].copy()
-    train_ctx = ctx_df.loc[ctx_df.index.isin(train_ids)]
-    val_ctx   = ctx_df.loc[ctx_df.index.isin(val_ids)]
-
-    train_ds = EMRDataset(train_df, train_ctx, tokenizer=tokenizer)
-    val_ds   = EMRDataset(val_df, val_ctx, tokenizer=tokenizer)
-
-    summarize_patient_data_split(train_ds, val_ds, train_ids, val_ids, tokenizer)
-
-    MODEL_CONFIG["ctx_dim"] = int(train_ds.context_df.shape[1])
-    print(f"[Pre-processing]: Auto-set MODEL_CONFIG['ctx_dim'] = {MODEL_CONFIG['ctx_dim']}")
-
-    return train_ds, val_ds, tokenizer
-
-def phase_one(embedder, train_dl, val_dl, resume=True):
-    return train_embedder(
-        embedder=embedder,
-        train_loader=train_dl,
-        val_loader=val_dl,
-        resume=resume,
-        checkpoint_path=PHASE1_CHECKPOINT,
-        training_settings=TRAINING_SETTINGS
+    # Three-way patient split (mirrors api.py / evaluation contract).
+    all_pids = temporal_raw["PatientId"].unique()
+    trainval_ids, test_ids = train_test_split(
+        all_pids, test_size=TEST_SPLIT, random_state=RANDOM_SEED
+    )
+    val_relative = VAL_SPLIT / (1.0 - TEST_SPLIT)
+    train_ids, val_ids = train_test_split(
+        trainval_ids, test_size=val_relative, random_state=RANDOM_SEED
     )
 
-def phase_two(model, train_dl, val_dl, resume=True):
-    return pretrain_transformer(
-                        model=model,
-                        train_dl=train_dl,
-                        val_dl=val_dl,
-                        resume=resume,
-                        checkpoint_path=PHASE2_CHECKPOINT,
-                        training_settings=TRAINING_SETTINGS
-                    )
+    train_temporal_raw = temporal_raw[temporal_raw["PatientId"].isin(train_ids)].copy()
+    train_ctx_raw      = ctx_raw[ctx_raw["PatientId"].isin(train_ids)].copy()
+    val_temporal_raw   = temporal_raw[temporal_raw["PatientId"].isin(val_ids)].copy()
+    val_ctx_raw        = ctx_raw[ctx_raw["PatientId"].isin(val_ids)].copy()
+    test_temporal_raw  = temporal_raw[temporal_raw["PatientId"].isin(test_ids)].copy()
+    test_ctx_raw       = ctx_raw[ctx_raw["PatientId"].isin(test_ids)].copy()
+
+    # Fit scaler on train, apply to val (test is processed at eval time).
+    os.makedirs(CHECKPOINT_PATH, exist_ok=True)
+    print("[Data]: Processing train split (fitting scaler)...")
+    train_processor = DataProcessor(
+        train_temporal_raw, train_ctx_raw,
+        scaler=None, tak_repo_path=TAK_REPO_PATH,
+        checkpoint_path=CHECKPOINT_PATH,
+    )
+    train_temporal_df, train_ctx_df = train_processor.run()
+
+    scaler = joblib_load(os.path.join(CHECKPOINT_PATH, "scaler.pkl"))
+    print("[Data]: Processing val split (applying fitted scaler)...")
+    val_processor = DataProcessor(
+        val_temporal_raw, val_ctx_raw,
+        scaler=scaler, tak_repo_path=TAK_REPO_PATH,
+        checkpoint_path=CHECKPOINT_PATH,
+    )
+    val_temporal_df, val_ctx_df = val_processor.run()
+
+    # Tokenizer cached by checkpoints/tokenizer.pt; rebuilt only on cold start.
+    tokenizer_path = Path(TOKENIZER_PATH)
+    tokenizer_path.parent.mkdir(parents=True, exist_ok=True)
+    if tokenizer_path.exists():
+        print("[Data]: Loading tokenizer from cache...")
+        tokenizer = EMRTokenizer.load(str(tokenizer_path))
+    else:
+        print("[Data]: Building tokenizer...")
+        tokenizer = EMRTokenizer.from_processed_df(train_temporal_df)
+        tokenizer.save(str(tokenizer_path))
+
+    train_ds = EMRDataset(train_temporal_df, train_ctx_df, tokenizer=tokenizer)
+    val_ds   = EMRDataset(val_temporal_df,   val_ctx_df,   tokenizer=tokenizer)
+    summarize_split(train_ds, val_ds, len(train_ids), len(val_ids), len(test_ids), tokenizer)
+
+    train_dl              = get_dataloader(train_ds, batch_size=batch_size,
+                                           collate_fn=collate_emr, oversample=False, bucket_batching=True)
+    oversampled_train_dl  = get_dataloader(train_ds, batch_size=batch_size,
+                                           collate_fn=collate_emr, oversample=True,  bucket_batching=True)
+    val_dl                = get_dataloader(val_ds,   batch_size=batch_size,
+                                           collate_fn=collate_emr, oversample=False, bucket_batching=True)
+
+    return train_dl, oversampled_train_dl, val_dl, tokenizer, (test_temporal_raw, test_ctx_raw)
 
 
-def phase_three(model, phase3_train_dl, val_dl, resume=True):
-    return finetune_transformer(
-        model=model,
-        train_dl=phase3_train_dl,
-        val_dl=val_dl,
-        resume=resume,
-        checkpoint_path=PHASE3_CHECKPOINT,
-        training_settings=TRAINING_SETTINGS,
+def _load_or_build_embedder(tokenizer):
+    """
+    Purpose: Reuse cached Phase-1 embedder when arch dims match; else build fresh.
+    Method:  Compares (embed_dim, time2vec_dim, ctx_dim) against the checkpoint's
+             saved config — same gate api.py uses.
+    """
+    key = (MODEL_CONFIG["embed_dim"], MODEL_CONFIG["time2vec_dim"], MODEL_CONFIG["ctx_dim"])
+    ckpt = Path(PHASE1_CHECKPOINT)
+    if ckpt.exists():
+        try:
+            cfg = torch.load(str(ckpt), map_location="cpu", weights_only=True)["config"]
+            if (cfg["embed_dim"], cfg["time2vec_dim"], cfg["ctx_dim"]) == key:
+                print("[Phase 1]: Config unchanged — loading cached embedder.")
+                embedder, *_ = EMREmbedding.load(str(ckpt), tokenizer=tokenizer)
+                return embedder, True
+        except Exception as e:
+            print(f"[Phase 1]: Cached embedder unusable ({e}); rebuilding.")
+    embedder = EMREmbedding(
+        tokenizer=tokenizer,
+        ctx_dim=MODEL_CONFIG["ctx_dim"],
+        time2vec_dim=MODEL_CONFIG["time2vec_dim"],
+        embed_dim=MODEL_CONFIG["embed_dim"],
+        dropout=MODEL_CONFIG["dropout"],
+    )
+    return embedder, False
+
+
+def run_training(reset_phase23=True):
+    """
+    Purpose: Run the full three-phase training pipeline.
+    Method:  Loads data, optionally clears Phase-2/3 checkpoints for a fresh run,
+             trains each phase via the same entry points api.py uses.
+
+    Args:
+        reset_phase23 (bool): when True (default), clears checkpoints/phase2 and
+            phase3 directories so each call retrains them from scratch. Phase-1
+            is always preserved when arch dims match (cheap to keep, expensive
+            to retrain).
+
+    Returns:
+        (embedder, model_p2, model_p3, test_raw): the trained components plus
+        the raw test split, ready to feed into evaluation.evaluate_on_test_set.
+    """
+    if reset_phase23:
+        for _phase in ("phase2", "phase3"):
+            p = Path(CHECKPOINT_PATH) / _phase
+            if p.exists():
+                shutil.rmtree(p)
+            p.mkdir(parents=True, exist_ok=True)
+    (Path(CHECKPOINT_PATH) / "phase1").mkdir(parents=True, exist_ok=True)
+
+    train_dl, oversampled_train_dl, val_dl, tokenizer, test_raw = prepare_data(
+        sample=TRAINING_SETTINGS.get("sample"),
+        batch_size=TRAINING_SETTINGS["batch_size"],
     )
 
-
-def _build_or_load_embedder(tokenizer):
-    ckpt_last = Path(PHASE1_CHECKPOINT).resolve().parent / "ckpt_last.pt"
-    if ckpt_last.exists():
-        embedder, *_ = EMREmbedding.load(ckpt_last, tokenizer=tokenizer)
-    else:
-        embedder = EMREmbedding(
-            tokenizer=tokenizer,
-            ctx_dim=MODEL_CONFIG.get("ctx_dim"),
-            time2vec_dim=MODEL_CONFIG.get("time2vec_dim"),
-            embed_dim=MODEL_CONFIG.get("embed_dim"),
-        )
-    return embedder
-
-
-def _build_or_load_transformer(embedder):
-    ckpt_last = Path(PHASE2_CHECKPOINT).resolve().parent / "ckpt_last.pt"
-    if ckpt_last.exists():
-        model, *_ = GPT.load(ckpt_last, embedder=embedder)
-    else:
-        model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
-    return model
-
-
-def run_training():
-    """Run the full three-phase training pipeline."""
-    train_ds, val_ds, tokenizer = prepare_data()
-
-    bs = TRAINING_SETTINGS["batch_size"]
-    train_dl    = get_dataloader(train_ds, batch_size=bs, collate_fn=collate_emr, oversample=False, bucket_batching=True)
-    oversampled_train_dl = get_dataloader(train_ds, batch_size=bs, collate_fn=collate_emr, oversample=True, bucket_batching=True)
-    val_dl               = get_dataloader(val_ds,   batch_size=bs, collate_fn=collate_emr, oversample=False, bucket_batching=True)
+    # Auto-detect ctx_dim from the first batch (handles QA features being on/off).
+    for batch in train_dl:
+        MODEL_CONFIG["ctx_dim"] = int(batch["context_vec"].shape[-1])
+        break
+    print(f"Model config: {MODEL_CONFIG}")
 
     # Phase 1 — embedder
-    embedder = _build_or_load_embedder(tokenizer)
-    embedder, _, _ = phase_one(embedder=embedder, train_dl=train_dl, val_dl=val_dl, resume=True)
+    embedder, reused = _load_or_build_embedder(tokenizer)
+    if not reused:
+        embedder, _, _ = train_embedder(
+            embedder          = embedder,
+            train_loader      = train_dl,
+            val_loader        = val_dl,
+            resume            = False,
+            checkpoint_path   = PHASE1_CHECKPOINT,
+            training_settings = TRAINING_SETTINGS,
+        )
 
-    # Phase 2 — transformer (oversampled batches for rare-outcome balance)
-    model = _build_or_load_transformer(embedder)
-    model, _, _ = phase_two(model=model, train_dl=oversampled_train_dl, val_dl=val_dl, resume=True)
+    # Phase 2 — backbone (oversampled batches for rare-outcome balance)
+    model_p2 = GPT(cfg=MODEL_CONFIG, embedder=embedder)
+    model_p2, _, _ = pretrain_transformer(
+        model             = model_p2,
+        train_dl          = oversampled_train_dl,
+        val_dl            = val_dl,
+        resume            = False,
+        checkpoint_path   = PHASE2_CHECKPOINT,
+        training_settings = TRAINING_SETTINGS,
+    )
 
-    # Phase 3 — outcome head (natural distribution; pos_weight handles class imbalance)
-    model, _, _ = phase_three(model=model, phase3_train_dl=train_dl, val_dl=val_dl, resume=True)
+    # Phase 3 — outcome head fine-tune (natural distribution; pos_weight handles imbalance).
+    # Load best Phase-2 checkpoint when present, else continue with in-memory model.
+    _p2_best = Path(PHASE2_CHECKPOINT)
+    _p2_last = _p2_best.parent / "ckpt_last.pt"
+    _p2_ckpt = _p2_best if _p2_best.exists() else (_p2_last if _p2_last.exists() else None)
+    if _p2_ckpt is not None:
+        model_p3, *_ = GPT.load(str(_p2_ckpt), embedder=embedder)
+    else:
+        model_p3 = model_p2
+
+    model_p3, _, _ = finetune_transformer(
+        model             = model_p3,
+        train_dl          = train_dl,
+        val_dl            = val_dl,
+        resume            = False,
+        checkpoint_path   = PHASE3_CHECKPOINT,
+        training_settings = TRAINING_SETTINGS,
+    )
+
+    return embedder, model_p2, model_p3, test_raw
 
 
 if __name__ == "__main__":
     run_training()
+    # Release training references; evaluation lives in evaluation.ipynb /
+    # evaluation.py and is intentionally run in a separate process so peak
+    # train-time RAM doesn't bleed into autoregressive generation.
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print("[Train] Done. Open evaluation.ipynb to score the held-out test split.")
