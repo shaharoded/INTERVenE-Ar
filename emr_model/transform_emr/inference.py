@@ -202,6 +202,13 @@ def generate(model,
         IsOutcome, IsTerminal, and (if collect_risk_scores=True) one P_<outcome>
         column per outcome in model.outcome_names.
     """
+    # Step 3 inference ablation (flag-gated): override the ttt-emit-gate strength /
+    # horizon to test whether stronger inference-side over-generation control helps
+    # this over-generating platform. Defaults preserve the recipe (bias 3.0, gate 48h),
+    # so QA / k-ablation evals are unchanged unless EMR_TTT_* are set.
+    ttt_emit_bias       = float(os.environ.get("EMR_TTT_BIAS",  ttt_emit_bias))
+    ttt_emit_gate_hours = float(os.environ.get("EMR_TTT_GATE",  ttt_emit_gate_hours))
+
     max_abs_ts_norm = float(max_duration_hours) / 336.0  # comparison threshold in normalised units
     autocast_dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
     device    = next(model.parameters()).device
