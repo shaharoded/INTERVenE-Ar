@@ -27,7 +27,7 @@ TRAINING_SETTINGS = {
     "phase1_n_epochs": 100,
     "phase2_n_epochs": 100,
     "phase3_n_epochs": 100,
-    "sample": None,  # P6 M-128 FULL-DATA sweep (57078 patients). Smoke: 50 + epochs 1. 10k probe: 10000.
+    "sample": None,  # Full QA run (USE_QA_DATA=True), M-128 seed42 patience15. QA smoke passed (ctx 7->16, +15 PATTERN tokens, gates A-D).
 
     # Phase-2 optimizer LR warmup (OneCycleLR pct_start).
     # This controls optimizer step size ramp-up, not auxiliary-loss lambda warmup.
