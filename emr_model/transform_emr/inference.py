@@ -1,4 +1,5 @@
 import json
+import os
 import torch
 import torch.nn.functional as F
 import pandas as pd
@@ -117,6 +118,37 @@ def _sample_tokens(next_logits, temperature, top_k):
         return topi[torch.arange(topi.shape[0], device=topi.device), idx]
     else:
         return torch.argmax(next_logits / temperature, dim=-1)   # [B]
+
+
+# ── F2: temperature-schedule decoding (inference-side ablation, flag-gated) ──────
+# Activated by env var EMR_DECODE_MODE=temp_sched (default "greedy" preserves the
+# immutable eval's argmax behaviour exactly, so QA / k-ablation evals are unchanged).
+# Motivation (roadmap F2): a hot→cool schedule lets the LM explore away from a
+# degenerate immediate-terminal local minimum early, then anneal to sharp decoding.
+# Schedule: linear anneal T_HI→T_LO over the first _F2_SCHED_STEPS decode steps,
+# then hold T_LO. Overridable via EMR_F2_THI / EMR_F2_TLO / EMR_F2_STEPS.
+def _f2_temperature(step):
+    t_hi    = float(os.environ.get("EMR_F2_THI",  "1.5"))
+    t_lo    = float(os.environ.get("EMR_F2_TLO",  "0.7"))
+    n_steps = float(os.environ.get("EMR_F2_STEPS", "30"))
+    frac = min(max(step / max(n_steps, 1.0), 0.0), 1.0)
+    return t_hi + (t_lo - t_hi) * frac
+
+
+def _sample_multinomial(next_logits, temperature):
+    """Temperature multinomial sampling over the full (legality-masked) logits.
+    Robust to rows that are all -inf (impossible legality state) — falls back to
+    argmax there, matching the greedy path's stuck-detection downstream."""
+    scaled = next_logits / max(float(temperature), 1e-6)
+    probs  = F.softmax(scaled, dim=-1)
+    bad    = (~torch.isfinite(probs).all(dim=-1)) | (probs.sum(dim=-1) <= 0)
+    safe   = probs.masked_fill(~torch.isfinite(probs), 0.0).clamp(min=0.0)
+    safe_sum = safe.sum(dim=-1, keepdim=True)
+    safe   = torch.where(safe_sum > 0, safe, torch.ones_like(safe))  # uniform if a row is all-zero
+    out    = torch.multinomial(safe, 1).squeeze(-1)
+    if bad.any():
+        out[bad] = torch.argmax(next_logits[bad], dim=-1)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -302,7 +334,12 @@ def generate(model,
                     next_logits[finished] = float("-inf")
                     next_logits[finished, pad_id] = 0.0
 
-                next_token_ids = _sample_tokens(next_logits, temperature, top_k)
+                # Decoding mode (flag-gated; default greedy = immutable-eval behaviour).
+                _decode_mode = os.environ.get("EMR_DECODE_MODE", "greedy").lower()
+                if _decode_mode == "temp_sched":
+                    next_token_ids = _sample_multinomial(next_logits, _f2_temperature(steps))
+                else:
+                    next_token_ids = _sample_tokens(next_logits, temperature, top_k)
 
                 open_counts, next_meal_rank = update_legality_state_batched(
                     luts, next_token_ids, open_counts, next_meal_rank, finished)
