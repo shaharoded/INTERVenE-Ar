@@ -414,6 +414,42 @@ calibration. Per standing orders this is a "different inference helps" trigger �
 retry is now a candidate after Step 4/4.5. NB: QA + k-ablation will run at *default* inference
 (3/48 greedy) for clean apples-to-apples; the ttt-gate gain applies orthogonally on top.
 
+### Step 4 — QA-data toggle (USE_QA_DATA=True) — QA HELPS (+0.038, biggest single win)
+
+**What:** M-128, seed 42, patience 15, `USE_QA_DATA=True` (keeps `%_PATTERN%` events →
+vocab 453→**472**; adds QA ComplianceScore context → ctx_dim 7→**16**). Smoke passed
+(gates A–D). Default greedy eval → clean QA-vs-non-QA at fixed seed/recipe. Commit `e27bab7`.
+Non-QA platform backed up at `checkpoints.bak_seed42_p15_nonQA`.
+
+**Headline vs non-QA seed-42 greedy baseline (0.847):**
+
+| metric | non-QA (s42 greedy) | **QA** | Δ |
+|---|---|---|---|
+| AUROC_w | 0.847 | **0.885** | **+0.038** |
+| AUPRC_w | 0.732 | 0.784 | +0.052 |
+| maxF1_w | 0.695 | 0.724 | +0.029 |
+| simple AUROC | 0.859 | 0.884 | +0.025 |
+
+Per-outcome AUROC: CARDIO 0.957, DISGLYCEMIA_Hyper 0.911, HYPEROSMOLALITY 0.884
+(**+0.083** — QA context helps this most), KIDNEY 0.882, DISGLYCEMIA_Hypo 0.873,
+DEATH **0.796** (best of the whole benchmark). phase3_val 1.543 (best of any run).
+
+**Pareto tension (again):** the QA model severely **under**-generates at default inference
+(gen_to_gt 0.241, `frac_terminal_first24h` 0.500 — half emit a terminal within 24h,
+gen_median 24h vs GT 100h), LoS MAE 84h. So QA buys discrimination at the cost of
+trajectory honesty — mirror image of the non-QA model's over-generation. NB: the ttt-gate
+fix that helped the over-gen non-QA model (stronger gate) would *worsen* QA; QA would want
+a *weaker* gate. (Not pursued yet — flagged.)
+
+**Per-aux trace:** P1 dt 1.830→0.724; P2 ce 1.362→0.0067 / ttt 21.2→0.084 / ranking unlock
+ep21; P3 outcome 2.173→1.349, pool 0.943→1e-7. All descend (T1✓), T2✓, T3✓ (all 0.796–0.957).
+
+**Verdict: QA HELPS — +0.038 AUROC_w, the largest single improvement in the benchmark**
+(and best DEATH discrimination). This is a "QA helps" trigger per standing orders → bigger-
+architecture retry is now a stronger candidate. Trajectory honesty regressed (under-gen) —
+a weaker ttt-gate is the natural inference-side counter (orthogonal, untested). Next: Step 4.5
+k-day context ablation (will run on this QA model — the current best — varying EVAL_INPUT_DAYS).
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
