@@ -499,6 +499,22 @@ This completes the planned Steps 3/4/4.5. Per-k logs: `run_k1..7.log`.
 recommended next experiment**. QA under-generates → a *weaker* ttt-gate is the untested
 inference counter. Then Step 5 (multi-seed confidence) + Step 6 (report).
 
+### M-256+QA — bigger-arch+QA retry: NO GAIN (winner = M-128+QA)
+
+**What:** M-256 (6.72M) + USE_QA_DATA=True, seed42 p15 — the QA-helps trigger's
+bigger-architecture test. Commit `885a431`.
+
+**Result: AUROC_w 0.878 = −0.007 vs M-128+QA (0.885)** — bigger arch does *not* help even
+with QA (within init noise ~0.06). AUPRC_w 0.782 (≈flat), maxF1_w 0.711. Per-outcome:
+DISGLYCEMIA_Hyper 0.921 (+0.010) but DEATH 0.725 (−0.071 vs M-128+QA) — net slightly lower.
+phase3_val **1.478 (lowest loss of ANY run)** yet not best AUROC → AUROC↔calibration
+divergence at the capacity axis, again. Under-generates like all QA models (gen_to_gt 0.333).
+
+**Decision: M-384+QA SKIPPED** (no upward trend; capacity doesn't help w/ or w/o QA).
+**WINNER = M-128+QA (1.75M params, AUROC_w 0.885)** — smallest model, best result.
+Final confidence step: bootstrap CIs on M-128+QA & M-256+QA (overlap ⇒ arch not significant)
++ report init variance from existing runs. No 3-seed retrain (per user).
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
