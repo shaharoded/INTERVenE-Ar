@@ -450,6 +450,55 @@ architecture retry is now a stronger candidate. Trajectory honesty regressed (un
 a weaker ttt-gate is the natural inference-side counter (orthogonal, untested). Next: Step 4.5
 k-day context ablation (will run on this QA model — the current best — varying EVAL_INPUT_DAYS).
 
+### Step 4.5 — k-day context ablation (eval-only, QA model) — k=2 optimal, more context does NOT help
+
+**What:** Vary the generation-seed length k ∈ {1…7} days on the QA model (seed-42 p15,
+current best) via the scoped `EVAL_INPUT_DAYS` edit (reverted to 2 after; git clean).
+Tests "does more patient-history context improve prediction?"
+
+| k (days) | AUROC_w | AUPRC_w | maxF1_w | gen_to_gt |
+|---|---|---|---|---|
+| 1 | 0.846 | 0.738 | 0.680 | 0.297 |
+| **2** | **0.885** | 0.784 | **0.724** | 0.241 |
+| 3 | 0.876 | **0.789** | 0.721 | 0.211 |
+| 4 | 0.861 | 0.784 | 0.707 | 0.197 |
+| 5 | 0.841 | 0.777 | 0.694 | 0.191 |
+| 6 | 0.826 | 0.771 | 0.686 | 0.194 |
+| 7 | 0.814 | 0.767 | 0.685 | 0.194 |
+
+**Finding: more context does NOT help.** AUROC_w peaks at **k=2** (the default), k=1 is
+slightly worse (too little context), and k≥3 declines monotonically (k=7: 0.814). AUPRC_w
+is flat-ish k2–4 (peak k3 0.789) then declines.
+
+**Honest caveat — the metric conflates two effects.** The peak-detector scores outcome
+probs over the *generated post-cutoff* trajectory, so a larger seed leaves **less future to
+predict**, and this QA model **under-generates** (gen_to_gt falls 0.30→0.19 as k grows) →
+fewer generated positions → mechanically lower AUROC. So the decline is dominated by the
+shrinking prediction window, not necessarily worse context use. Bottom line either way:
+**no k beats the k=2 default**, so this ablation does **not** trigger a bigger-architecture
+retry. (Only QA does.)
+
+**Verdict: K-ABLATION — k=2 optimal; "more context helps" is FALSE under this eval.**
+This completes the planned Steps 3/4/4.5. Per-k logs: `run_k1..7.log`.
+
+---
+
+## Benchmark synthesis (end of Steps 1–4.5)
+
+**Best model so far:** M-128 (1.75M params) + **QA data** at seed-42/patience-15 →
+**AUROC_w 0.885, AUPRC_w 0.784, maxF1_w 0.724**, all 6 outcomes 0.796–0.957.
+
+**What moved the needle (clean, within-seed where noted):**
+- **QA data: +0.038 AUROC** (biggest single win; best DEATH 0.796, HYPEROSMOLALITY +0.083).
+- **ttt-gate inference (non-QA): +0.016** AUROC + calibration (gen_to_gt 1.91→1.05) — free.
+- **patience 5→15: +0.023** (at fixed seed; over-trains generation though).
+- Architecture (M-128→256→384): within single-seed noise (~0.06 ≫ sweep spread 0.015).
+- Inference temperature schedule: −0.150 (greedy optimal). k>2 context: no gain.
+
+**Open triggers / next:** QA helped → **bigger-architecture-with-QA retry is the
+recommended next experiment**. QA under-generates → a *weaker* ttt-gate is the untested
+inference counter. Then Step 5 (multi-seed confidence) + Step 6 (report).
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
