@@ -16,8 +16,8 @@ SEED = 42
 
 MODEL_CONFIG = {
       "time2vec_dim": 32,
-      "embed_dim": 128,   # WINNER M-128 (head_dim=64, n_head=2) — SEEDED @ patience 15 = inference/QA platform
-      "n_head": 2,
+      "embed_dim": 256,   # M-256 + QA (head_dim=64, n_head=4) — bigger-arch-with-QA retry (QA-helps trigger)
+      "n_head": 4,
       "n_layer": 4,
       "dropout": 0.1,
       "bias": True,
