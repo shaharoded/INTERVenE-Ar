@@ -16,8 +16,8 @@ SEED = 42
 
 MODEL_CONFIG = {
       "time2vec_dim": 32,
-      "embed_dim": 256,   # M-256 + QA (head_dim=64, n_head=4) — bigger-arch-with-QA retry (QA-helps trigger)
-      "n_head": 4,
+      "embed_dim": 128,   # WINNER: M-128 + QA (head_dim=64, n_head=2). Best model: AUROC_w 0.885 [0.881,0.889].
+      "n_head": 2,
       "n_layer": 4,
       "dropout": 0.1,
       "bias": True,

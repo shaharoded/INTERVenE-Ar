@@ -45,3 +45,8 @@ emr_model/data/source/
 uv.lock
 PLAN_TOMORROW.md
 PROPOSAL_*.md
+
+# Checkpoints (large binaries; runtime + backups, never committed)
+emr_model/checkpoints/
+emr_model/checkpoints.bak_*/
+k_ablation_summary.txt

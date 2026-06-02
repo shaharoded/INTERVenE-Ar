@@ -515,6 +515,25 @@ divergence at the capacity axis, again. Under-generates like all QA models (gen_
 Final confidence step: bootstrap CIs on M-128+QA & M-256+QA (overlap ⇒ arch not significant)
 + report init variance from existing runs. No 3-seed retrain (per user).
 
+### Step 5 — Confidence (bootstrap CIs + init variance; 3-seed retrain SKIPPED per user)
+
+Bootstrap 95% CIs (2000 patient-resamples, no retraining; point estimates validated
+against reported headlines):
+
+| model | AUROC_w [95% CI] | AUPRC_w [95% CI] |
+|---|---|---|
+| **M-128+QA (winner)** | **0.885 [0.881, 0.889]** | 0.784 [0.776, 0.792] |
+| M-256+QA | 0.878 [0.874, 0.882] | 0.782 [——] |
+
+**Two-part confidence picture:** test-set bootstrap CIs are tight (±~0.004), but the
+**init/training variance ≈ 0.024 std** (empirical, from the four existing full-data M-128
+runs: 0.883/0.872/0.847/0.824) is ~6× larger and dominates. So the M-128+QA vs M-256+QA
+gap (0.007) is **within init noise → architectures statistically indistinguishable across
+seeds**. This is the clean confidence story without a 30h 3-seed retrain.
+
+**FINAL REPORT written to `FINAL_REPORT.md`.** Repo config set to the winner (M-128+QA,
+seed 42, patience 15) so `python api.py` reproduces the best model. **Benchmark complete.**
+
 ## Reproducibility
 
 - Branch `autoresearch-trajectory`.
