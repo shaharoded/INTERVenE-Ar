@@ -61,7 +61,7 @@ Headline keys in `api.py` summary block:
 - `peak_mae_hrs\t…` rows
 - Trajectory honesty: `gen_to_gt_ratio_median`, `gen_frac_terminal_first24h`, etc.
 
-**Do not touch `api.py` or `evaluation.py`.** Agent edits `emr_model/transform_emr/**` and config only.
+**Do not touch `api.py` or `evaluation.py`.** Agent edits `intervene_ar/**` and config only.
 
 ## Roadmap — what's left
 
@@ -122,7 +122,7 @@ Headline keys in `api.py` summary block:
    raw_aux, final raw_aux, Δ%). Flag |Δ| < 5 % as "not learning."
 8. Journal commit + push.
 9. DISCARD → git revert --no-edit <CODE_SHA> && git push.
-10. KEEP → cp -r emr_model/checkpoints emr_model/checkpoints.bak_keep_<tag>.
+10. KEEP → cp -r checkpoints checkpoints.bak_keep_<tag>.
     Run ablation that strips the new change → confirms gain attribution.
 11. After each KEEP, re-eval running best at 10k (`--eval-only`) to refresh.
 12. FULL-DATA CONFIRM (sample=None) once a milestone (smoke→headline→P6 winner) is reached.
@@ -163,7 +163,7 @@ From the iteration loop, abridged (full details in prior commits):
 
 - Branch `autoresearch-trajectory`; no force-push to `main`.
 - Ledger: `results/results-trajectory-fix.tsv`. Benchmarking rows append; iteration-loop rows preserved.
-- Canonical baseline: `emr_model/checkpoints.bak_originals/` (read-only).
-- Running-best backups: `emr_model/checkpoints.bak_keep_<tag>/`.
+- Canonical baseline: `checkpoints.bak_originals/` (read-only).
+- Running-best backups: `checkpoints.bak_keep_<tag>/`.
 - Iteration-loop history lives in prior git commits (not on disk).
 - Benchmarking journal: `status.md` (fresh, agent appends `### <tag>` blocks here).

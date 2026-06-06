@@ -22,7 +22,7 @@ backbone with `lr_factor=0.01`.
 ## Outcome configuration
 
 Head-targeted outcomes are set in
-`emr_model/transform_emr/config/dataset_config.py`:
+`intervene_ar/config/dataset_config.py`:
 
 - 7 complications (in `OUTCOMES`) (but in data only 5 will pass the min. support threshold)
 - 2 terminals (in `TERMINAL_OUTCOMES`): DEATH, RELEASE
@@ -538,6 +538,6 @@ seed 42, patience 15) so `python api.py` reproduces the best model. **Benchmark 
 
 - Branch `autoresearch-trajectory`.
 - Ledger: `results/results-trajectory-fix.tsv` (iteration-loop rows preserved; benchmarking rows appended).
-- Canonical baseline: `emr_model/checkpoints.bak_originals/` (read-only).
-- Running-best backups: `emr_model/checkpoints.bak_keep_<tag>/`.
+- Canonical baseline: `checkpoints.bak_originals/` (read-only).
+- Running-best backups: `checkpoints.bak_keep_<tag>/`.
 - Iteration-loop history: prior git commits (not on disk).

@@ -1,6 +1,6 @@
 # EMR Event-Prediction Transformer — Benchmarking Final Report
 
-Dataset: `emr_model/data/source/` — 57,078 patients / 16.8M temporal events.
+Dataset: `data/source/` — 57,078 patients / 16.8M temporal events.
 Split (seeded, fixed): 39,954 train / 8,562 val / 8,562 held-out test.
 Evaluation: per-patient peak-detector on the held-out test set (immutable `evaluation.py`).
 6 evaluated outcomes (5 complications + DEATH; KETOACIDOSIS & ACIDOSIS auto-filtered

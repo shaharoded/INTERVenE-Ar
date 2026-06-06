@@ -12,18 +12,18 @@ The checkpoint dir must contain phase1/, phase3/, processed_datasets.pt, scaler.
 exactly matching evaluation.py's generate() call).
 """
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "emr_model"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 import torch
 from pathlib import Path
 from joblib import load as joblib_load
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-from transform_emr.dataset import DataProcessor, EMRDataset
-from transform_emr.embedder import EMREmbedding
-from transform_emr.transformer import GPT
-from transform_emr.inference import generate
-from transform_emr.config.dataset_config import TAK_REPO_PATH
+from intervene_ar.dataset import DataProcessor, EMRDataset
+from intervene_ar.embedder import EMREmbedding
+from intervene_ar.transformer import InterveneGPT
+from intervene_ar.inference import generate
+from intervene_ar.config.dataset_config import TAK_REPO_PATH
 import evaluation as ev
 
 ckpt_dir = sys.argv[1].rstrip("/")
@@ -43,7 +43,7 @@ scaler = joblib_load(os.path.join(ckpt_dir, "scaler.pkl"))
 print(f"[boot] vocab={len(tokenizer.token2id)} | test patients (raw)={test_temporal_raw['PatientId'].nunique()}")
 
 embedder, *_ = EMREmbedding.load(_pick("phase1", "embedder"), tokenizer=tokenizer)
-model, *_    = GPT.load(_pick("phase3", "model"), embedder=embedder)
+model, *_    = InterveneGPT.load(_pick("phase3", "model"), embedder=embedder)
 model.eval()
 
 # Replicate evaluate_on_test_set's data prep (full = GT, truncated = seed).

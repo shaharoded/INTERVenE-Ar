@@ -17,7 +17,8 @@ evaluate_on_test_set receives full test_raw and processes it fresh — correct.
 import sys, os
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(PROJECT_ROOT, "emr_model"))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import torch
 import numpy as np
@@ -26,11 +27,11 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split
 from joblib import load as joblib_load
 
-from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset
-from transform_emr.config.dataset_config import TAK_REPO_PATH, USE_QA_DATA
+from intervene_ar.dataset import DataProcessor, EMRTokenizer, EMRDataset
+from intervene_ar.config.dataset_config import TAK_REPO_PATH, USE_QA_DATA
 
-CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "emr_model", "checkpoints")
-DATA_DIR       = os.path.join(PROJECT_ROOT, "emr_model", "data", "source")
+CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
+DATA_DIR       = os.path.join(PROJECT_ROOT, "data", "source")
 TEST_SPLIT     = 0.15
 VAL_SPLIT      = 0.15
 RANDOM_SEED    = 42

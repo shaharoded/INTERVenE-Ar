@@ -24,22 +24,15 @@ results.tsv
 progress.png
 .claude/
 
-# Final-results folder is committed (the published artefact). Add an explicit
-# negation so the standalone `results.tsv` rule above does not exclude the
-# named files under results/.
-!results/
-!results/*.tsv
-# But: per-run audit dumps from api.py / eval_only stay local-only. The grep
-# block in run.log is the canonical record; results/ holds only the curated
-# KEEP/DISCARD ledger TSVs.
-results/per_outcome_*.tsv
-results/multi_horizon_*.tsv
+# Ignore results directories
+results/
+
 
 # Model checkpoints (large, rebuilt each experiment)
-emr_model/checkpoints/
+checkpoints/
 
 # Raw data (large source files)
-emr_model/data/source/
+data/source/
 
 # uv lock file (regenerate with: uv lock)
 uv.lock
@@ -47,6 +40,6 @@ PLAN_TOMORROW.md
 PROPOSAL_*.md
 
 # Checkpoints (large binaries; runtime + backups, never committed)
-emr_model/checkpoints/
-emr_model/checkpoints.bak_*/
+checkpoints/
+checkpoints.bak_*/
 k_ablation_summary.txt

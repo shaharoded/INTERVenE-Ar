@@ -5,7 +5,7 @@ complication-prediction model, adapted from Karpathy's
 [autoresearcher](https://github.com/karpathy/autoresearch) framework.
 
 An AI agent drives a Karpathy-style autonomous loop: edit
-`emr_model/transform_emr/`, train, evaluate on a held-out test split, KEEP or
+`intervene_ar/`, train, evaluate on a held-out test split, KEEP or
 DISCARD per the rules in `program.md`, log to `results/*.tsv`, repeat.
 
 Final best model on MIMIC-IV: **M-256** — AUROC 0.915, AUPRC 0.630, onset MAE
@@ -24,13 +24,13 @@ analysis.ipynb               plots the journey + the size comparison
 results/
   results-architecture optimization.tsv   full per-experiment ledger
   results-hyperparameters sweep.tsv       final architecture grid (M-256 family)
-emr_model/
-  transform_emr/
+
+  intervene_ar/
     config/
       model_config.py        MODEL_CONFIG + TRAINING_SETTINGS (agent edits this)
       dataset_config.py      paths, tokens, USE_QA_DATA flag
     embedder.py              Phase-1 EMREmbedding
-    transformer.py           Phase-2/3 GPT + finetune
+    transformer.py           Phase-2/3 InterveneGPT + finetune
     dataset.py               DataProcessor, EMRTokenizer, dataloaders
     loss.py / schedulers.py / utils.py / inference.py / diagnose.py
   data/source/               temporal_data.csv + context_data.csv (gitignored)
@@ -38,7 +38,7 @@ emr_model/
 ```
 
 `api.py` and `evaluation.py` are the fixed contract. The agent only edits
-`model_config.py` (primary) and architecture files under `emr_model/transform_emr/`.
+`model_config.py` (primary) and architecture files under `intervene_ar/`.
 
 ---
 
@@ -47,7 +47,7 @@ emr_model/
 - **Phase 1 — `EMREmbedding`** — hierarchical token embeddings (raw → concept →
   concept+value → position), Time2Vec for inter-event time, static patient
   context. Loss: teacher-forced BCE + Δt MSE.
-- **Phase 2 — `GPT`** — causal decoder over Phase-1 embeddings with AdaLN-Zero
+- **Phase 2 — `InterveneGPT`** — causal decoder over Phase-1 embeddings with AdaLN-Zero
   and temporal RoPE. Curriculum: soft-kernel BCE → next-token CE + Δt → pairwise
   ranking on the outcome head.
 - **Phase 3 — outcome-head fine-tune** — backbone differential LR; outcome BCE
@@ -64,10 +64,10 @@ AUPRC / onset-MAE on the held-out 15 % test split (split by `PatientId`, seed=42
 
 ```bash
 pip install -e .
-# Place CSVs at emr_model/data/source/{temporal_data,context_data}.csv
+# Place CSVs at data/source/{temporal_data,context_data}.csv
 
 # Smoke test (50 patients, 1 epoch per phase, ~1 min on CPU)
-# In emr_model/transform_emr/config/model_config.py set sample=50 and phase{1,2,3}_n_epochs=1
+# In intervene_ar/config/model_config.py set sample=50 and phase{1,2,3}_n_epochs=1
 python api.py > smoke.log 2>&1
 grep "^outcome_auroc:\|^---" smoke.log
 
@@ -77,7 +77,7 @@ grep "^outcome_auroc:\|^outcome_auprc:\|^onset_mae_hrs:\|^peak_vram_mb:" run.log
 ```
 
 Outputs go to a final summary block after `---`. The pre-trained final
-model is in `emr_model/checkpoints/`; `api.py` will load and reuse it
+model is in `checkpoints/`; `api.py` will load and reuse it
 when the embedder config matches.
 
 ---
@@ -113,8 +113,8 @@ chmod -R a+rwX /workspace/autoresearch
 **SCP the data files (from local PowerShell):**
 
 ```powershell
-scp -P <PORT> -i ~/.ssh/id_ed25519 emr_model\data\source\temporal_data.csv root@<HOST>:/workspace/autoresearch/emr_model/data/source/
-scp -P <PORT> -i ~/.ssh/id_ed25519 emr_model\data\source\context_data.csv  root@<HOST>:/workspace/autoresearch/emr_model/data/source/
+scp -P <PORT> -i ~/.ssh/id_ed25519 data\source\temporal_data.csv root@<HOST>:/workspace/autoresearch/data/source/
+scp -P <PORT> -i ~/.ssh/id_ed25519 data\source\context_data.csv  root@<HOST>:/workspace/autoresearch/data/source/
 ```
 
 **Start the agent (each session):**
@@ -144,7 +144,7 @@ git pull --ff-only
 ```
 
 **Before stopping the pod:** push the branch from the pod so nothing is lost on
-container disk. SCP off `emr_model/checkpoints/` if you want to keep the trained
+container disk. SCP off `checkpoints/` if you want to keep the trained
 weights (gitignored, too large for git).
 
 ---

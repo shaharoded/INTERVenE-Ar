@@ -28,9 +28,9 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
-# Tell setuptools the only Python package is emr_model — its auto-discovery
+# Tell setuptools the only Python package is intervene_ar — its auto-discovery
 # otherwise picks up sibling folders (e.g. results/, archive/) and refuses to
 # install because it sees multiple flat-layout top-level packages.
 [tool.setuptools.packages.find]
-include = ["emr_model*"]
+include = ["intervene_ar*"]
 exclude = ["results*", "archive*", "best_weights*", "checkpoints*"]

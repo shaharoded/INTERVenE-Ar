@@ -33,14 +33,13 @@ from pathlib import Path
 from joblib import load as joblib_load
 from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
 
-PROJECT_ROOT  = os.path.dirname(os.path.abspath(__file__))
-EMR_MODEL_DIR = os.path.join(PROJECT_ROOT, "emr_model")
-if EMR_MODEL_DIR not in sys.path:
-    sys.path.insert(0, EMR_MODEL_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from transform_emr.dataset import DataProcessor, EMRDataset
-from transform_emr.config.dataset_config import TAK_REPO_PATH, OUTCOME_RARE_THRESHOLD_PCT
-from transform_emr.inference import generate
+from intervene_ar.dataset import DataProcessor, EMRDataset
+from intervene_ar.config.dataset_config import TAK_REPO_PATH, OUTCOME_RARE_THRESHOLD_PCT
+from intervene_ar.inference import generate
 
 # ---------------------------------------------------------------------------
 # Fixed evaluation constants (do not change)
@@ -694,7 +693,7 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
             risk curves and computes episode-level AUROC/AUPRC and onset-time MAE.
 
     Args:
-        model: Trained GPT model (best available checkpoint, already loaded).
+        model: Trained InterveneGPT model (best available checkpoint, already loaded).
         tokenizer (EMRTokenizer): Fitted tokenizer (same as used during training).
         val_temporal_raw (pd.DataFrame): Raw (unprocessed) val temporal events.
         val_ctx_raw (pd.DataFrame): Raw (unprocessed) val context features.

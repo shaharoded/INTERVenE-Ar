@@ -3,13 +3,13 @@ api.py — EMR Autoresearch immutable contract.
 
 DO NOT MODIFY this file. It defines the fixed training pipeline and evaluation
 metrics. To experiment with model architecture or hyperparameters, edit files
-under emr_model/transform_emr/ (and its config/ sub-package).
+under intervene_ar/ (and its config/ sub-package).
 
 Usage:
     python api.py
     python api.py > run.log 2>&1   (redirect all output to log)
 
-The agent reads program.md for context, edits transform_emr/ files, then runs
+The agent reads program.md for context, edits intervene_ar/ files, then runs
 this script to train and evaluate. The summary block (after the "---" separator)
 is the ground-truth result for each run.
 
@@ -68,16 +68,15 @@ os.environ["TQDM_DISABLE"] = "1"
 # Reduce CUDA memory fragmentation (helps on larger models during backward)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-PROJECT_ROOT  = os.path.dirname(os.path.abspath(__file__))
-EMR_MODEL_DIR = os.path.join(PROJECT_ROOT, "emr_model")
-if EMR_MODEL_DIR not in sys.path:
-    sys.path.insert(0, EMR_MODEL_DIR)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from transform_emr.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr, get_dataloader
-from transform_emr.config.dataset_config import TAK_REPO_PATH, USE_QA_DATA
-from transform_emr.config.model_config import MODEL_CONFIG, TRAINING_SETTINGS
-from transform_emr.embedder import EMREmbedding, train_embedder
-from transform_emr.transformer import GPT, pretrain_transformer, finetune_transformer
+from intervene_ar.dataset import DataProcessor, EMRTokenizer, EMRDataset, collate_emr, get_dataloader
+from intervene_ar.config.dataset_config import TAK_REPO_PATH, USE_QA_DATA
+from intervene_ar.config.model_config import MODEL_CONFIG, TRAINING_SETTINGS
+from intervene_ar.embedder import EMREmbedding, train_embedder
+from intervene_ar.transformer import InterveneGPT, pretrain_transformer, finetune_transformer
 
 from evaluation import evaluate_on_test_set
 
@@ -85,11 +84,11 @@ from evaluation import evaluate_on_test_set
 # Fixed paths — do not modify
 # ===========================================================================
 
-DATA_DIR               = os.path.join(EMR_MODEL_DIR, "data", "source")
+DATA_DIR               = os.path.join(PROJECT_ROOT, "data", "source")
 TEMPORAL_DATA_FILE     = os.path.join(DATA_DIR, "temporal_data.csv")
 CONTEXT_DATA_FILE      = os.path.join(DATA_DIR, "context_data.csv")
 
-CHECKPOINT_DIR         = os.path.join(EMR_MODEL_DIR, "checkpoints")
+CHECKPOINT_DIR         = os.path.join(PROJECT_ROOT, "checkpoints")
 EMBEDDER_CHECKPOINT    = os.path.join(CHECKPOINT_DIR, "phase1", "ckpt_best.pt")
 TRANSFORMER_CHECKPOINT = os.path.join(CHECKPOINT_DIR, "phase2", "ckpt_best.pt")
 PHASE3_CHECKPOINT      = os.path.join(CHECKPOINT_DIR, "phase3", "ckpt_best.pt")
@@ -121,7 +120,7 @@ def load_data(sample=None, batch_size=64):
 
     Returns:
         embedder_train_dl (DataLoader): Natural-distribution loader for Phase-1 embedder.
-        transformer_train_dl (DataLoader): Oversampled loader for Phase-2 GPT pretraining.
+        transformer_train_dl (DataLoader): Oversampled loader for Phase-2 InterveneGPT pretraining.
         phase3_train_dl (DataLoader): Natural-distribution loader for Phase-3 fine-tuning.
         val_dl (DataLoader): Natural-distribution validation loader (early-stop monitor).
         tokenizer (EMRTokenizer): Fitted vocabulary.
@@ -370,9 +369,9 @@ if not EVAL_ONLY:
         )
 
     # -----------------------------------------------------------------------
-    # Phase 2 — Pretrain GPT transformer over learned embeddings
+    # Phase 2 — Pretrain InterveneGPT transformer over learned embeddings
     # -----------------------------------------------------------------------
-    model = GPT(cfg=MODEL_CONFIG, embedder=embedder)
+    model = InterveneGPT(cfg=MODEL_CONFIG, embedder=embedder)
     model, _, val_losses = pretrain_transformer(
         model             = model,
         train_dl          = transformer_train_dl,
@@ -390,7 +389,7 @@ if not EVAL_ONLY:
     _p2_ckpt = _p2_best if _p2_best.exists() else (_p2_last if _p2_last.exists() else None)
 
     if _p2_ckpt is not None:
-        model_p3, *_ = GPT.load(str(_p2_ckpt), embedder=embedder)
+        model_p3, *_ = InterveneGPT.load(str(_p2_ckpt), embedder=embedder)
     else:
         model_p3 = model
 
@@ -452,9 +451,9 @@ _p3_path = Path(PHASE3_CHECKPOINT)
 _p2_path = Path(TRANSFORMER_CHECKPOINT)
 
 if _p3_path.exists():
-    best_model, *_ = GPT.load(str(_p3_path), embedder=embedder)
+    best_model, *_ = InterveneGPT.load(str(_p3_path), embedder=embedder)
 elif _p2_path.exists():
-    best_model, *_ = GPT.load(str(_p2_path), embedder=embedder)
+    best_model, *_ = InterveneGPT.load(str(_p2_path), embedder=embedder)
 else:
     best_model = model_p3
 
