@@ -9,7 +9,7 @@ This repo is part of an unpublished thesis and will be finalized post-submission
 The results shown here (in `evaluation.ipynb`) are on random data, as my research dataset is private. This model will be used on actual EMR data, stored in a closed environment. For that, it is organized as a package that can be installed:
 
 ```bash
-transform-emr/
+root/
 │
 ├── intervene_ar/                     # Core Python package
 │   ├── config/                        # Configuration modules
