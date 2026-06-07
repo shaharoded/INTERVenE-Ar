@@ -4,6 +4,8 @@
 
 This repository implements a three-phase deep learning pipeline for modeling longitudinal Electronic Medical Records (EMRs). The architecture combines temporal embeddings, patient context, and Transformer-based sequence modeling to predict or impute patient events over time, and to read complication-risk curves from a dedicated outcome head.
 
+> **Branches.** `main` carries the canonical research codebase used in the thesis. `autoresearcher-updates` carries an adaptation of [Karpathy's autoresearch methodology](https://github.com/karpathy/autoresearch) — an agent-friendly `api.py` contract plus a custom research skill specialised for this architecture — used to drive autonomous hyperparameter/architecture sweeps against the same model surface.
+
 <img src="images\Model Sceme.png" width="100%">
 
 This repo is part of an unpublished thesis and will be finalized post-submission. **Please do not reuse without permission**.
