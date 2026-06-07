@@ -685,18 +685,18 @@ def weighted_mean_auc(auc_table, by="n_pos"):
 # Main evaluation entry point (called by api.py)
 # ---------------------------------------------------------------------------
 
-def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler, checkpoint_dir):
+def evaluate_on_test_set(model, tokenizer, test_temporal_raw, test_ctx_raw, scaler, checkpoint_dir):
     """
-    Purpose: Full post-training evaluation on the held-out validation set.
-    Method: Re-processes the raw val data twice — once untruncated (for ground truth) and
+    Purpose: Full post-training evaluation on the held-out test set.
+    Method: Re-processes the raw test data twice — once untruncated (for ground truth) and
             once with EVAL_INPUT_DAYS truncation (for generation seed) — then generates
             risk curves and computes episode-level AUROC/AUPRC and onset-time MAE.
 
     Args:
         model: Trained InterveneGPT model (best available checkpoint, already loaded).
         tokenizer (EMRTokenizer): Fitted tokenizer (same as used during training).
-        val_temporal_raw (pd.DataFrame): Raw (unprocessed) val temporal events.
-        val_ctx_raw (pd.DataFrame): Raw (unprocessed) val context features.
+        test_temporal_raw (pd.DataFrame): Raw (unprocessed) test temporal events.
+        test_ctx_raw (pd.DataFrame): Raw (unprocessed) test context features.
         scaler: Fitted StandardScaler from training (loaded from checkpoints/scaler.pkl).
         checkpoint_dir (str): Path to checkpoints directory.
 
@@ -709,9 +709,9 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
             mae_table (pd.DataFrame): per-outcome MAE/n_patients table
     """
     # -- Full dataset (untruncated, for ground truth extraction) --
-    print("[Eval] Processing full val sequences (ground truth)...")
+    print("[Eval] Processing full test sequences (ground truth)...")
     full_proc = DataProcessor(
-        val_temporal_raw.copy(), val_ctx_raw.copy(),
+        test_temporal_raw.copy(), test_ctx_raw.copy(),
         scaler=scaler,
         tak_repo_path=TAK_REPO_PATH,
         checkpoint_path=checkpoint_dir,
@@ -720,9 +720,9 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
     eval_ds_full = EMRDataset(full_temporal_df, full_ctx_df, tokenizer=tokenizer)
 
     # -- Truncated dataset (EVAL_INPUT_DAYS seed for generation) --
-    print(f"[Eval] Processing truncated val sequences ({EVAL_INPUT_DAYS}-day input)...")
+    print(f"[Eval] Processing truncated test sequences ({EVAL_INPUT_DAYS}-day input)...")
     trunc_proc = DataProcessor(
-        val_temporal_raw.copy(), val_ctx_raw.copy(),
+        test_temporal_raw.copy(), test_ctx_raw.copy(),
         scaler=scaler,
         tak_repo_path=TAK_REPO_PATH,
         checkpoint_path=checkpoint_dir,
@@ -850,4 +850,188 @@ def evaluate_on_test_set(model, tokenizer, val_temporal_raw, val_ctx_raw, scaler
         mae_table=mae_table,
         gen_stats=gen_stats,
         multi_horizon_table=multi_horizon_table,
+        # Raw per-step generation output + ground-truth episodes — consumed by
+        # bootstrap_evaluate() and by any downstream caller that wants to recompute
+        # custom metrics without re-running generate().
+        risk_df=risk_df,
+        gt_episodes=gt_episodes,
+        gt_first=gt_first,
     )
+
+
+# ===========================================================================
+# Bootstrap variance for a trained checkpoint
+# ===========================================================================
+
+def bootstrap_evaluate(model, tokenizer, test_temporal_raw, test_ctx_raw,
+                       scaler, checkpoint_dir, B=2000, seed=42):
+    """
+    Purpose: Patient-level bootstrap CIs for the locked test-set headline.
+    Method:  Run `evaluate_on_test_set` ONCE to get the per-step risk_df + GT,
+             collapse to per-(patient, outcome) peak scores, then resample
+             held-out test patients with replacement (B reps) to produce 95%
+             percentile CIs for the support-weighted AUROC / AUPRC headline,
+             per-outcome AUROC/AUPRC, and length-of-stay MAE. Single model,
+             single generation pass — far cheaper than re-seeding the full
+             pipeline.
+
+    Args:
+        model              : Trained InterveneGPT (best available checkpoint).
+        tokenizer          : EMRTokenizer matching the training vocab.
+        test_temporal_raw  : held-out test split temporal DataFrame.
+        test_ctx_raw       : held-out test split context DataFrame.
+        scaler             : fitted scaler (joblib-loaded).
+        checkpoint_dir (str): for evaluate_on_test_set's DataProcessor path.
+        B (int)            : number of bootstrap resamples (default 2000).
+        seed (int)         : RNG seed for reproducibility.
+
+    Returns:
+        dict: evaluate_on_test_set's output extended with *_ci_lo / *_ci_hi /
+        *_boot_mean / *_boot_sd entries and a per_outcome_ci DataFrame. Also
+        prints a grep-friendly bootstrap summary block to stdout.
+    """
+    import time
+
+    res = evaluate_on_test_set(
+        model=model, tokenizer=tokenizer,
+        test_temporal_raw=test_temporal_raw, test_ctx_raw=test_ctx_raw,
+        scaler=scaler, checkpoint_dir=checkpoint_dir,
+    )
+    risk_df       = res["risk_df"]
+    gt_episodes   = res["gt_episodes"]
+    outcome_names = [n for n in model.outcome_names if n not in AUC_EXCLUDE]
+
+    # Per-patient max score per outcome — pool the generated (non-input) rows
+    # only; mirrors per_patient_max_auc's peak-detector framing.
+    gen_df   = risk_df[risk_df["IsInput"] == 0]
+    all_pids = list(risk_df["PatientId"].unique())
+    N        = len(all_pids)
+    p_cols   = [f"P_{n}" for n in outcome_names]
+
+    maxpp = {pid: {c: 0.0 for c in p_cols} for pid in all_pids}
+    if len(gen_df):
+        g = gen_df.groupby("PatientId")[p_cols].max()
+        for pid, row in g.iterrows():
+            for c in p_cols:
+                maxpp[pid][c] = float(row[c])
+
+    cols = {}
+    for name in outcome_names:
+        scores = np.array([maxpp[p][f"P_{name}"] for p in all_pids])
+        labels = np.array(
+            [int(len(gt_episodes.get(p, {}).get(name, [])) > 0) for p in all_pids],
+            dtype=np.int64,
+        )
+        cols[name] = (scores, labels)
+
+    min_pos = _min_positives(N)
+
+    def _weighted_stat(idx):
+        aurocs, auprcs, weights = [], [], []
+        for nm, (sc, lb) in cols.items():
+            s, l = sc[idx], lb[idx]
+            n_pos = int(l.sum()); n_neg = len(l) - n_pos
+            if n_pos < min_pos or n_neg < min_pos:
+                continue
+            aurocs.append(roc_auc_score(l, s))
+            auprcs.append(average_precision_score(l, s))
+            weights.append(n_pos)
+        if not weights:
+            return np.nan, np.nan
+        w = np.array(weights, float); w /= w.sum()
+        return float((np.array(aurocs) * w).sum()), float((np.array(auprcs) * w).sum())
+
+    per_out = {name: {"auroc": [], "auprc": []} for name in cols}
+    boot_auroc, boot_auprc = [], []
+    rng = np.random.RandomState(seed)
+    t0  = time.time()
+    for _ in range(B):
+        idx = rng.randint(0, N, size=N)
+        a, p = _weighted_stat(idx)
+        if not (np.isnan(a) or np.isnan(p)):
+            boot_auroc.append(a); boot_auprc.append(p)
+        for nm, (sc, lb) in cols.items():
+            s, l = sc[idx], lb[idx]
+            n_pos = int(l.sum()); n_neg = len(l) - n_pos
+            if n_pos < min_pos or n_neg < min_pos:
+                continue
+            per_out[nm]["auroc"].append(roc_auc_score(l, s))
+            per_out[nm]["auprc"].append(average_precision_score(l, s))
+    print(f"[boot] {B} resamples in {time.time()-t0:.1f}s")
+
+    # Length-of-stay bootstrap. Decoder LoS = trajectory-length (last TimePoint)
+    # vs first GT RELEASE — matches length_of_stay_mae() upstream. RELEASE-only
+    # cohort; patients without GT release are excluded.
+    los_pairs = []
+    for pid, sub in risk_df.groupby("PatientId"):
+        gt_releases = gt_episodes.get(pid, {}).get("RELEASE_EVENT", [])
+        if not gt_releases:
+            continue
+        pred_los = float(sub["TimePoint"].max())
+        gt_los   = float(min(gt_releases))
+        los_pairs.append(abs(pred_los - gt_los))
+    los_arr = np.asarray(los_pairs)
+
+    boot_los = []
+    rng2 = np.random.RandomState(seed + 1)
+    if los_arr.size:
+        nL = los_arr.size
+        for _ in range(B):
+            boot_los.append(los_arr[rng2.randint(0, nL, size=nL)].mean())
+
+    def _ci(arr):
+        a = np.asarray(arr)
+        return np.percentile(a, 2.5), np.percentile(a, 97.5), a.mean(), a.std()
+
+    point_auroc = res["patient_auroc_weighted"]
+    point_auprc = res["patient_auprc_weighted"]
+    print(f"\n=== BOOTSTRAP 95pct CI (patient resample, B={B}) ===")
+    print(f"[boot] point estimate: AUROC_w={point_auroc:.4f}  "
+          f"AUPRC_w={point_auprc:.4f}  N_test={N}")
+
+    out = dict(res)
+    for label, point, arr in [
+        ("patient_auroc_weighted", point_auroc, boot_auroc),
+        ("patient_auprc_weighted", point_auprc, boot_auprc),
+    ]:
+        if not arr:
+            print(f"{label}: (insufficient successful resamples)")
+            continue
+        lo, hi, mean, sd = _ci(arr)
+        out[f"{label}_ci_lo"]     = float(lo)
+        out[f"{label}_ci_hi"]     = float(hi)
+        out[f"{label}_boot_mean"] = float(mean)
+        out[f"{label}_boot_sd"]   = float(sd)
+        print(f"{label}: point={point:.4f}  boot_mean={mean:.4f}  "
+              f"95%CI=[{lo:.4f}, {hi:.4f}]  sd={sd:.4f}")
+
+    if boot_los:
+        lo, hi, mean, sd = _ci(boot_los)
+        out["length_of_stay_mae_hours_ci_lo"]     = float(lo)
+        out["length_of_stay_mae_hours_ci_hi"]     = float(hi)
+        out["length_of_stay_mae_hours_boot_mean"] = float(mean)
+        out["length_of_stay_mae_hours_boot_sd"]   = float(sd)
+        print(f"length_of_stay_mae_hours (RELEASE-only, n={los_arr.size}): "
+              f"point={res['length_of_stay_mae_hours']:.4f}  "
+              f"boot_mean={mean:.4f}  95%CI=[{lo:.4f}, {hi:.4f}]  sd={sd:.4f}")
+
+    print("\n--- per-outcome 95% CI ---")
+    print(f"{'outcome':<34}{'AUROC [95% CI]':<30}{'AUPRC [95% CI]'}")
+    per_out_rows = []
+    for name in cols:
+        ar, pr = per_out[name]["auroc"], per_out[name]["auprc"]
+        if not ar:
+            print(f"{name:<34}(insufficient positives in resamples)")
+            per_out_rows.append({"outcome": name,
+                                 "auroc_mean": np.nan, "auroc_lo": np.nan, "auroc_hi": np.nan,
+                                 "auprc_mean": np.nan, "auprc_lo": np.nan, "auprc_hi": np.nan})
+            continue
+        alo, ahi, am, _ = _ci(ar); plo, phi, pm, _ = _ci(pr)
+        per_out_rows.append({"outcome": name,
+                             "auroc_mean": float(am), "auroc_lo": float(alo), "auroc_hi": float(ahi),
+                             "auprc_mean": float(pm), "auprc_lo": float(plo), "auprc_hi": float(phi)})
+        print(f"{name:<34}{am:.3f} [{alo:.3f},{ahi:.3f}]      "
+              f"{pm:.3f} [{plo:.3f},{phi:.3f}]")
+    out["per_outcome_ci"] = pd.DataFrame(per_out_rows).set_index("outcome")
+    print("\n[boot] done.")
+    return out

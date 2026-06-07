@@ -67,13 +67,21 @@ pip install -e .
 # Place CSVs at data/source/{temporal_data,context_data}.csv
 
 # Smoke test (50 patients, 1 epoch per phase, ~1 min on CPU)
-# In intervene_ar/config/model_config.py set sample=50 and phase{1,2,3}_n_epochs=1
-python api.py > smoke.log 2>&1
+python api.py --smoke > smoke.log 2>&1
 grep "^outcome_auroc:\|^---" smoke.log
 
-# Full run (default config; restore sample=None and original epoch counts)
+# Full run (default config)
 python api.py > run.log 2>&1
 grep "^outcome_auroc:\|^outcome_auprc:\|^onset_mae_hrs:\|^peak_vram_mb:" run.log
+
+# Pre-warm the processed-data cache (load+split+tokenize once, then exit)
+python api.py --build-cache
+
+# Patient-bootstrap 95% CIs on the locked Phase-3 checkpoint
+python api.py --bootstrap 2000 > boot.log 2>&1
+
+# Post-training diagnostics
+python api.py --diagnose > diag.log 2>&1
 ```
 
 Outputs go to a final summary block after `---`. The pre-trained final

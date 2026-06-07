@@ -103,8 +103,9 @@ Headline keys in `api.py` summary block:
 ```
 1. Read program.md. Check git log + last rows of results/results-trajectory-fix.tsv.
 2. Propose ONE change with a falsifiable hypothesis.
-3. SMOKE (sample=50, phase{1,2,3}_n_epochs=1):
-     python api.py > smoke.log 2>&1
+3. SMOKE (sample=50, phase{1,2,3}_n_epochs=1; the `--smoke` flag patches
+   these settings in-place, no config edit needed):
+     python api.py --smoke > smoke.log 2>&1
    Gate-A: no NaN/inf in any tr_* loss term.
    Gate-B: every aux's raw magnitude within ~1–2 OOM of BCE.
    Gate-C: calibrated λ in [1e-3, 10].

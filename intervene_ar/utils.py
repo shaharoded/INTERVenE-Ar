@@ -6,6 +6,7 @@ General util functions for the package
 """
 import sys
 import os
+import tempfile
 import datetime
 import functools
 import inspect
@@ -75,9 +76,9 @@ def _ensure_tee_active():
     global _active_tee
     if _active_tee is not None:
         return
-    # Tee log goes to /tmp (local fs) — the workspace mfs has intermittent OSError [Errno 5]
-    # that crashes training mid-run. stdout redirect to /tmp/run.log already captures everything.
-    log_path = "/tmp/training.log"
+    # Tee log goes to the system temp dir (local fs) — the workspace mfs has intermittent
+    # OSError [Errno 5] that crashes training mid-run. stdout redirect already captures everything.
+    log_path = os.path.join(tempfile.gettempdir(), "training.log")
     _active_tee = _TeeStream(log_path, sys.stdout)
     sys.stdout = _active_tee
     print(f"[Logger] Logging to: {log_path}")

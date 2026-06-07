@@ -98,6 +98,6 @@ gen_to_gt 0.24 — a weaker ttt-gate is the natural inference-side counter, unte
 - Branch `autoresearch-trajectory`. Ledger: `results/results-trajectory-fix.tsv`.
 - Winner config is the repo default (`python api.py` → M-128+QA, seed 42, patience 15).
 - Backups: `checkpoints.bak_M128_QA_s42` (winner), `checkpoints.bak_seed42_p15_nonQA`.
-- Bootstrap CIs: `python bootstrap_ci.py <checkpoint_dir>`.
+- Bootstrap CIs: `python api.py --bootstrap 2000`.
 - `evaluation.py` / `api.py` never modified (except the user-scoped, reverted
   `EVAL_INPUT_DAYS` edit for the k-ablation).

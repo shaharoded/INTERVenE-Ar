@@ -1,13 +1,34 @@
 """
-api.py — EMR Autoresearch immutable contract.
+api.py — EMR Autoresearch immutable training/eval contract (AR-trajectory edition).
 
-DO NOT MODIFY this file. It defines the fixed training pipeline and evaluation
-metrics. To experiment with model architecture or hyperparameters, edit files
-under intervene_ar/ (and its config/ sub-package).
+The default invocation (`python api.py`) is the immutable training+eval
+pipeline. The DO NOT MODIFY rule applies to that path: the per-run summary
+block printed after the "---" separator is the ground-truth result for every
+ledger row. To experiment with model architecture or hyperparameters, edit
+files under intervene_ar/ (and its config/ sub-package).
+
+Five additional CLI modes wrap utility flows on top of the same data
+pipeline (none of them affect a default training run):
+    --smoke              quick gate: sample=50, 1 epoch per phase
+    --build-cache        run load_data() and exit — pre-warms processed_datasets.pt
+                         so subsequent training starts with zero data overhead
+    --diagnose           skip training; run diagnose.run_diagnostics
+    --bootstrap [B]      skip training; B-resample patient bootstrap CIs
+    --eval-only          internal: re-launched by the trainer as a clean
+                         subprocess so eval gets a fresh RAM slate (decoder
+                         autoregressive generation needs the memory budget)
+
+Note: the default training run already builds + persists the cache the first
+time it runs; --build-cache is purely a "pre-warm without spending epochs"
+convenience for fresh pods or data-pipeline sanity checks.
 
 Usage:
     python api.py
     python api.py > run.log 2>&1   (redirect all output to log)
+    python api.py --smoke > results/logs/smoke.log 2>&1
+    python api.py --build-cache
+    python api.py --diagnose > results/logs/diag.log 2>&1
+    python api.py --bootstrap 2000 > results/logs/boot.log 2>&1
 
 The agent reads program.md for context, edits intervene_ar/ files, then runs
 this script to train and evaluate. The summary block (after the "---" separator)
@@ -45,18 +66,6 @@ from joblib import load as joblib_load
 from sklearn.model_selection import train_test_split
 import torch
 
-# ----------------------------------------------------------------------------
-# Mode flag: training + eval run in SEPARATE PROCESSES so cumulative training
-# RAM cannot kill the eval step (the pattern that crashed L-384 / XL-512 in
-# the architecture sweep — autoregressive generation needs a clean memory
-# slate). When invoked normally, this script trains all three phases, saves a
-# small train_summary.json, frees memory, and subprocess.run()s itself with
-# `--eval-only`. The eval subprocess loads the saved checkpoints + summary
-# and prints the final summary block; its stdout/stderr inherit through to
-# the parent's run.log redirection so the user sees one continuous log.
-# ----------------------------------------------------------------------------
-EVAL_ONLY = "--eval-only" in sys.argv
-
 # Force UTF-8 stdout/stderr so Windows cp1252 doesn't choke on Δ, etc. in training logs
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -78,7 +87,49 @@ from intervene_ar.config.model_config import MODEL_CONFIG, TRAINING_SETTINGS
 from intervene_ar.embedder import EMREmbedding, train_embedder
 from intervene_ar.transformer import InterveneGPT, pretrain_transformer, finetune_transformer
 
-from evaluation import evaluate_on_test_set
+from evaluation import evaluate_on_test_set, bootstrap_evaluate
+
+# ===========================================================================
+# CLI dispatcher
+#
+# --eval-only is internal: the trainer re-launches the script with this flag
+# as a separate process so cumulative training RAM cannot kill the eval step
+# (the pattern that crashed L-384 / XL-512 in the architecture sweep —
+# autoregressive generation needs a clean memory slate). The training parent
+# trains all three phases, persists a small train_summary.json, frees memory,
+# and subprocess.run()s itself with `--eval-only`. The eval subprocess loads
+# the saved checkpoints + summary and prints the final summary block; its
+# stdout/stderr inherit through to the parent's run.log redirection so the
+# user sees one continuous log.
+#
+# --build-cache / --diagnose / --bootstrap are user-facing utility flows that
+# short-circuit before the training loop runs.
+# ===========================================================================
+_CLI = None
+if __name__ == "__main__":
+    import argparse
+    _p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
+    _p.add_argument("--smoke", action="store_true",
+                    help="quick gate: sample=50, 1 epoch per phase")
+    _p.add_argument("--build-cache", dest="build_cache", action="store_true",
+                    help="run load_data() and exit — pre-warms processed_datasets.pt")
+    _p.add_argument("--diagnose", action="store_true",
+                    help="skip training; run diagnose.run_diagnostics on the cached Phase-3 checkpoint")
+    _p.add_argument("--bootstrap", type=int, nargs="?", const=2000, default=None, metavar="B",
+                    help="skip training; B patient-resample bootstrap CIs on the cached checkpoint (default 2000)")
+    _p.add_argument("--eval-only", dest="eval_only", action="store_true",
+                    help="internal: load cached Phase-3 ckpt and run final evaluation only")
+    _p.add_argument("--sample", type=int, default=None,
+                    help="override TRAINING_SETTINGS['sample'] (for --diagnose / --bootstrap on sampled splits)")
+    _CLI = _p.parse_args()
+    if _CLI.smoke:
+        TRAINING_SETTINGS.update({
+            "sample": 50, "phase1_n_epochs": 1,
+            "phase2_n_epochs": 1, "phase3_n_epochs": 1,
+        })
+        print(f"[smoke] settings patched: sample=50, all phases 1 epoch")
+
+EVAL_ONLY = bool(_CLI and _CLI.eval_only)
 
 # ===========================================================================
 # Fixed paths — do not modify
@@ -251,6 +302,73 @@ def load_data(sample=None, batch_size=64):
 
 TRAIN_SUMMARY_PATH = os.path.join(CHECKPOINT_DIR, "train_summary.json")
 
+# ===========================================================================
+# --build-cache early dispatch (run load_data() once and exit; the natural
+# processed_datasets.pt is created as a side-effect for subsequent runs).
+# ===========================================================================
+if _CLI is not None and _CLI.build_cache:
+    _sample = _CLI.sample if _CLI.sample is not None else TRAINING_SETTINGS.get("sample")
+    print(f"[build-cache] sample={_sample}")
+    _embedder_dl, _trans_dl, _p3_dl, _val_dl, _tokenizer, _test_raw = load_data(
+        sample=_sample, batch_size=TRAINING_SETTINGS["batch_size"],
+    )
+    _ntrain = len(_embedder_dl.dataset) if hasattr(_embedder_dl, "dataset") else "?"
+    _nval   = len(_val_dl.dataset)      if hasattr(_val_dl, "dataset")      else "?"
+    print(f"[build-cache] done — {_ntrain} train / {_nval} val patients "
+          f"(cache at {PROCESSED_CACHE}).")
+    sys.exit(0)
+
+# ===========================================================================
+# --diagnose early dispatch (skip training; delegate to the diagnose module
+# which loads its own data + checkpoints).
+# ===========================================================================
+if _CLI is not None and _CLI.diagnose:
+    from intervene_ar.diagnose import run_diagnostics
+    _sample = _CLI.sample if _CLI.sample is not None else 2000
+    print(f"[diag] sample={_sample} batch_size={TRAINING_SETTINGS['batch_size']}")
+    run_diagnostics(sample=_sample, batch_size=TRAINING_SETTINGS["batch_size"])
+    print("[diag] done.")
+    sys.exit(0)
+
+# ===========================================================================
+# --bootstrap early dispatch (skip training; load the cached Phase-3
+# checkpoint and run bootstrap_evaluate on the held-out test split).
+# ===========================================================================
+if _CLI is not None and _CLI.bootstrap is not None:
+    _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _sample = _CLI.sample if _CLI.sample is not None else TRAINING_SETTINGS.get("sample")
+    print(f"[boot] sample={_sample} device={_device} B={_CLI.bootstrap}")
+
+    _embedder_dl, _trans_dl, _p3_dl, _val_dl, _tokenizer, _test_raw = load_data(
+        sample=_sample, batch_size=TRAINING_SETTINGS["batch_size"],
+    )
+    for _batch in _val_dl:
+        MODEL_CONFIG["ctx_dim"] = _batch["context_vec"].shape[-1]
+        break
+
+    _p3_best = Path(PHASE3_CHECKPOINT)
+    _p3_last = _p3_best.parent / "ckpt_last.pt"
+    _ckpt = _p3_best if _p3_best.exists() else (_p3_last if _p3_last.exists() else None)
+    if _ckpt is None:
+        print(f"[boot][error] no Phase-3 checkpoint at {PHASE3_CHECKPOINT}; train first.")
+        sys.exit(1)
+
+    _embedder, *_ = EMREmbedding.load(EMBEDDER_CHECKPOINT, tokenizer=_tokenizer)
+    _embedder.to(_device)
+    _model, *_ = InterveneGPT.load(str(_ckpt), embedder=_embedder)
+    _model.to(_device)
+    print(f"[boot] loaded model from {_ckpt}")
+
+    _scaler = joblib_load(os.path.join(CHECKPOINT_DIR, "scaler.pkl"))
+    _test_temporal_raw, _test_ctx_raw = _test_raw
+    bootstrap_evaluate(
+        model=_model, tokenizer=_tokenizer,
+        test_temporal_raw=_test_temporal_raw, test_ctx_raw=_test_ctx_raw,
+        scaler=_scaler, checkpoint_dir=CHECKPOINT_DIR,
+        B=int(_CLI.bootstrap), seed=RANDOM_SEED,
+    )
+    sys.exit(0)
+
 t_start = time.time()
 device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}  |  EVAL_ONLY={EVAL_ONLY}")
@@ -352,6 +470,14 @@ if not EVAL_ONLY:
             print(f"[Phase 1]: Could not load cached embedder ({e}), retraining.")
 
     if not _embedder_reused:
+        # Wipe stale phase1 checkpoints before retraining so a short run that
+        # never beats the warmup gate cannot leave an old ckpt_best.pt with a
+        # different embed_dim behind — eval-only reloads from disk and would
+        # otherwise assertion-fail with a dim mismatch against the new P2/P3 cfg.
+        _p1_dir = Path(EMBEDDER_CHECKPOINT).parent
+        if _p1_dir.exists():
+            shutil.rmtree(_p1_dir)
+        _p1_dir.mkdir(parents=True, exist_ok=True)
         embedder = EMREmbedding(
             tokenizer    = tokenizer,
             ctx_dim      = MODEL_CONFIG["ctx_dim"],
@@ -458,15 +584,14 @@ else:
     best_model = model_p3
 
 # Final evaluation runs on the held-out TEST split — never seen during training
-# or early-stop selection. evaluate_on_test_set still names its kwargs val_* for
-# backwards compat; we are passing the test split into them.
+# or early-stop selection.
 test_temporal_raw, test_ctx_raw = test_raw
 scaler = joblib_load(os.path.join(CHECKPOINT_DIR, "scaler.pkl"))
 eval_results = evaluate_on_test_set(
     model=best_model,
     tokenizer=tokenizer,
-    val_temporal_raw=test_temporal_raw,
-    val_ctx_raw=test_ctx_raw,
+    test_temporal_raw=test_temporal_raw,
+    test_ctx_raw=test_ctx_raw,
     scaler=scaler,
     checkpoint_dir=CHECKPOINT_DIR,
 )
