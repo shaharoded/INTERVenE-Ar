@@ -43,3 +43,7 @@ PROPOSAL_*.md
 checkpoints/
 checkpoints.bak_*/
 k_ablation_summary.txt
+# Saved best-of-sweep weights — future home is a separate weights repo / LFS.
+# Two ckpts briefly landed in history (c615660, removed by 5793057); this rule
+# prevents accidental re-adds.
+best_weights/
