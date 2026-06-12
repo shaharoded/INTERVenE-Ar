@@ -220,7 +220,7 @@ def load_data(sample=None, batch_size=64):
 
     # Three-way split by PatientId: train / val (early stop) / test (held-out for final eval).
     # Two-stage split with the same seed keeps the test set stable across re-runs.
-    all_pids = temporal_raw["PatientId"].unique()
+    all_pids = np.sort(temporal_raw["PatientId"].unique())  # sorted for reproducibility across CSV row order
     trainval_ids, test_ids = train_test_split(
         all_pids, test_size=TEST_SPLIT, random_state=RANDOM_SEED
     )
