@@ -645,6 +645,161 @@ def run_diagnostics(sample: int = 2000, batch_size: int = 32) -> None:
     print("\n[Diag] Done.")
 
 
+def probe_onset_time_predictions(model,
+                                 val_ds,
+                                 outcome_names=None,
+                                 sample_size: int = 64,
+                                 max_duration_hours: float = 336.0,
+                                 max_len: int = 2000,
+                                 seed: int = 42,
+                                 std_warn_hours: float = 2.0) -> dict:
+    """
+    Purpose: Verify that per-outcome onset-time predictions from the generated
+             trajectory are non-trivial — i.e., not collapsed to a single
+             value, and better than the constant-GT-median baseline that
+             ``evaluation.time_accuracy`` uses to compute peak-MAE.
+    Method:  Generate trajectories for a random ``sample_size`` slice of
+             ``val_ds.patient_ids``, locate the argmax-probability TimePoint
+             per outcome per patient (same operation as
+             ``evaluation.time_accuracy``), and compute:
+               * the spread of predicted onset times across patients
+                 (mean / std / percentiles) — catches collapse to one time;
+               * model MAE on positives (patients where the outcome occurs
+                 within the GT trajectory), plus a constant-GT-median baseline
+                 and ``lift = baseline − model``. Same sign convention as
+                 ``evaluation.py``.
+    Flags:
+        * ``pred_std < std_warn_hours`` ⇒ near-constant predicted onset time.
+        * ``lift ≤ 0`` ⇒ argmax peak is no better than predicting the median
+          GT time.
+
+    Args:
+        model: trained InterveneGPT with task heads attached.
+        val_ds: validation EMRDataset (untruncated patient sequences — used
+                for both generation seeds and ground-truth onset extraction).
+        outcome_names: list of outcome names to evaluate. Defaults to
+                       ``model.outcome_names``.
+        sample_size: how many patients to subsample for generation. Keep small
+                     (default 64) since generation is autoregressive.
+        max_duration_hours / max_len: passed through to ``inference.generate``.
+        seed: RNG seed for patient subsampling.
+        std_warn_hours: collapse threshold on predicted onset-time std.
+
+    Returns:
+        ``{outcome_name: {n_pos, pred_mean, pred_std, pred_percentiles,
+                          model_mae, baseline_mae, lift}}``.
+    """
+    import copy
+    from intervene_ar.inference import generate as ar_generate
+    # Re-use the canonical eval helpers so this probe stays in lock-step with
+    # the deployed peak-MAE / GT-extraction logic.
+    from evaluation import extract_ground_truth, time_accuracy
+
+    outcome_names = list(outcome_names or model.outcome_names)
+
+    if len(val_ds.patient_ids) == 0:
+        print("[probe_onset_time_predictions] val_ds has no patients — skipping.")
+        return {}
+
+    rng = np.random.default_rng(seed)
+    n = min(sample_size, len(val_ds.patient_ids))
+    chosen = rng.choice(val_ds.patient_ids, size=n, replace=False)
+
+    # Shallow copy so we can restrict patient_ids without mutating the caller's
+    # dataset.  patient_groups is the same dict either way (lookup-only access).
+    mini = copy.copy(val_ds)
+    mini.patient_ids = np.array(sorted(chosen.tolist()))
+
+    print(f"[probe_onset_time_predictions] running generation on {n} val patients...")
+    model.eval()
+    risk_df = ar_generate(
+        model, mini,
+        max_duration_hours=max_duration_hours,
+        max_len=max_len,
+        temperature=1.0,
+        top_k=None,
+        rep_decay=0.6,
+        collect_risk_scores=True,
+        tqdm_desc="probe-onset-gen",
+    )
+    if len(risk_df) == 0:
+        print("[probe_onset_time_predictions] generation produced no rows — skipping.")
+        return {}
+
+    gt_first = extract_ground_truth(val_ds, outcome_names)
+
+    # Per-outcome predicted onset times (argmax) and corresponding GT.
+    gen_df = risk_df[risk_df["IsInput"] == 0]
+    p_cols = {n: f"P_{n}" for n in outcome_names}
+    idxmax = gen_df.groupby("PatientId")[[p_cols[n] for n in outcome_names]].idxmax()
+
+    report = {}
+    flagged_constant = []
+    flagged_no_lift  = []
+    print("[probe_onset_time_predictions] per-outcome onset-time check")
+    print(f"  {'outcome':<32s}  {'n_pos':>5s}  {'pred_mean':>9s}  "
+          f"{'pred_std':>8s}  {'p5':>6s}  {'p50':>6s}  {'p95':>6s}  "
+          f"{'model_mae':>9s}  {'baseline':>8s}  {'lift':>7s}")
+    for name in outcome_names:
+        pcol = p_cols[name]
+        # Predicted onset time = TimePoint at the argmax over generated rows.
+        valid = idxmax[pcol].dropna()
+        if len(valid) == 0:
+            print(f"  {name:<32s}  (no generated rows)")
+            continue
+        pred_t = gen_df.loc[valid.astype(int), ["PatientId", "TimePoint"]] \
+                       .set_index("PatientId")["TimePoint"]
+        preds_all = pred_t.to_numpy(dtype=float)
+
+        # Positives = GT first-occurrence time < inf.
+        gt_arr, pred_arr = [], []
+        for pid, pt in pred_t.items():
+            gt_t = gt_first.get(pid, {}).get(name, np.inf)
+            if gt_t < np.inf:
+                gt_arr.append(float(gt_t))
+                pred_arr.append(float(pt))
+        gt_arr = np.asarray(gt_arr)
+        pred_arr = np.asarray(pred_arr)
+
+        pred_mean = float(preds_all.mean()) if preds_all.size else float("nan")
+        pred_std  = float(preds_all.std())  if preds_all.size else float("nan")
+        pcts = np.percentile(preds_all, [5, 50, 95]).tolist() if preds_all.size else [float("nan")] * 3
+
+        if pred_arr.size:
+            model_mae    = float(np.mean(np.abs(pred_arr - gt_arr)))
+            baseline_mae = float(np.mean(np.abs(gt_arr - np.median(gt_arr))))
+            lift         = baseline_mae - model_mae
+        else:
+            model_mae = baseline_mae = lift = float("nan")
+
+        out = {
+            "n_pos":            int(pred_arr.size),
+            "pred_mean":        pred_mean,
+            "pred_std":         pred_std,
+            "pred_percentiles": pcts,
+            "model_mae":        model_mae,
+            "baseline_mae":     baseline_mae,
+            "lift":             lift,
+        }
+        report[name] = out
+        print(f"  {name:<32s}  {out['n_pos']:>5d}  "
+              f"{pred_mean:>9.2f}  {pred_std:>8.2f}  "
+              f"{pcts[0]:>6.1f}  {pcts[1]:>6.1f}  {pcts[2]:>6.1f}  "
+              f"{model_mae:>9.2f}  {baseline_mae:>8.2f}  {lift:>+7.2f}")
+        if preds_all.size and pred_std < std_warn_hours:
+            flagged_constant.append(name)
+        if not math.isnan(lift) and lift <= 0:
+            flagged_no_lift.append(name)
+
+    if flagged_constant:
+        print(f"  WARN: near-constant predicted onset times for {flagged_constant} "
+              f"(pred_std < {std_warn_hours} h).")
+    if flagged_no_lift:
+        print(f"  WARN: argmax peak does not beat constant-GT-median predictor "
+              f"for {flagged_no_lift} (lift ≤ 0).")
+    return report
+
+
 def diagnose_generation_time(df: pd.DataFrame, max_duration_hours: float = 336.0) -> dict:
     """
     Purpose: Audit the temporal behaviour of a generated event stream to detect
