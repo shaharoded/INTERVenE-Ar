@@ -51,6 +51,13 @@ EVAL_GRACE_HOURS  = 24.0  # tolerance added to each window edge for positive lab
 EVAL_MAX_LEN      = 500   # max generated steps per patient
 EVAL_TEMPERATURE  = 1.0   # sampling temperature (no top-k filtering)
 EVAL_FULL_HORIZON_HOURS = 336.0  # cap per-patient eval horizon at 14 days (matches training/inference)
+# Strict lower bound (hours) on positive-label events. Outcomes occurring in
+# [0, FORECAST_CUTOFF_HOURS] are observed inside the input seed and are not
+# part of the forecasting task — including them as positive labels inflates
+# AUPRC trivially (Enc) or deflates it via unreachable positives (Ar). The
+# STraTS / GRU-D preprocess already uses this convention; this restores
+# label-definition parity across all four methods.
+FORECAST_CUTOFF_HOURS = EVAL_INPUT_DAYS * 24.0
 
 # Eval-time outcome support threshold = same 1% used at data-load time
 # (OUTCOME_RARE_THRESHOLD_PCT in dataset_config). Outcomes that already passed
@@ -133,14 +140,22 @@ def length_of_stay_mae(risk_df, gt_episodes, release_token="RELEASE_EVENT"):
 # Ground truth extraction
 # ---------------------------------------------------------------------------
 
-def extract_ground_truth(eval_ds, outcome_names):
+def extract_ground_truth(eval_ds, outcome_names,
+                         min_event_time_hours=FORECAST_CUTOFF_HOURS):
     """
     Purpose: Build per-patient first-occurrence ground truth for each outcome.
-    Method: Scans each patient's full (untruncated) token sequence from eval_ds.
+    Method: Scans each patient's full (untruncated) token sequence; only
+            collects occurrences strictly after `min_event_time_hours` (default
+            FORECAST_CUTOFF_HOURS, i.e. the input seed window). Excluding
+            in-seed events matches the STraTS / GRU-D preprocess label
+            convention and stops trivial positives from inflating per-outcome
+            n_pos counts.
 
     Args:
-        eval_ds (EMRDataset): Full (untruncated) test dataset.
-        outcome_names (list[str]): Outcome token strings to collect.
+        eval_ds              (EMRDataset): Full (untruncated) test dataset.
+        outcome_names        (list[str]): Outcome token strings to collect.
+        min_event_time_hours (float):      strict lower bound; events at or
+                                          before this time are ignored.
 
     Returns:
         dict: {patient_id: {outcome_name: first_time_hours or np.inf}}
@@ -155,7 +170,7 @@ def extract_ground_truth(eval_ds, outcome_names):
             tok = row[tok_col]
             if tok in outcome_set:
                 t = row["TimePoint"]
-                if t < patient_gt[tok]:
+                if t > min_event_time_hours and t < patient_gt[tok]:
                     patient_gt[tok] = t
         gt[pid] = patient_gt
     return gt
@@ -262,14 +277,22 @@ def extract_patient_horizons(eval_ds, full_horizon_hours=EVAL_FULL_HORIZON_HOURS
     return out
 
 
-def extract_ground_truth_episodes(eval_ds, outcome_names):
+def extract_ground_truth_episodes(eval_ds, outcome_names,
+                                  min_event_time_hours=FORECAST_CUTOFF_HOURS):
     """
     Purpose: Build per-patient all-occurrence ground truth (list of times) for each outcome.
-    Method: Scans each patient's full (untruncated) token sequence from eval_ds.
+    Method: Scans each patient's full (untruncated) token sequence; collects
+            only occurrences strictly after `min_event_time_hours` (default
+            FORECAST_CUTOFF_HOURS, i.e. the input seed window). Excluding
+            in-seed events matches the STraTS / GRU-D preprocess label
+            convention so per-outcome positives reflect the forecasting task,
+            not events visible in the model input.
 
     Args:
-        eval_ds (EMRDataset): Full (untruncated) test dataset.
-        outcome_names (list[str]): Outcome token strings to collect.
+        eval_ds              (EMRDataset): Full (untruncated) test dataset.
+        outcome_names        (list[str]): Outcome token strings to collect.
+        min_event_time_hours (float):      strict lower bound; events at or
+                                          before this time are ignored.
 
     Returns:
         dict: {patient_id: {outcome_name: [t1, t2, ...]}}  (empty list if never occurred)
@@ -282,7 +305,7 @@ def extract_ground_truth_episodes(eval_ds, outcome_names):
         patient_gt = {n: [] for n in outcome_names}
         for _, row in df.iterrows():
             tok = row[tok_col]
-            if tok in outcome_set:
+            if tok in outcome_set and row["TimePoint"] > min_event_time_hours:
                 patient_gt[tok].append(row["TimePoint"])
         gt[pid] = patient_gt
     return gt
