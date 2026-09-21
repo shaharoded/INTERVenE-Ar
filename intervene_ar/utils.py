@@ -192,11 +192,12 @@ def get_temporal_soft_targets(
         nonpad_src = (target_ids != padding_idx).to(decay.dtype)
         decay = decay * nonpad_src.unsqueeze(1)
 
-    # Scatter-add into the V dim using target_ids as the column index.
+    # Scatter-max into the V dim: keep only the nearest future occurrence
+    # (highest decay = smallest Δt). Avoids summing multiple occurrences of the
+    # same token class, which saturates common tokens to 1.0 regardless of distance.
     target = torch.zeros(B, T_q, V, device=device, dtype=decay.dtype)
     idx = target_ids.unsqueeze(1).expand(B, T_q, T_all)
-    target.scatter_add_(2, idx, decay)
-    target = target.clamp(0.0, 1.0)
+    target.scatter_reduce_(2, idx, decay, reduce="amax", include_self=True)
 
     if 0 <= padding_idx < V:
         pad_mask = torch.ones(V, device=device, dtype=target.dtype)
