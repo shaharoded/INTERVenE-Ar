@@ -10,6 +10,8 @@ This repository implements a three-phase deep learning pipeline for modeling lon
 
 This repo is part of an unpublished thesis and will be finalized post-submission. **Please do not reuse without permission**.
 
+> **Preprint.** An arXiv draft covering the INTERVenE family is available for reading: [arXiv:2608.29901](https://arxiv.org/abs/2608.29901). See the [Citation](#-citation--acknowledgments) section for the BibTeX entry.
+
 The results shown here (in `evaluation.ipynb`) are on random data, as my research dataset is private. This model will be used on actual EMR data, stored in a closed environment. For that, it is organized as a package that can be installed:
 
 ```bash
@@ -369,7 +371,20 @@ Headline framing is **patient-level peak-detector AUC + F1**: each (patient, out
 
 ## 📚 Citation & Acknowledgments
 
-This work builds on and adapts ideas from the following sources:
+If you use this work, please cite the accompanying arXiv preprint:
+
+> Oded, S., & Shahar, Y. (2026). *INTERVenE: Temporal-Abstraction-Interval Based Transformers for Short-Horizon Medical Event Prediction*. arXiv preprint [arXiv:2608.29901](https://arxiv.org/abs/2608.29901).
+
+```bibtex
+@article{oded2026intervene,
+  title={INTERVenE: Temporal-Abstraction-Interval Based Transformers for Short-Horizon Medical Event Prediction},
+  author={Oded, Shahar and Shahar, Yuval},
+  journal={arXiv preprint arXiv:2608.29901},
+  year={2026}
+}
+```
+
+This work also builds on and adapts ideas from the following sources:
 
 - **Time2Vec** (Kazemi et al., 2019):  
   The temporal embedding design is adapted from the Time2Vec formulation.  
