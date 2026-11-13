@@ -10,7 +10,7 @@ This repository implements a three-phase deep learning pipeline for modeling lon
 
 This repo is part of an unpublished thesis and will be finalized post-submission. **Please do not reuse without permission**.
 
-> **Preprint.** An arXiv draft covering the INTERVenE family is available for reading: [arXiv:2608.29901](https://arxiv.org/abs/2608.29901). See the [Citation](#-citation--acknowledgments) section for the BibTeX entry.
+> **Method paper.** This repository implements the **INTERVenE-ar** variant described in Shahar Oded and Yuval Shahar?s *INTERVenE: Temporal-Abstraction-Interval Based Transformers for Short-Horizon Medical Event Prediction* (2026). Read the [arXiv preprint](https://arxiv.org/abs/2608.29901) ? [DOI](https://doi.org/10.48550/arXiv.2608.29901). See [Citation & Acknowledgments](#-citation--acknowledgments) for the citation and BibTeX.
 
 The results shown here (in `evaluation.ipynb`) are on random data, as my research dataset is private. This model will be used on actual EMR data, stored in a closed environment. For that, it is organized as a package that can be installed:
 
@@ -371,16 +371,18 @@ Headline framing is **patient-level peak-detector AUC + F1**: each (patient, out
 
 ## 📚 Citation & Acknowledgments
 
-If you use this work, please cite the accompanying arXiv preprint:
+If you reuse this code, model, or method, please cite the following method paper (see also [License](License)):
 
-> Oded, S., & Shahar, Y. (2026). *INTERVenE: Temporal-Abstraction-Interval Based Transformers for Short-Horizon Medical Event Prediction*. arXiv preprint [arXiv:2608.29901](https://arxiv.org/abs/2608.29901).
+> Oded, Shahar, and Yuval Shahar. "INTERVenE: Temporal-Abstraction-Interval Based Transformers for Short-Horizon Medical Event Prediction." arXiv preprint arXiv:2608.29901 (2026). https://doi.org/10.48550/arXiv.2608.29901
 
 ```bibtex
 @article{oded2026intervene,
   title={INTERVenE: Temporal-Abstraction-Interval Based Transformers for Short-Horizon Medical Event Prediction},
   author={Oded, Shahar and Shahar, Yuval},
   journal={arXiv preprint arXiv:2608.29901},
-  year={2026}
+  year={2026},
+  doi={10.48550/arXiv.2608.29901},
+  url={https://arxiv.org/abs/2608.29901}
 }
 ```
 

@@ -1,13 +1,21 @@
 cff-version: 1.2.0
-message: "If you use this model or code, please cite the following work:"
-title: "Predicting Clinical Outcomes and Assessing the Effects of Compliance to Diabetes Care Guidelines in Hospitals Using Time-Dependent Machine Learning Methods"
+message: "If you reuse this code, model, or method, please cite the INTERVenE method paper below. See License for reuse terms."
+title: "INTERVenE-ar"
+type: software
 authors:
   - family-names: Oded
     given-names: Shahar
-date-released: 2025-05-23
-version: "1.0"
-url: https://github.com/shaharoded/Transform-EMR
-repository-code: https://github.com/shaharoded/Transform-EMR
-license: CC-BY-NC-4.0
-type: thesis
-abstract: "This repository contains code and models for structured event prediction in EMR data using multi-phase training with a InterveneGPT architecture. Developed as part of a graduate thesis."
+repository-code: https://github.com/shaharoded/INTERVenE-Ar
+url: https://github.com/shaharoded/INTERVenE-Ar
+preferred-citation:
+  type: article
+  title: "INTERVenE: Temporal-Abstraction-Interval Based Transformers for Short-Horizon Medical Event Prediction"
+  authors:
+    - family-names: Oded
+      given-names: Shahar
+    - family-names: Shahar
+      given-names: Yuval
+  journal: "arXiv preprint arXiv:2608.29901"
+  year: 2026
+  doi: 10.48550/arXiv.2608.29901
+  url: https://arxiv.org/abs/2608.29901
